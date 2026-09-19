@@ -1,0 +1,15 @@
+[package]
+name = "zc-destinations"
+description = "ZeroClip upload destinations: the Destination trait, Discord webhooks, YouTube (bring-your-own credentials). Phase 6."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+zc-core.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

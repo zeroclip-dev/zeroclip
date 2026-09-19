@@ -1,0 +1,5 @@
+# Any stable Rust >= 1.95 (the workspace's rust-version) works; this just makes sure
+# rustfmt and clippy are installed alongside it.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

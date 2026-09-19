@@ -1,0 +1,101 @@
+# ZeroClip — Cargo workspace.
+#
+# The repository root is the desktop app (`zeroclip`); libraries live in `crates/`,
+# throwaway experiments in `spikes/`. See docs/ARCHITECTURE.md for the crate map
+# and the dependency rules between crates.
+
+[workspace]
+resolver = "3"
+members = [".", "crates/*", "spikes/*"]
+# Plain `cargo build` / `cargo test` cover the app and every library crate.
+# Spikes are opt-in: `cargo run -p spike-phase0`.
+default-members = [".", "crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+zc-core = { path = "crates/zc-core" }
+zc-engine = { path = "crates/zc-engine" }
+zc-mux = { path = "crates/zc-mux" }
+zc-win = { path = "crates/zc-win" }
+zc-video = { path = "crates/zc-video" }
+zc-audio = { path = "crates/zc-audio" }
+zc-input = { path = "crates/zc-input" }
+zc-store = { path = "crates/zc-store" }
+zc-editor = { path = "crates/zc-editor" }
+zc-destinations = { path = "crates/zc-destinations" }
+
+# External crates. Add new ones here and reference them with `{ workspace = true }`
+# so every crate agrees on one version.
+anyhow = "1.0.104"
+directories = "6.0.0"
+# glow (OpenGL) renderer: much lighter to build than the default wgpu stack, and the
+# UI is idle while a game runs anyway. Swap "glow" for "wgpu" if OpenGL misbehaves.
+eframe = { version = "0.36.2", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "links",
+] }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.20"
+toml = "1.1.6"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Each Windows crate enables only the API features it uses.
+windows = "0.62.2"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# Every `unsafe` block needs a `// SAFETY:` comment explaining why it is sound.
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+# Use `tracing`, not println!.
+print_stdout = "warn"
+
+[profile.dev.package."*"]
+# Optimise dependencies even in debug builds: egui and image decoding are
+# painfully slow at opt-level 0, and dependencies are compiled only once.
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+# Keep line tables so crash reports and the flight recorder have usable backtraces.
+debug = "line-tables-only"
+
+# ---------------------------------------------------------------------------
+# The desktop app
+# ---------------------------------------------------------------------------
+
+[package]
+name = "zeroclip"
+description = "Zero-impact game clipper for Windows: DVR buffer, hardware encoding, instant trim, one-drop sharing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+zc-core.workspace = true
+zc-engine.workspace = true
+anyhow.workspace = true
+directories.workspace = true
+eframe.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

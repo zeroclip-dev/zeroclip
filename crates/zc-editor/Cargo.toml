@@ -1,0 +1,15 @@
+[package]
+name = "zc-editor"
+description = "ZeroClip lightning editor: keyframe-snapped stream-copy trim, concat and remux via the ffmpeg CLI, waveform peaks. Phase 5."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+zc-core.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

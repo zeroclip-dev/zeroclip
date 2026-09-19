@@ -1,0 +1,17 @@
+[package]
+name = "zc-engine"
+description = "ZeroClip recording engine: orchestrates sources, recording modes, the watchdog and the recorder. Platform-independent."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+zc-core.workspace = true
+zc-mux.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

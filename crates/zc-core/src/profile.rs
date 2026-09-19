@@ -1,0 +1,165 @@
+//! Game profiles (DESIGN §7).
+//!
+//! When the foreground window changes, the input adapter reports the executable;
+//! the engine resolves a profile for it and applies it: DVR window length, and
+//! whether to start session recording automatically.
+
+use serde::{Deserialize, Serialize};
+
+use crate::time::Hns;
+
+/// Settings applied while a particular game has focus.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameProfile {
+    /// Executable file name, e.g. `cs2.exe`. Matched case-insensitively.
+    pub exe: String,
+    /// How much footage the DVR buffer keeps, in seconds.
+    pub buffer_secs: u32,
+    /// Start session recording automatically while the game runs.
+    pub session_recording: bool,
+}
+
+impl GameProfile {
+    /// The DVR window as [`Hns`].
+    #[must_use]
+    pub fn buffer(&self) -> Hns {
+        Hns::from_secs(i64::from(self.buffer_secs))
+    }
+}
+
+/// All profiles, plus the fallback used for unknown executables.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileSet {
+    /// Used when no profile matches.
+    pub default: GameProfile,
+    /// Per-game profiles.
+    pub games: Vec<GameProfile>,
+}
+
+impl Default for ProfileSet {
+    /// The examples from DESIGN §7.
+    fn default() -> Self {
+        Self {
+            default: GameProfile { exe: "*".into(), buffer_secs: 60, session_recording: false },
+            games: vec![
+                GameProfile { exe: "cs2.exe".into(), buffer_secs: 120, session_recording: true },
+                GameProfile {
+                    exe: "RainbowSix.exe".into(),
+                    buffer_secs: 300,
+                    session_recording: false,
+                },
+            ],
+        }
+    }
+}
+
+impl ProfileSet {
+    /// The profile for an executable, given as a bare file name or a full path.
+    ///
+    /// Matching is on the file name only and ignores ASCII case (Windows paths are
+    /// case-insensitive). Both `\` and `/` separate path components, regardless of
+    /// the OS this runs on. Unknown executables get [`ProfileSet::default`].
+    #[must_use]
+    pub fn resolve(&self, exe: &str) -> &GameProfile {
+        let _ = exe;
+        todo!("Phase 4: resolve profiles (see the `profile_*` specs)")
+    }
+
+    /// Adds a profile, or replaces the existing one for the same executable
+    /// (used to promote a game from the "recent games" list).
+    pub fn upsert(&mut self, profile: GameProfile) {
+        let _ = profile;
+        todo!("Phase 4: insert or replace (see the `profile_*` specs)")
+    }
+}
+
+/// The result of [`clamp_window`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowClamp {
+    /// The window to actually use.
+    pub window: Hns,
+    /// Whether it was reduced to respect the RAM ceiling (tell the user).
+    pub clamped: bool,
+}
+
+/// Limits a requested DVR window so the video ring fits under `ram_ceiling_bytes`
+/// at `max_video_bitrate_bps` (DESIGN §7: "clamp it and tell the user rather than
+/// silently allocating 2 GB").
+#[must_use]
+pub fn clamp_window(
+    requested: Hns,
+    max_video_bitrate_bps: u64,
+    ram_ceiling_bytes: u64,
+) -> WindowClamp {
+    let _ = (requested, max_video_bitrate_bps, ram_ceiling_bytes);
+    todo!("Phase 4: clamp the window (see the `profile_clamp_*` specs)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_profiles_match_the_design_doc() {
+        let set = ProfileSet::default();
+        assert_eq!(set.default.buffer(), Hns::from_secs(60));
+        assert_eq!(set.games.len(), 2);
+    }
+
+    #[test]
+    #[ignore = "spec: ProfileSet::resolve (Phase 4)"]
+    fn profile_resolves_by_file_name_ignoring_case() {
+        let set = ProfileSet::default();
+        assert_eq!(set.resolve("cs2.exe").buffer_secs, 120);
+        assert_eq!(
+            set.resolve(r"C:\Games\Counter-Strike 2\game\bin\win64\CS2.EXE").buffer_secs,
+            120
+        );
+        assert_eq!(set.resolve("D:/Ubisoft/RainbowSix.exe").buffer_secs, 300);
+    }
+
+    #[test]
+    #[ignore = "spec: ProfileSet::resolve (Phase 4)"]
+    fn profile_falls_back_to_the_default() {
+        let set = ProfileSet::default();
+        assert_eq!(set.resolve("notepad.exe"), &set.default);
+        assert_eq!(set.resolve(""), &set.default);
+        assert_eq!(set.resolve(r"C:\cs2.exe.bak"), &set.default, "no partial matches");
+    }
+
+    #[test]
+    #[ignore = "spec: ProfileSet::upsert (Phase 4)"]
+    fn profile_upsert_replaces_by_exe() {
+        let mut set = ProfileSet::default();
+        set.upsert(GameProfile {
+            exe: "CS2.exe".into(),
+            buffer_secs: 90,
+            session_recording: false,
+        });
+        assert_eq!(set.games.len(), 2, "replaced, not added");
+        assert_eq!(set.resolve("cs2.exe").buffer_secs, 90);
+        set.upsert(GameProfile {
+            exe: "valorant.exe".into(),
+            buffer_secs: 45,
+            session_recording: false,
+        });
+        assert_eq!(set.games.len(), 3);
+    }
+
+    #[test]
+    #[ignore = "spec: clamp_window (Phase 4)"]
+    fn profile_clamp_keeps_windows_that_fit() {
+        // 2 min at 20 Mbps = 300 MB, under a 1 GiB ceiling.
+        let c = clamp_window(Hns::from_secs(120), 20_000_000, 1 << 30);
+        assert_eq!(c, WindowClamp { window: Hns::from_secs(120), clamped: false });
+    }
+
+    #[test]
+    #[ignore = "spec: clamp_window (Phase 4)"]
+    fn profile_clamp_shrinks_windows_over_the_ceiling() {
+        // 5 min at 20 Mbps = 750 MB > 500 MB ceiling → 500 MB / 2.5 MB/s = 200 s.
+        let c = clamp_window(Hns::from_secs(300), 20_000_000, 500_000_000);
+        assert!(c.clamped);
+        assert_eq!(c.window, Hns::from_secs(200));
+    }
+}

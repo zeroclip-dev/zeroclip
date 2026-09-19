@@ -1,0 +1,12 @@
+/target
+
+# Editors and IDEs
+/.vs/
+/.idea/
+*.swp
+
+# Claude Code: personal, machine-specific settings (.claude/settings.json is shared)
+/.claude/settings.local.json
+
+# Output of the Phase 0 spike when run from the repo root
+/spike-phase0.mp4
