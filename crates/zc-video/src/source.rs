@@ -1,20 +1,68 @@
 //! [`GpuVideoSource`]: the pipeline behind the engine's `VideoSource` port.
+//!
+//! Threads:
+//! - **WGC frame pool** ([`FrameHandler::on_frame`]): pace to the target fps, convert
+//!   BGRA → NV12 on the GPU, hand the ring slot to the encoder thread. Never blocks.
+//! - **`zc-video` encoder thread** ([`run`]): owns everything that isn't `Send` (the
+//!   COM apartment, Media Foundation, the encoder) plus the capture session. It
+//!   feeds the encoder when it asks for input, pushes its output into the sink, and
+//!   repeats the last frame when the screen is static.
+//! - **Engine thread**: only calls `start`, `stop`, `request_keyframe`, `screenshot`.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D};
+use zc_core::Hns;
+use zc_core::backoff::Backoff;
 use zc_core::media::Codec;
 use zc_core::ports::{Emit, SourceError, VideoSource, VideoStart};
 use zc_core::sink::SharedSink;
+use zc_core::time::FramePacer;
 use zc_core::watchdog::HealthEvent;
+use zc_win::clock;
+use zc_win::com::Apartment;
+use zc_win::mf::MediaFoundation;
 
-/// Capture → convert → encode, running on the frame pool's thread.
+use crate::capture::{CapturedFrame, WgcCapture, capture_item};
+use crate::convert::NvConverter;
+use crate::device::create_device;
+use crate::encoder::{EncoderEvent, HwEncoder, probe};
+use crate::screenshot::{save_png, staging_copy};
+
+/// A staging copy of one frame, and its size.
+type Shot = Result<(ID3D11Texture2D, (u32, u32)), SourceError>;
+
+/// Flags the engine thread sets and the pipeline threads read.
+#[derive(Debug, Default)]
+struct Shared {
+    stop: AtomicBool,
+    keyframe: AtomicBool,
+    screenshot_wanted: AtomicBool,
+    screenshot: Mutex<Option<SyncSender<Shot>>>,
+}
+
+/// What the encoder thread reports once it's running.
+struct Started {
+    codec: Codec,
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+}
+
+/// Capture → convert → encode, on the GPU.
 ///
 /// `start` wires [`device`](crate::device), [`capture`](crate::capture),
 /// [`convert`](crate::convert) and [`encoder`](crate::encoder) together; `stop`
 /// tears them down (and is what the watchdog's re-init calls before starting again).
 #[derive(Debug, Default)]
 pub struct GpuVideoSource {
-    running: bool,
+    shared: Arc<Shared>,
+    thread: Option<JoinHandle<()>>,
+    gpu: Option<(ID3D11Device, ID3D11DeviceContext)>,
 }
 
 impl GpuVideoSource {
@@ -25,6 +73,12 @@ impl GpuVideoSource {
     }
 }
 
+impl Drop for GpuVideoSource {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 impl VideoSource for GpuVideoSource {
     fn start(
         &mut self,
@@ -32,26 +86,306 @@ impl VideoSource for GpuVideoSource {
         sink: SharedSink,
         health: Emit<HealthEvent>,
     ) -> Result<Codec, SourceError> {
-        let _ = (config, sink, health);
-        todo!(
-            "Phase 1: Apartment + MediaFoundation guards, create_device, probe → Codec::select, \
-             capture_item, NvConverter, HwEncoder, WgcCapture::start with a callback that \
-             converts + encodes each frame and reports FrameDelivered/FrameDropped to `health`"
-        )
-    }
-
-    fn stop(&mut self) {
-        if self.running {
-            todo!("Phase 1: stop the session, drain the encoder, then release the device")
+        self.stop();
+        self.shared = Arc::default();
+        let (report, started) = mpsc::sync_channel(1);
+        let (config, shared) = (*config, Arc::clone(&self.shared));
+        let thread = thread::Builder::new()
+            .name("zc-video".into())
+            .spawn(move || run(&config, &sink, &health, &shared, &report))
+            .map_err(|e| SourceError::Other(format!("couldn't start the video thread: {e}")))?;
+        self.thread = Some(thread);
+        match started.recv() {
+            Ok(Ok(Started { codec, device, context })) => {
+                self.gpu = Some((device, context));
+                Ok(codec)
+            }
+            Ok(Err(e)) => {
+                self.stop();
+                Err(e)
+            }
+            Err(_) => {
+                self.stop();
+                Err(SourceError::Other("the video thread exited during start-up".into()))
+            }
         }
     }
 
+    fn stop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            self.shared.stop.store(true, Ordering::Release);
+            if thread.join().is_err() {
+                tracing::error!("the video thread panicked");
+            }
+        }
+        self.gpu = None;
+    }
+
     fn request_keyframe(&mut self) {
-        todo!("Phase 1: HwEncoder::force_keyframe")
+        self.shared.keyframe.store(true, Ordering::Relaxed);
     }
 
     fn screenshot(&mut self, path: &Path) -> Result<(), SourceError> {
-        let _ = path;
-        todo!("Phase 1: grab the latest frame → screenshot::save_png")
+        let Some((_, context)) = &self.gpu else {
+            return Err(SourceError::Other("capture isn't running".into()));
+        };
+        let (tx, rx) = mpsc::sync_channel(1);
+        *self.shared.screenshot.lock().map_err(|_| SourceError::Other("poisoned lock".into()))? =
+            Some(tx);
+        self.shared.screenshot_wanted.store(true, Ordering::Release);
+        let (staging, size) = rx.recv_timeout(Duration::from_secs(2)).map_err(|_| {
+            SourceError::Other(
+                "no new frame within 2 s (WGC only delivers frames when the screen changes)".into(),
+            )
+        })??;
+        save_png(context, &staging, size, path)
+    }
+}
+
+/// Runs on the WGC frame pool's thread for every captured frame (up to the display
+/// refresh rate), and on the encoder thread for repeats.
+struct FrameHandler {
+    pacer: FramePacer,
+    converter: NvConverter,
+    frames: SyncSender<(usize, Hns)>,
+    health: Emit<HealthEvent>,
+    shared: Arc<Shared>,
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    last: Option<Hns>,
+    dropping: bool,
+}
+
+impl FrameHandler {
+    fn on_frame(&mut self, frame: &CapturedFrame) {
+        // Before the pacer, so a screenshot request isn't thinned out.
+        if self.shared.screenshot_wanted.swap(false, Ordering::Acquire)
+            && let Ok(mut slot) = self.shared.screenshot.try_lock()
+            && let Some(tx) = slot.take()
+        {
+            let _ = tx.try_send(
+                staging_copy(&self.device, &self.context, &frame.texture).map(|t| (t, frame.size)),
+            );
+        }
+        if !self.pacer.accept(frame.time) {
+            return;
+        }
+        let slot = self.converter.convert(&frame.texture, frame.size);
+        self.hand_off(slot, frame.time);
+    }
+
+    /// Called by the encoder thread on a timer: on a static screen WGC delivers
+    /// nothing, so repeat the last frame to keep GOPs on time (DESIGN §4).
+    fn tick(&mut self, now: Hns) {
+        if let Some(time) = self.pacer.repeat_due(now)
+            && let Some(slot) = self.converter.repeat_last()
+        {
+            self.hand_off(Ok(slot), time);
+        }
+    }
+
+    fn hand_off(&mut self, slot: Result<usize, SourceError>, time: Hns) {
+        let sent = slot.map(|slot| self.frames.try_send((slot, time)));
+        match sent {
+            Ok(Ok(())) => {
+                // ponytail: FrameDelivered only on leaving a drop run. The engine's
+                // health channel allocates as it grows, and the Phase 4 watchdog only
+                // needs it to reset its drop count.
+                if self.dropping
+                    && let Some(last) = self.last
+                {
+                    (self.health)(HealthEvent::FrameDelivered { interval: time - last });
+                }
+                self.dropping = false;
+                self.last = Some(time);
+            }
+            Ok(Err(TrySendError::Disconnected(_))) => {}
+            Ok(Err(TrySendError::Full(_))) | Err(_) => {
+                (self.health)(HealthEvent::FrameDropped);
+                self.dropping = true;
+            }
+        }
+    }
+}
+
+/// The encoder thread. Reports start-up through `report`, then runs until `stop`.
+fn run(
+    config: &VideoStart,
+    sink: &SharedSink,
+    health: &Emit<HealthEvent>,
+    shared: &Arc<Shared>,
+    report: &SyncSender<Result<Started, SourceError>>,
+) {
+    // Guards first, so they drop last.
+    let guards = Apartment::multithreaded().and_then(|a| Ok((a, MediaFoundation::start()?)));
+    let _guards = match guards {
+        Ok(guards) => guards,
+        Err(e) => {
+            let _ = report.send(Err(e));
+            return;
+        }
+    };
+    let pipeline = match Pipeline::open(config, health, shared) {
+        Ok(pipeline) => pipeline,
+        Err(e) => {
+            let _ = report.send(Err(e));
+            return;
+        }
+    };
+    let Pipeline { device, context, codec, mut encoder, handler, frames, item } = pipeline;
+
+    // Protected content (HDCP) can block starting capture; retry with backoff.
+    let mut backoff = Backoff::hdcp();
+    let try_capture = || {
+        let handler = Arc::clone(&handler);
+        WgcCapture::start(&device, &item, config.capture_cursor, move |frame| {
+            if let Ok(mut handler) = handler.lock() {
+                handler.on_frame(&frame);
+            }
+        })
+    };
+    let mut retry_at = Instant::now();
+    let mut capture = match try_capture() {
+        Ok(capture) => Some(capture),
+        Err(SourceError::Protected) => {
+            retry_at += backoff.next_delay().to_duration().unwrap_or_default();
+            None
+        }
+        Err(e) => {
+            let _ = report.send(Err(e));
+            return;
+        }
+    };
+    let _ = report.send(Ok(Started { codec, device: device.clone(), context: context.clone() }));
+
+    let mut credits = 0u32;
+    let result = (|| -> Result<(), SourceError> {
+        while !shared.stop.load(Ordering::Acquire) {
+            if capture.is_none() && Instant::now() >= retry_at {
+                match try_capture() {
+                    Ok(c) => {
+                        capture = Some(c);
+                        backoff.reset();
+                    }
+                    Err(SourceError::Protected) => {
+                        retry_at =
+                            Instant::now() + backoff.next_delay().to_duration().unwrap_or_default();
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            while let Some(event) = encoder.next_event()? {
+                match event {
+                    EncoderEvent::NeedInput => credits += 1,
+                    EncoderEvent::HaveOutput => encoder.take_output(&**sink)?,
+                    EncoderEvent::DrainComplete | EncoderEvent::Other => {}
+                }
+            }
+            if let Ok(mut handler) = handler.lock() {
+                handler.tick(clock::now());
+            }
+            // ponytail: a 1 ms poll; switch to IMFAsyncCallback/BeginGetEvent if it
+            // shows up in profiles.
+            if credits == 0 {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            match frames.recv_timeout(Duration::from_millis(1)) {
+                Ok((slot, pts)) => {
+                    if shared.keyframe.swap(false, Ordering::Relaxed)
+                        && let Err(e) = encoder.force_keyframe()
+                    {
+                        tracing::warn!(%e, "couldn't force a keyframe");
+                    }
+                    encoder.submit(slot, pts)?;
+                    credits -= 1;
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        tracing::error!(%e, "video encoder fault");
+        let hresult = match e {
+            SourceError::Platform { code, .. } => code,
+            _ => 0x8000_4005_u32 as i32, // E_FAIL
+        };
+        health(HealthEvent::EncoderFault { hresult });
+    }
+    // Stop capture first so nothing new arrives, then flush what's in the encoder.
+    drop(capture);
+    encoder.drain(&**sink);
+}
+
+/// Everything the encoder thread builds before capture starts.
+struct Pipeline {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    codec: Codec,
+    encoder: HwEncoder,
+    handler: Arc<Mutex<FrameHandler>>,
+    frames: mpsc::Receiver<(usize, Hns)>,
+    item: windows::Graphics::Capture::GraphicsCaptureItem,
+}
+
+impl Pipeline {
+    fn open(
+        config: &VideoStart,
+        health: &Emit<HealthEvent>,
+        shared: &Arc<Shared>,
+    ) -> Result<Self, SourceError> {
+        let (device, context) = create_device()?;
+        let item = capture_item(config.target)?;
+        let size = item
+            .Size()
+            .map_err(|e| SourceError::Other(format!("GraphicsCaptureItem::Size: {e}")))?;
+        let size_in =
+            (u32::try_from(size.Width).unwrap_or(0), u32::try_from(size.Height).unwrap_or(0));
+        // NV12 and the encoders need even sizes.
+        let size_out = (size_in.0 & !1, size_in.1 & !1);
+        let converter = NvConverter::new(&device, size_in, size_out)?;
+
+        // The codec ladder: the preference if the GPU has it, else the best it has;
+        // if an encoder lists but won't open (e.g. too wide for H.264), step down.
+        let supported = probe(&device);
+        let mut codec = Codec::select(&supported, Some(config.codec))
+            .ok_or_else(|| SourceError::Unsupported("no hardware video encoder".into()))?;
+        let encoder = loop {
+            match HwEncoder::new(
+                &device,
+                &VideoStart { codec, ..*config },
+                size_out,
+                converter.textures(),
+            ) {
+                Ok(encoder) => break encoder,
+                Err(e) => {
+                    let next = std::iter::successors(codec.step_down(), |c| c.step_down())
+                        .find(|c| supported.contains(c))
+                        .ok_or(e)?;
+                    tracing::warn!(
+                        from = codec.name(),
+                        to = next.name(),
+                        "encoder failed; stepping down"
+                    );
+                    codec = next;
+                }
+            }
+        };
+
+        let (frames_tx, frames) = mpsc::sync_channel(2);
+        let handler = Arc::new(Mutex::new(FrameHandler {
+            pacer: FramePacer::new(config.fps),
+            converter,
+            frames: frames_tx,
+            health: Arc::clone(health),
+            shared: Arc::clone(shared),
+            device: device.clone(),
+            context: context.clone(),
+            last: None,
+            dropping: false,
+        }));
+        Ok(Self { device, context, codec, encoder, handler, frames, item })
     }
 }

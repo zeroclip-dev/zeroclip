@@ -48,8 +48,8 @@ state machine; editing never re-encodes; nothing is ever deleted unverified.
 |---|---|---|---|
 | UI | eframe | draws; sends `Command`s; drains `EngineEvent`s | block on the engine |
 | `zc-engine` | engine actor | owns settings, profile, watchdog, modes; starts/stops sources | touch the hot path |
-| WGC frame pool | `zc-video` | convert + submit each frame to the encoder | allocate, block on I/O |
-| Encoder events | `zc-video` | `ProcessOutput` → `Recorder::push` | allocate, block on I/O |
+| WGC frame pool | `zc-video` | pace to the target fps, convert to NV12, hand the ring slot to the encoder thread | allocate, block |
+| Encoder (`zc-video` thread) | `zc-video` | NeedInput → `ProcessInput`; HaveOutput → `ProcessOutput` → `PacketSink::push`; repeat the last frame while the screen is static | allocate, block on I/O |
 | Game audio, mic | `zc-audio` | WASAPI event loop → AAC → `Recorder::push` (MMCSS "Pro Audio") | allocate, block on I/O |
 | Message thread | `zc-input` | Raw Input + WinEvent hook → `OsEvent`s | do real work in callbacks |
 | IO | engine (Phase 3) | chunked, paced disk writes; clip dumps | hold the recorder lock |

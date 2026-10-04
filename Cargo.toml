@@ -43,6 +43,8 @@ eframe = { version = "0.36.2", default-features = false, features = [
     "glow",
     "links",
 ] }
+# PNG screenshots. Already in the tree through eframe.
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
 # Already in the tree through tracing-appender; used for local-time file names.
