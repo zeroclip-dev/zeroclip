@@ -42,12 +42,14 @@ impl Backoff {
 
     /// How long to wait before the next retry; advances the schedule.
     pub fn next_delay(&mut self) -> Hns {
-        todo!("Phase 1: doubling, capped (see the `backoff_*` specs)")
+        let delay = Hns(self.next.ticks().min(self.max.ticks()));
+        self.next = Hns(self.next.ticks().saturating_mul(2).min(self.max.ticks()));
+        delay
     }
 
     /// Back to the initial delay, after a successful capture.
     pub fn reset(&mut self) {
-        todo!("Phase 1")
+        self.next = self.initial;
     }
 }
 
@@ -56,7 +58,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "spec: Backoff::next_delay (Phase 1)"]
     fn backoff_doubles_up_to_the_cap() {
         let mut b = Backoff::hdcp();
         let delays: Vec<i64> = (0..7).map(|_| b.next_delay().as_millis()).collect();
@@ -64,7 +65,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: Backoff::reset (Phase 1)"]
     fn backoff_reset_starts_over() {
         let mut b = Backoff::hdcp();
         for _ in 0..4 {

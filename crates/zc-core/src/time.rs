@@ -136,6 +136,73 @@ impl fmt::Display for Hns {
     }
 }
 
+/// Frames up to this fraction of an interval early still count as on time, so a
+/// jittery 60 Hz source recorded at 60 fps isn't thinned. A tuning knob.
+const EARLY_SLACK_DIVISOR: i64 = 4;
+
+/// Turns a capture stream into exactly `fps` frames per second (DESIGN §3).
+///
+/// WGC delivers a frame on every display refresh where something changed, which
+/// gives two problems the encoder must never see:
+/// - **Too many frames.** A 200 Hz display delivers up to 200 per second;
+///   [`accept`](Self::accept) keeps one per interval, on a fixed grid, so the
+///   average is exact even when arrivals sit on a coarse 5 ms grid.
+/// - **No frames at all.** A static screen delivers nothing, which would stretch
+///   GOPs far past their 1–2 s and break the DVR's eviction (DESIGN §4).
+///   [`repeat_due`](Self::repeat_due) says when to re-submit the last frame.
+#[derive(Clone, Copy, Debug)]
+pub struct FramePacer {
+    interval: Hns,
+    next_due: Option<Hns>,
+}
+
+impl FramePacer {
+    /// A pacer for `fps` frames per second (at least 1).
+    #[must_use]
+    pub fn new(fps: u32) -> Self {
+        Self { interval: Hns(Hns::PER_SECOND / i64::from(fps.max(1))), next_due: None }
+    }
+
+    /// The time between frames.
+    #[must_use]
+    pub fn interval(&self) -> Hns {
+        self.interval
+    }
+
+    /// Whether to encode a frame captured at `t`. Frames arrive in time order.
+    pub fn accept(&mut self, t: Hns) -> bool {
+        let slack = Hns(self.interval.ticks() / EARLY_SLACK_DIVISOR);
+        if let Some(due) = self.next_due
+            && t + slack < due
+        {
+            return false;
+        }
+        let due = self.next_due.unwrap_or(t);
+        // Stay on the frame grid, but after a pause restart from `t` instead of
+        // bursting to catch up.
+        self.next_due =
+            Some(if t - due >= self.interval { t + self.interval } else { due + self.interval });
+        true
+    }
+
+    /// Called on a timer: if the current slot went unfilled by `now`, returns the
+    /// timestamp at which to re-submit the previous frame, and books that slot.
+    ///
+    /// The repeat lands on the frame grid when the timer is on time, or at `now`
+    /// after a longer stall, so a stall never produces a burst of repeats.
+    pub fn repeat_due(&mut self, now: Hns) -> Option<Hns> {
+        let due = self.next_due?;
+        let slack = Hns(self.interval.ticks() / EARLY_SLACK_DIVISOR);
+        // Give a real frame until a little after its slot before repeating.
+        if now < due + slack {
+            return None;
+        }
+        let t = if now - due >= self.interval { now } else { due };
+        self.accept(t);
+        Some(t)
+    }
+}
+
 /// Maps raw capture timestamps onto the session timeline (DESIGN §6, "Master clock and PTS").
 ///
 /// The clock is anchored once, to the `SystemRelativeTime` of the first captured
@@ -211,6 +278,75 @@ mod tests {
         assert_eq!(Hns::from_secs(1).saturating_sub(Hns::from_secs(2)), Hns::ZERO);
         assert_eq!(-Hns(5), Hns(-5));
         assert_eq!(format!("{}", Hns::from_millis(1234)), "1.234s");
+    }
+
+    /// Feeds frames at `hz` for one second into a pacer at `fps`; returns how many it kept.
+    fn kept_in_one_second(hz: i64, fps: u32) -> usize {
+        let mut pacer = FramePacer::new(fps);
+        (0..hz).filter(|k| pacer.accept(Hns(k * Hns::PER_SECOND / hz))).count()
+    }
+
+    #[test]
+    fn frame_pacer_thins_high_refresh_rates_to_the_target() {
+        // The Phase 0 spike on a 200 Hz display: without pacing on a grid, the
+        // nearest refresh after 16.7 ms is 20 ms, which gives 50 fps instead of 60.
+        assert!((59..=61).contains(&kept_in_one_second(200, 60)));
+        assert!((59..=61).contains(&kept_in_one_second(144, 60)));
+        assert!((29..=31).contains(&kept_in_one_second(144, 30)));
+    }
+
+    #[test]
+    fn frame_pacer_keeps_every_frame_of_a_matching_or_slower_source() {
+        assert_eq!(kept_in_one_second(30, 60), 30, "it never duplicates");
+        let mut pacer = FramePacer::new(60);
+        let jitter = [1, -1, 0, 1, -1];
+        let kept = (0..60)
+            .filter(|&k| {
+                let t = k * Hns::PER_SECOND / 60 + jitter[k as usize % 5] * Hns::PER_MILLI;
+                pacer.accept(Hns(t))
+            })
+            .count();
+        assert_eq!(kept, 60, "±1 ms jitter at 60 Hz keeps every frame");
+    }
+
+    #[test]
+    fn frame_pacer_restarts_after_a_pause_without_bursting() {
+        let mut pacer = FramePacer::new(60);
+        assert!(pacer.accept(Hns::ZERO));
+        assert!(pacer.accept(Hns::from_secs(1)), "the first frame after a gap is kept");
+        let soon = Hns::from_secs(1) + Hns::from_millis(5);
+        assert!(!pacer.accept(soon), "the next one waits a full interval");
+        assert!(pacer.accept(Hns::from_secs(1) + pacer.interval()));
+    }
+
+    #[test]
+    fn frame_pacer_repeats_on_the_grid_while_the_screen_is_static() {
+        let mut pacer = FramePacer::new(60);
+        let i = pacer.interval();
+        assert!(pacer.accept(Hns::ZERO));
+        assert_eq!(pacer.repeat_due(i), None, "the slot isn't late yet");
+        // A timer ticking mid-slot fills every slot, stamped on the grid.
+        for k in 1..=59 {
+            let now = Hns(k * i.ticks() + i.ticks() / 2);
+            assert_eq!(pacer.repeat_due(now), Some(Hns(k * i.ticks())));
+        }
+    }
+
+    #[test]
+    fn frame_pacer_real_frames_win_over_repeats() {
+        let mut pacer = FramePacer::new(60);
+        let i = pacer.interval();
+        assert!(pacer.accept(Hns::ZERO));
+        assert!(pacer.accept(i));
+        assert_eq!(pacer.repeat_due(i + Hns(i.ticks() / 2)), None, "slot 1 was filled");
+    }
+
+    #[test]
+    fn frame_pacer_does_not_burst_repeats_after_a_stall() {
+        let mut pacer = FramePacer::new(60);
+        assert!(pacer.accept(Hns::ZERO));
+        assert_eq!(pacer.repeat_due(Hns::from_secs(1)), Some(Hns::from_secs(1)));
+        assert_eq!(pacer.repeat_due(Hns::from_secs(1)), None);
     }
 
     #[test]

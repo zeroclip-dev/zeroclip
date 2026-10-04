@@ -39,7 +39,7 @@ Manager shows the GPU's Video Encode engine busy with no unexpected CPU copy ove
 - [ ] `zc-video::capture` — WGC session, resize handling
 - [ ] `zc-video::convert` — BGRA → NV12 on the GPU (video processor)
 - [ ] `zc-video::encoder` — capability probe and the async hardware MFT; fixed GOP, VBR, no B-frames
-- [ ] Specs: `Codec::step_down`, `Codec::select`, `Backoff` (HDCP retry)
+- [x] Specs: `Codec::step_down`, `Codec::select`, `Backoff` (HDCP retry)
 - [ ] `zc-video::screenshot`, and wire `Command::Screenshot` in the engine
 - [ ] Wire `GpuVideoSource` into `src/wiring.rs`; show the codec in the status bar
 

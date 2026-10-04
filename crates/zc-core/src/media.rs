@@ -38,7 +38,8 @@ impl Codec {
     /// The watchdog uses this when re-initialisation keeps failing (DESIGN §8).
     #[must_use]
     pub fn step_down(self) -> Option<Self> {
-        todo!("Phase 1: walk down Codec::LADDER (see the `codec_*` specs)")
+        let i = Self::LADDER.iter().position(|&c| c == self)?;
+        Self::LADDER.get(i + 1).copied()
     }
 
     /// Chooses the codec to encode with, given what the hardware supports.
@@ -47,8 +48,12 @@ impl Codec {
     /// supported codec on the ladder is used. `None` means no hardware encoder at all.
     #[must_use]
     pub fn select(supported: &[Self], preferred: Option<Self>) -> Option<Self> {
-        let _ = (supported, preferred);
-        todo!("Phase 1: pick from the ladder (see the `codec_*` specs)")
+        if let Some(p) = preferred
+            && supported.contains(&p)
+        {
+            return Some(p);
+        }
+        Self::LADDER.into_iter().find(|c| supported.contains(c))
     }
 }
 
@@ -201,7 +206,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: Codec::step_down (Phase 1)"]
     fn codec_ladder_steps_down_to_h264() {
         assert_eq!(Codec::Av1.step_down(), Some(Codec::Hevc));
         assert_eq!(Codec::Hevc.step_down(), Some(Codec::H264));
@@ -209,7 +213,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: Codec::select (Phase 1)"]
     fn codec_select_prefers_best_supported() {
         assert_eq!(Codec::select(&[Codec::H264, Codec::Hevc], None), Some(Codec::Hevc));
         assert_eq!(Codec::select(&Codec::LADDER, None), Some(Codec::Av1));
@@ -217,7 +220,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: Codec::select (Phase 1)"]
     fn codec_select_honours_supported_preference_only() {
         let supported = [Codec::Hevc, Codec::H264];
         assert_eq!(Codec::select(&supported, Some(Codec::H264)), Some(Codec::H264));
