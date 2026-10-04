@@ -1,25 +1,100 @@
 //! Screenshots (DESIGN §5): one frame, uncompressed, independent of recording.
+//!
+//! The capture callback only queues a GPU copy into a staging texture
+//! ([`staging_copy`]); the caller (the engine thread, off the hot path) maps it and
+//! encodes the PNG ([`save_png`]). This is the one place a frame is deliberately
+//! copied to system memory.
 
 use std::path::Path;
 
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D};
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_STAGING, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+};
 use zc_core::ports::SourceError;
+use zc_win::error::WinResultExt;
 
-/// Saves `frame` as a PNG at `path`.
+/// Copies `texture` into a new CPU-readable staging texture, on the GPU.
 ///
-/// Phase 1 plan: create a `D3D11_USAGE_STAGING` texture with `D3D11_CPU_ACCESS_READ`
-/// → `CopyResource` → `Map` → copy rows (mind `RowPitch`), swapping BGRA → RGBA →
-/// encode with the `image` crate on a background thread. This is the one place a
-/// frame is deliberately copied to system memory.
+/// # Errors
+/// The texture couldn't be created.
+pub fn staging_copy(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    texture: &ID3D11Texture2D,
+) -> Result<ID3D11Texture2D, SourceError> {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    // SAFETY: `desc` is a valid out-parameter; the copy is a GPU command between two
+    // textures of the same description on a multithread-protected device.
+    unsafe {
+        texture.GetDesc(&mut desc);
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        desc.MiscFlags = 0;
+        let mut staging = None;
+        device
+            .CreateTexture2D(&desc, None, Some(&mut staging))
+            .context("CreateTexture2D (staging)")?;
+        let staging =
+            staging.ok_or_else(|| SourceError::Other("CreateTexture2D returned nothing".into()))?;
+        context.CopyResource(&staging, texture);
+        Ok(staging)
+    }
+}
+
+/// Saves the top-left `size` pixels of a BGRA staging texture as a PNG at `path`.
 ///
 /// # Errors
 /// Mapping or file errors.
 pub fn save_png(
-    device: &ID3D11Device,
     context: &ID3D11DeviceContext,
-    frame: &ID3D11Texture2D,
+    staging: &ID3D11Texture2D,
+    size: (u32, u32),
     path: &Path,
 ) -> Result<(), SourceError> {
-    let _ = (device, context, frame, path);
-    todo!("Phase 1: staging copy → PNG")
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    // SAFETY: `staging` is CPU-readable; Map waits for the GPU copy to finish.
+    unsafe { context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }.context("Map")?;
+    let pitch = mapped.RowPitch as usize;
+    // SAFETY: while mapped, `pData` points at `RowPitch` bytes for each of the
+    // texture's rows, and `size` never exceeds the texture.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(mapped.pData.cast::<u8>(), pitch * size.1 as usize) };
+    let rgba = bgra_to_rgba(bytes, pitch, size.0, size.1);
+    // SAFETY: balances the successful Map above; `bytes` isn't used after this.
+    unsafe { context.Unmap(staging, 0) };
+    image::save_buffer(path, &rgba, size.0, size.1, image::ExtendedColorType::Rgba8)
+        .map_err(|e| SourceError::Other(format!("saving {}: {e}", path.display())))
+}
+
+/// BGRA rows (with `row_pitch` bytes per row) to tightly packed RGBA. Alpha is
+/// forced opaque: DWM's alpha channel isn't reliably 255.
+fn bgra_to_rgba(src: &[u8], row_pitch: usize, width: u32, height: u32) -> Vec<u8> {
+    let row_bytes = width as usize * 4;
+    let mut out = Vec::with_capacity(row_bytes * height as usize);
+    for row in src.chunks(row_pitch).take(height as usize) {
+        for px in row[..row_bytes].chunks_exact(4) {
+            out.extend_from_slice(&[px[2], px[1], px[0], 255]);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bgra_to_rgba_swaps_channels_and_skips_row_padding() {
+        // 2×2 pixels, 12-byte rows (4 bytes of padding each).
+        let src = [
+            1, 2, 3, 0, 4, 5, 6, 0, 9, 9, 9, 9, //
+            7, 8, 9, 0, 10, 11, 12, 0, 9, 9, 9, 9,
+        ];
+        assert_eq!(
+            bgra_to_rgba(&src, 12, 2, 2),
+            [3, 2, 1, 255, 6, 5, 4, 255, 9, 8, 7, 255, 12, 11, 10, 255]
+        );
+    }
 }

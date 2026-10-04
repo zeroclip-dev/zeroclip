@@ -20,8 +20,8 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
     D3D11_VIDEO_USAGE_OPTIMAL_SPEED, D3D11_VPIV_DIMENSION_TEXTURE2D,
-    D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Device, ID3D11Texture2D, ID3D11VideoContext1,
-    ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+    D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
     ID3D11VideoProcessorOutputView,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
@@ -40,6 +40,7 @@ const RING: usize = 8;
 /// Converts captured BGRA textures into NV12 textures for the encoder.
 #[derive(Debug)]
 pub struct NvConverter {
+    context: ID3D11DeviceContext,
     video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext1,
     enumerator: ID3D11VideoProcessorEnumerator,
@@ -47,6 +48,7 @@ pub struct NvConverter {
     textures: Vec<ID3D11Texture2D>,
     outputs: Vec<ID3D11VideoProcessorOutputView>,
     next: usize,
+    last: Option<usize>,
     input: (u32, u32),
     output: (u32, u32),
 }
@@ -64,9 +66,8 @@ impl NvConverter {
     ) -> Result<Self, SourceError> {
         let video_device = device.cast::<ID3D11VideoDevice>().context("ID3D11VideoDevice")?;
         // SAFETY: plain COM call on a live device.
-        let video_context = unsafe { device.GetImmediateContext() }
-            .and_then(|c| c.cast::<ID3D11VideoContext1>())
-            .context("ID3D11VideoContext1")?;
+        let context = unsafe { device.GetImmediateContext() }.context("GetImmediateContext")?;
+        let video_context = context.cast::<ID3D11VideoContext1>().context("ID3D11VideoContext1")?;
         let desc = D3D11_TEXTURE2D_DESC {
             Width: output.0,
             Height: output.1,
@@ -90,6 +91,7 @@ impl NvConverter {
         let (enumerator, processor, outputs) =
             Self::processor(&video_device, &video_context, &textures, input, output)?;
         Ok(Self {
+            context,
             video_device,
             video_context,
             enumerator,
@@ -97,6 +99,7 @@ impl NvConverter {
             textures,
             outputs,
             next: 0,
+            last: None,
             input,
             output,
         })
@@ -257,8 +260,24 @@ impl NvConverter {
         // an input view (and a texture reference) every frame.
         unsafe { ManuallyDrop::drop(&mut stream.pInputSurface) };
         result.context("VideoProcessorBlt")?;
+        self.last = Some(slot);
         self.next = (slot + 1) % RING;
         Ok(slot)
+    }
+
+    /// Copies the last converted frame into the next ring slot and returns that
+    /// slot, for repeating a frame while the screen is static. Copying (rather than
+    /// re-submitting the old slot) means a repeat never touches a texture the encoder
+    /// may still be reading. `None` before the first frame.
+    pub fn repeat_last(&mut self) -> Option<usize> {
+        let last = self.last?;
+        let slot = self.next;
+        // SAFETY: a GPU copy between two NV12 textures of the same size, on a
+        // multithread-protected device.
+        unsafe { self.context.CopyResource(&self.textures[slot], &self.textures[last]) };
+        self.last = Some(slot);
+        self.next = (slot + 1) % RING;
+        Some(slot)
     }
 
     /// The NV12 ring. The encoder pre-creates one sample per texture.

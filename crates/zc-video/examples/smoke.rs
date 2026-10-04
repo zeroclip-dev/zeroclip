@@ -1,51 +1,105 @@
-//! Manual check for the GPU video pipeline on a real machine:
-//! `cargo run -p zc-video --example smoke`.
+//! Manual check for the GPU video pipeline on a real machine (the Phase 1
+//! done-when harness):
+//!
+//! `cargo run -p zc-video --example smoke --release -- [secs=10] [h264|hevc|av1] [fps=60]`
+//!
+//! Writes the raw encoded stream to `capture.h264` / `capture.hevc` / `capture.obu`
+//! and a screenshot to `smoke.png`, then logs packets, keyframe spacing, drops and
+//! faults. Play the stream with `ffplay capture.hevc` or VLC.
 
-use std::sync::Arc;
+use std::io::Write;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use zc_core::ports::CaptureTarget;
-use zc_video::capture::{WgcCapture, capture_item};
-use zc_video::convert::NvConverter;
+use zc_core::Hns;
+use zc_core::media::{Codec, PacketRef};
+use zc_core::ports::{CaptureTarget, VideoSource, VideoStart};
+use zc_core::sink::PacketSink;
+use zc_core::watchdog::HealthEvent;
+use zc_video::GpuVideoSource;
+
+/// Sends every packet to the main thread (allocating is fine in an example).
+struct ChannelSink(mpsc::Sender<(Vec<u8>, bool, Hns)>);
+
+impl PacketSink for ChannelSink {
+    fn push(&self, packet: PacketRef<'_>) {
+        let _ = self.0.send((packet.data.to_vec(), packet.meta.keyframe, packet.meta.pts));
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().init();
-    let _apartment = zc_win::com::Apartment::multithreaded()?;
-    let (device, _context) = zc_video::device::create_device()?;
+    let mut args = std::env::args().skip(1);
+    let secs: u64 = args.next().map_or(Ok(10), |s| s.parse())?;
+    let (codec, file) = match args.next().as_deref() {
+        None | Some("hevc") => (Codec::Hevc, "capture.hevc"),
+        Some("h264") => (Codec::H264, "capture.h264"),
+        Some("av1") => (Codec::Av1, "capture.obu"),
+        Some(other) => return Err(format!("unknown codec {other}").into()),
+    };
+    let fps: u32 = args.next().map_or(Ok(60), |s| s.parse())?;
 
-    let item = capture_item(CaptureTarget::PrimaryMonitor)?;
-    let size = item.Size()?;
-    let input = (u32::try_from(size.Width)?, u32::try_from(size.Height)?);
-    let mut converter = NvConverter::new(&device, input, (input.0 & !1, input.1 & !1))?;
-
-    let [frames, converted, failed] = [(); 3].map(|()| Arc::new(AtomicU64::new(0)));
-    let counters = (Arc::clone(&frames), Arc::clone(&converted), Arc::clone(&failed));
-    let mut last_size = (0, 0);
-    let start = Instant::now();
-    let capture = WgcCapture::start(&device, &item, false, move |frame| {
-        counters.0.fetch_add(1, Ordering::Relaxed);
-        if frame.size != last_size {
-            tracing::info!(size = ?frame.size, "capture size");
-            last_size = frame.size;
+    let (tx, rx) = mpsc::channel();
+    let [drops, faults] = [(); 2].map(|()| Arc::new(AtomicU64::new(0)));
+    let (d, f) = (Arc::clone(&drops), Arc::clone(&faults));
+    let health = Arc::new(move |event: HealthEvent| match event {
+        HealthEvent::FrameDropped => _ = d.fetch_add(1, Ordering::Relaxed),
+        HealthEvent::EncoderFault { hresult } => {
+            tracing::error!(hresult = format_args!("{hresult:#010x}"), "encoder fault");
+            f.fetch_add(1, Ordering::Relaxed);
         }
-        match converter.convert(&frame.texture, frame.size) {
-            Ok(_) => counters.1.fetch_add(1, Ordering::Relaxed),
-            Err(e) => {
-                tracing::warn!(%e, "convert failed");
-                counters.2.fetch_add(1, Ordering::Relaxed)
-            }
-        };
-    })?;
-    std::thread::sleep(Duration::from_secs(5));
-    drop(capture);
-    let n = frames.load(Ordering::Relaxed);
+        _ => {}
+    });
+    let config = VideoStart {
+        target: CaptureTarget::PrimaryMonitor,
+        codec,
+        fps,
+        min_bitrate_bps: 5_000_000,
+        max_bitrate_bps: 20_000_000,
+        keyframe_interval: Hns::from_secs(1),
+        capture_cursor: true,
+    };
+
+    let mut source = GpuVideoSource::new();
+    let used = source.start(&config, Arc::new(ChannelSink(tx)), health)?;
+    tracing::info!(codec = used.name(), secs, fps, "recording");
+    let start = Instant::now();
+    std::thread::sleep(Duration::from_secs(secs / 2));
+    match source.screenshot(Path::new("smoke.png")) {
+        Ok(()) => tracing::info!("screenshot saved to smoke.png"),
+        Err(e) => tracing::warn!(%e, "screenshot failed"),
+    }
+    std::thread::sleep(Duration::from_secs(secs - secs / 2));
+    source.stop();
+    let elapsed = start.elapsed().as_secs_f64();
+
+    let mut out = std::io::BufWriter::new(std::fs::File::create(file)?);
+    let (mut packets, mut bytes, mut keyframes) = (0u64, 0usize, Vec::new());
+    for (data, keyframe, pts) in rx.try_iter() {
+        out.write_all(&data)?;
+        packets += 1;
+        bytes += data.len();
+        if keyframe {
+            keyframes.push(pts);
+        }
+    }
+    out.flush()?;
+    let gaps: Vec<f64> = keyframes.windows(2).map(|w| (w[1] - w[0]).as_secs_f64()).collect();
+    let mean_gap = gaps.iter().sum::<f64>() / gaps.len().max(1) as f64;
+    let max_gap = gaps.iter().copied().fold(0.0, f64::max);
     tracing::info!(
-        frames = n,
-        converted = converted.load(Ordering::Relaxed),
-        failed = failed.load(Ordering::Relaxed),
-        fps = n as f64 / start.elapsed().as_secs_f64(),
-        "capture done"
+        file,
+        packets,
+        fps = packets as f64 / elapsed,
+        mib = bytes as f64 / f64::from(1 << 20),
+        keyframes = keyframes.len(),
+        mean_keyframe_gap_s = mean_gap,
+        max_keyframe_gap_s = max_gap,
+        drops = drops.load(Ordering::Relaxed),
+        faults = faults.load(Ordering::Relaxed),
+        "done"
     );
     Ok(())
 }
