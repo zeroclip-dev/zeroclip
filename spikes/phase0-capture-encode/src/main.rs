@@ -258,6 +258,10 @@ fn record(
         });
     pool.FrameArrived(&handler)?;
     let session = pool.CreateCaptureSession(item)?;
+    // Experiment: WGC's default minimum gap between frames looks like ~16.7 ms, which on
+    // a 200 Hz display lands on every 4th refresh (50 fps). Ask for 1 ms and see.
+    // Needs Windows 11 22H2+; older systems return an error, which we ignore.
+    let _ = session.SetMinUpdateInterval(windows::Foundation::TimeSpan { Duration: 10_000 });
     session.StartCapture()?;
 
     let start = Instant::now();
