@@ -58,8 +58,8 @@ pub fn capture_item(target: CaptureTarget) -> Result<GraphicsCaptureItem, Source
             // SAFETY: `monitor` is a valid HMONITOR obtained just above.
             unsafe { interop.CreateForMonitor(monitor) }.context("CreateForMonitor")
         }
-        // SAFETY: an invalid HWND makes the call fail; it can't cause UB.
         CaptureTarget::Window(hwnd) => {
+            // SAFETY: an invalid HWND makes the call fail; it can't cause UB.
             unsafe { interop.CreateForWindow(HWND(hwnd as *mut c_void)) }.context("CreateForWindow")
         }
         // ponytail: nothing selects a monitor by index until follow-the-game capture
