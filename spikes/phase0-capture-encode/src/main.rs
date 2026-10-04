@@ -79,10 +79,14 @@ fn main() -> Result<()> {
 
     let bytes = std::fs::metadata(OUTPUT)?.len();
     println!(
-        "Wrote {OUTPUT}: {} frames, {:.1} MB, average frame interval {:.2} ms",
+        "Wrote {OUTPUT}: {} frames, {:.1} MB, frame interval min/median/average/max =          {:.2}/{:.2}/{:.2}/{:.2} ms, {:.0}% of frames under 8 ms after the previous one",
         stats.frames,
         bytes as f64 / 1_000_000.0,
-        stats.average_interval_ms
+        stats.min_interval_ms,
+        stats.median_interval_ms,
+        stats.average_interval_ms,
+        stats.max_interval_ms,
+        stats.fast_share * 100.0
     );
     Ok(())
 }
@@ -91,6 +95,11 @@ fn main() -> Result<()> {
 struct Stats {
     frames: u64,
     average_interval_ms: f64,
+    min_interval_ms: f64,
+    median_interval_ms: f64,
+    max_interval_ms: f64,
+    /// Fraction of intervals shorter than 8 ms, i.e. frames arriving at 125+ fps.
+    fast_share: f64,
 }
 
 /// **Step 1** — a hardware D3D11 device that both WGC and Media Foundation can use.
@@ -255,14 +264,14 @@ fn record(
     let mut first_time = None;
     let mut last_time = 0i64;
     let mut frames = 0u64;
-    let mut interval_sum = 0i64;
+    let mut intervals = Vec::<i64>::new();
     while start.elapsed() < DURATION {
         let Ok((texture, time)) = rx.recv_timeout(Duration::from_millis(100)) else {
             continue;
         };
         let first = *first_time.get_or_insert(time);
         if frames > 0 {
-            interval_sum += time - last_time;
+            intervals.push(time - last_time);
         }
         last_time = time;
 
@@ -283,7 +292,22 @@ fn record(
     session.Close()?;
     pool.Close()?;
 
-    let average_interval_ms =
-        if frames > 1 { interval_sum as f64 / (frames - 1) as f64 / 10_000.0 } else { 0.0 };
-    Ok(Stats { frames, average_interval_ms })
+    // Spike-only statistics: how steady is the frame cadence? (100 ns ticks to ms.)
+    intervals.sort_unstable();
+    let ms = |ticks: i64| ticks as f64 / 10_000.0;
+    let at = |i: usize| intervals.get(i).copied().map_or(0.0, ms);
+    let average_interval_ms = if intervals.is_empty() {
+        0.0
+    } else {
+        ms(intervals.iter().sum::<i64>()) / intervals.len() as f64
+    };
+    let fast = intervals.iter().filter(|&&t| ms(t) < 8.0).count();
+    Ok(Stats {
+        frames,
+        average_interval_ms,
+        min_interval_ms: at(0),
+        median_interval_ms: at(intervals.len() / 2),
+        max_interval_ms: at(intervals.len().saturating_sub(1)),
+        fast_share: fast as f64 / intervals.len().max(1) as f64,
+    })
 }
