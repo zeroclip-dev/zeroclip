@@ -58,7 +58,9 @@ use zc_win::mf::MediaFoundation;
 const OUTPUT: &str = "spike-phase0.mp4";
 const DURATION: Duration = Duration::from_secs(10);
 const FPS: u32 = 60;
-const BITRATE_BPS: u32 = 20_000_000;
+// 20 Mbps made the default (constant-bitrate) encoder skip frames on busy screens, with gaps
+// of up to 1 s in the file. 60 Mbps keeps all of them. Phase 1 uses peak-constrained VBR.
+const BITRATE_BPS: u32 = 60_000_000;
 
 fn main() -> Result<()> {
     // COM/WinRT and Media Foundation must be initialised on this thread first.
