@@ -262,6 +262,19 @@ impl Actor {
     fn start_sources(&mut self) {
         // Phase 2: start the audio sources too. Phase 3: hand them all the Recorder
         // instead of the packet counter.
+        self.start_video();
+
+        let inbox = self.inbox.clone();
+        let os_events: Emit<OsEvent> = Arc::new(move |event| {
+            // Fails only while the engine is shutting down; nothing to do then.
+            let _ = inbox.send(Msg::Os(event));
+        });
+        if let Some(Err(e)) = self.ports.input.as_mut().map(|input| input.start(os_events)) {
+            self.emit(EngineEvent::Error(format!("Hotkeys unavailable: {e}")));
+        }
+    }
+
+    fn start_video(&mut self) {
         let inbox = self.inbox.clone();
         let health: Emit<HealthEvent> = Arc::new(move |event| {
             // Fails only while the engine is shutting down; nothing to do then.
@@ -279,15 +292,6 @@ impl Actor {
             None => self.emit(EngineEvent::Warning(
                 "No capture source yet: the GPU video pipeline arrives in Phase 1.".into(),
             )),
-        }
-
-        let inbox = self.inbox.clone();
-        let os_events: Emit<OsEvent> = Arc::new(move |event| {
-            // Fails only while the engine is shutting down; nothing to do then.
-            let _ = inbox.send(Msg::Os(event));
-        });
-        if let Some(Err(e)) = self.ports.input.as_mut().map(|input| input.start(os_events)) {
-            self.emit(EngineEvent::Error(format!("Hotkeys unavailable: {e}")));
         }
     }
 
@@ -323,9 +327,15 @@ impl Actor {
                 }
             }
             Command::ApplySettings(settings) => {
-                // Phase 3/4: re-size the DVR buffer and restart sources whose
-                // settings changed; for now just adopt them.
+                // Phase 3/4: also re-size the DVR buffer.
+                let video_changed = self.settings.video != settings.video;
                 self.settings = *settings;
+                if video_changed && let Some(video) = self.ports.video.as_mut() {
+                    tracing::info!("video settings changed; restarting capture");
+                    video.stop();
+                    self.status.capturing = false;
+                    self.start_video();
+                }
                 if let Some(dir) = &self.settings.recording.output_dir {
                     self.output_dir.clone_from(dir);
                 }
@@ -383,6 +393,7 @@ mod tests {
     /// A video source that never touches a GPU. (`SyntheticVideoSource` arrives in Phase 3.)
     struct FakeVideo {
         fail: bool,
+        starts: Arc<AtomicUsize>,
     }
 
     impl VideoSource for FakeVideo {
@@ -392,6 +403,7 @@ mod tests {
             _: SharedSink,
             _: Emit<HealthEvent>,
         ) -> Result<Codec, SourceError> {
+            self.starts.fetch_add(1, Ordering::Relaxed);
             if self.fail {
                 Err(SourceError::Unsupported("no GPU in this test".into()))
             } else {
@@ -406,7 +418,29 @@ mod tests {
     }
 
     fn with_video(fail: bool) -> Ports {
-        Ports { video: Some(Box::new(FakeVideo { fail })), ..Ports::default() }
+        Ports {
+            video: Some(Box::new(FakeVideo { fail, starts: Arc::default() })),
+            ..Ports::default()
+        }
+    }
+
+    #[test]
+    fn changed_video_settings_restart_capture_once() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let video = FakeVideo { fail: false, starts: Arc::clone(&starts) };
+        let (engine, _) = spawn(Ports { video: Some(Box::new(video)), ..Ports::default() });
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.capturing));
+
+        let mut settings = Settings::default();
+        settings.profiles.default.buffer_secs = 90; // not a video setting
+        engine.send(Command::ApplySettings(Box::new(settings.clone()))).unwrap();
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        assert_eq!(starts.load(Ordering::Relaxed), 1, "unchanged video settings keep capturing");
+
+        settings.video.fps = 30;
+        engine.send(Command::ApplySettings(Box::new(settings))).unwrap();
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.capturing));
+        assert_eq!(starts.load(Ordering::Relaxed), 2);
     }
 
     const TIMEOUT: Duration = Duration::from_secs(5);
