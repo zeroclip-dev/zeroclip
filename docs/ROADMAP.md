@@ -10,6 +10,9 @@ documented core beats a perfect product that isn't finished.
 How to see what is left in the code: `cargo test -- --ignored` runs every spec that
 hasn't been implemented yet.
 
+Every box below is broken into task cards in [docs/plan/](plan/README.md). Work the
+cards; tick a box here when its cards are done.
+
 ## Foundations — done
 
 - [x] Cargo workspace with one crate per subsystem, and the dependency rules between them
@@ -55,7 +58,8 @@ Manager shows the GPU's Video Encode engine busy with no unexpected CPU copy ove
 ## Phase 3 — Buffers, modes, muxing
 
 - [ ] Specs: `DvrBuffer` (all of them, including `dvr_push_never_allocates`), `Tee`, `ChunkedWriter`, `WritePacer`
-- [ ] Decide fMP4 vs MKV; implement `zc_mux::container::create`
+- [ ] Implement `zc_mux::container::create` (fMP4, decided in D18)
+- [ ] Crash-safe recordings: sync every fragment, `.partial` files, startup repair (D18)
 - [ ] `Recorder` spec; `SyntheticVideoSource`; the `synthetic_harness` save-clip spec
 - [ ] DVR save, manual recording, session recording; page-lock the buffer (`VirtualLock`)
 - [ ] `zc-win::drive` + HDD pacing for dumps
@@ -77,7 +81,7 @@ Manager shows the GPU's Video Encode engine busy with no unexpected CPU copy ove
 
 ## Phase 5 — Editor
 
-- [ ] Decide `egui_video` vs libmpv vs an external player (docs/OPEN_QUESTIONS.md)
+- [ ] Keyframe thumbnail strip; preview in an external player (D22)
 - [ ] Specs: `snap_in_point`, `check_compatible`, `rms_peaks`
 - [ ] `zc-editor::ffmpeg` jobs; trim with visible snap points; stitch; export remux
 - [ ] Waveform extraction on a background task, cached by file hash
