@@ -79,8 +79,9 @@ fn main() -> Result<()> {
 
     let bytes = std::fs::metadata(OUTPUT)?.len();
     println!(
-        "Wrote {OUTPUT}: {} frames, {:.1} MB, frame interval min/median/average/max =          {:.2}/{:.2}/{:.2}/{:.2} ms, {:.0}% of frames under 8 ms after the previous one",
+        "Wrote {OUTPUT}: {} of {} arrived frames, {:.1} MB, frame interval min/median/average/max =          {:.2}/{:.2}/{:.2}/{:.2} ms, {:.0}% of frames under 8 ms after the previous one",
         stats.frames,
+        stats.arrived,
         bytes as f64 / 1_000_000.0,
         stats.min_interval_ms,
         stats.median_interval_ms,
@@ -93,6 +94,8 @@ fn main() -> Result<()> {
 
 /// What happened during the recording.
 struct Stats {
+    /// Frames WGC delivered, before pacing.
+    arrived: u64,
     frames: u64,
     average_interval_ms: f64,
     min_interval_ms: f64,
@@ -269,11 +272,23 @@ fn record(
     let mut last_time = 0i64;
     let mut frames = 0u64;
     let mut intervals = Vec::<i64>::new();
+    // Pace to FPS: WGC now delivers every refresh (up to 200/s), but we only want FPS
+    // frames per second. A due-time accumulator keeps the average exact even when the
+    // arrivals sit on a coarse grid (a 5 ms grid gives gaps of 15 and 20 ms, averaging
+    // 16.7 ms). Phase 1's `FramePacer` does this before the GPU copy.
+    let period = 10_000_000 / i64::from(FPS);
+    let mut next_due = 0i64;
+    let mut arrived = 0u64;
     while start.elapsed() < DURATION {
         let Ok((texture, time)) = rx.recv_timeout(Duration::from_millis(100)) else {
             continue;
         };
+        arrived += 1;
         let first = *first_time.get_or_insert(time);
+        if time - first < next_due {
+            continue;
+        }
+        next_due = (next_due + period).max(time - first);
         if frames > 0 {
             intervals.push(time - last_time);
         }
@@ -307,6 +322,7 @@ fn record(
     };
     let fast = intervals.iter().filter(|&&t| ms(t) < 8.0).count();
     Ok(Stats {
+        arrived,
         frames,
         average_interval_ms,
         min_interval_ms: at(0),
