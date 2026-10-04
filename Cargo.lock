@@ -3962,6 +3962,8 @@ dependencies = [
 name = "zc-video"
 version = "0.1.0"
 dependencies = [
+ "tracing",
+ "tracing-subscriber",
  "windows",
  "zc-core",
  "zc-win",
