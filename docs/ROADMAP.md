@@ -20,7 +20,7 @@ cards; tick a box here when its cards are done.
 - [x] Engine actor with ports for the platform adapters, and a synthetic-source harness
 - [x] egui app shell: settings persistence, logging, profile editor, activity feed
 - [x] Design, architecture and decision docs; CLAUDE.md for Claude Code
-- [ ] Add the CI workflow as `.github/workflows/ci.yml` (format, lint, test and docs on Windows)
+- [x] Add the CI workflow as `.github/workflows/ci.yml` (format, lint, test and docs on Windows)
 
 ## Phase 0 — Spike (a weekend)
 
