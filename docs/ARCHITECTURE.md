@@ -15,7 +15,7 @@ state machine; editing never re-encodes; nothing is ever deleted unverified.
 
 | Crate | Owns | Depends on | OS |
 |---|---|---|---|
-| `zeroclip` (repo root) | egui UI, settings file, logging, **wiring** (composition root) | `zc-engine`, `zc-core`; adapters as phases land | Windows |
+| `zeroclip` (repo root) | egui UI, settings file, logging, **wiring** (composition root) | `zc-engine`, `zc-core`, `zc-video`; more adapters as phases land | Windows |
 | `zc-engine` | the engine actor, recording modes, the `Recorder`, synthetic sources | `zc-core`, `zc-mux` | any |
 | `zc-core` | `Hns` time, packets, codecs, DVR buffer, watchdog FSM, profiles, hotkeys, DSP, settings, **ports** | — | any |
 | `zc-mux` | container writers (fMP4/MKV), chunked writes, HDD pacing | `zc-core` | any |
