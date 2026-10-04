@@ -53,6 +53,8 @@ pub struct VideoStart {
     pub max_bitrate_bps: u32,
     /// Fixed IDR interval (DESIGN §3: 1–2 s, never encoder defaults).
     pub keyframe_interval: Hns,
+    /// Draw the mouse cursor into the capture (WGC `IsCursorCaptureEnabled`).
+    pub capture_cursor: bool,
 }
 
 /// Parameters for starting an audio source.

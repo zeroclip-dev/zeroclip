@@ -1,14 +1,19 @@
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use zc_core::control::{Command, EngineEvent, EngineStatus};
-use zc_core::ports::{AudioSource, Emit, InputSource, OsEvent, VideoSource};
+use zc_core::ports::{
+    AudioSource, CaptureTarget, Emit, InputSource, OsEvent, VideoSource, VideoStart,
+};
 use zc_core::settings::Settings;
+use zc_core::sink::{PacketSink, SharedSink};
 use zc_core::watchdog::HealthEvent;
+use zc_core::{Codec, PacketRef};
 
 /// The platform adapters the engine drives. Every one is optional: the app runs,
 /// and the UI works, before the phase that delivers a given adapter lands.
@@ -88,6 +93,7 @@ impl Engine {
             events: events_tx,
             wake,
             status: EngineStatus::default(),
+            packets: Arc::default(),
         };
         let thread =
             thread::Builder::new().name("zc-engine".into()).spawn(move || actor.run(&rx))?;
@@ -99,8 +105,6 @@ impl Engine {
 enum Msg {
     Command(Command),
     Os(OsEvent),
-    // Constructed by the health emitter handed to the video source (Phase 1).
-    #[expect(dead_code, reason = "scaffold: sent once sources report health (Phase 1)")]
     Health(HealthEvent),
 }
 
@@ -174,6 +178,40 @@ struct Actor {
     events: Sender<EngineEvent>,
     wake: Emit<()>,
     status: EngineStatus,
+    packets: Arc<PacketCounter>,
+}
+
+/// Counts what the video source produces. A Phase 1 stand-in for the `Recorder`,
+/// which needs Phase 2's `MasterClock` and Phase 3's `DvrBuffer`; Phase 3 replaces
+/// it. Atomics only, so `push` never allocates or blocks (CLAUDE.md rule 2).
+#[derive(Debug, Default)]
+struct PacketCounter {
+    packets: AtomicU64,
+    keyframes: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl PacketSink for PacketCounter {
+    fn push(&self, packet: PacketRef<'_>) {
+        self.packets.fetch_add(1, Ordering::Relaxed);
+        self.keyframes.fetch_add(u64::from(packet.meta.keyframe), Ordering::Relaxed);
+        self.bytes.fetch_add(packet.data.len() as u64, Ordering::Relaxed);
+    }
+}
+
+/// What the video source is asked to do, from the user's settings.
+fn video_start(settings: &Settings) -> VideoStart {
+    let v = &settings.video;
+    VideoStart {
+        target: CaptureTarget::PrimaryMonitor,
+        // "Auto" asks for the best codec; the adapter walks down the ladder.
+        codec: v.codec.unwrap_or(Codec::LADDER[0]),
+        fps: v.fps,
+        min_bitrate_bps: v.min_bitrate_kbps.saturating_mul(1_000),
+        max_bitrate_bps: v.max_bitrate_kbps.saturating_mul(1_000),
+        keyframe_interval: v.keyframe_interval(),
+        capture_cursor: v.capture_cursor,
+    }
 }
 
 impl Actor {
@@ -211,13 +249,25 @@ impl Actor {
     }
 
     fn start_sources(&mut self) {
-        // Phase 1: create the Recorder, start `ports.video` with it as the sink and
-        // a health emitter posting `Msg::Health`, then publish the codec in use.
-        // Phase 2: start the audio sources with the same Recorder.
-        if self.ports.video.is_none() {
-            self.emit(EngineEvent::Warning(
+        // Phase 2: start the audio sources too. Phase 3: hand them all the Recorder
+        // instead of the packet counter.
+        let inbox = self.inbox.clone();
+        let health: Emit<HealthEvent> = Arc::new(move |event| {
+            // Fails only while the engine is shutting down; nothing to do then.
+            let _ = inbox.send(Msg::Health(event));
+        });
+        let config = video_start(&self.settings);
+        let sink: SharedSink = Arc::clone(&self.packets) as SharedSink;
+        match self.ports.video.as_mut().map(|video| video.start(&config, sink, health)) {
+            Some(Ok(codec)) => {
+                tracing::info!(codec = codec.name(), "capture started");
+                self.status.capturing = true;
+                self.status.codec = Some(codec);
+            }
+            Some(Err(e)) => self.emit(EngineEvent::Error(format!("Capture unavailable: {e}"))),
+            None => self.emit(EngineEvent::Warning(
                 "No capture source yet: the GPU video pipeline arrives in Phase 1.".into(),
-            ));
+            )),
         }
 
         let inbox = self.inbox.clone();
@@ -240,7 +290,15 @@ impl Actor {
         }
         if let Some(video) = video {
             video.stop();
+            let c = &self.packets;
+            tracing::info!(
+                packets = c.packets.load(Ordering::Relaxed),
+                keyframes = c.keyframes.load(Ordering::Relaxed),
+                bytes = c.bytes.load(Ordering::Relaxed),
+                "video stream totals"
+            );
         }
+        self.status.capturing = false;
     }
 
     fn on_command(&mut self, command: Command) {
@@ -290,9 +348,41 @@ impl Actor {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
+
+    use zc_core::ports::SourceError;
 
     use super::*;
+
+    /// A video source that never touches a GPU. (`SyntheticVideoSource` arrives in Phase 3.)
+    struct FakeVideo {
+        fail: bool,
+    }
+
+    impl VideoSource for FakeVideo {
+        fn start(
+            &mut self,
+            _: &VideoStart,
+            _: SharedSink,
+            _: Emit<HealthEvent>,
+        ) -> Result<Codec, SourceError> {
+            if self.fail {
+                Err(SourceError::Unsupported("no GPU in this test".into()))
+            } else {
+                Ok(Codec::Hevc)
+            }
+        }
+        fn stop(&mut self) {}
+        fn request_keyframe(&mut self) {}
+        fn screenshot(&mut self, path: &Path) -> Result<(), SourceError> {
+            std::fs::write(path, b"png").map_err(|e| SourceError::Other(e.to_string()))
+        }
+    }
+
+    fn with_video(fail: bool) -> Ports {
+        Ports { video: Some(Box::new(FakeVideo { fail })), ..Ports::default() }
+    }
 
     const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -352,6 +442,34 @@ mod tests {
         let event = wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
         let EngineEvent::Status(status) = event else { unreachable!() };
         assert_eq!(status.buffer_window, zc_core::Hns::from_secs(90));
+    }
+
+    #[test]
+    fn reports_the_codec_once_capture_starts() {
+        let (engine, _) = spawn(with_video(false));
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Status(s) if s.capturing && s.codec == Some(Codec::Hevc)),
+        );
+    }
+
+    #[test]
+    fn capture_failure_is_reported_not_fatal() {
+        let (engine, _) = spawn(with_video(true));
+        wait_for(&engine, |e| matches!(e, EngineEvent::Error(m) if m.starts_with("Capture")));
+        let event = wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        let EngineEvent::Status(status) = event else { unreachable!() };
+        assert!(!status.capturing);
+    }
+
+    #[test]
+    fn video_start_follows_settings() {
+        let start = video_start(&Settings::default());
+        assert_eq!(start.codec, Codec::Av1, "Auto asks for the best codec");
+        assert_eq!(start.min_bitrate_bps, 5_000_000);
+        assert_eq!(start.max_bitrate_bps, 20_000_000);
+        assert_eq!(start.keyframe_interval, zc_core::Hns::from_secs(1));
+        assert!(!start.capture_cursor);
     }
 
     #[test]
