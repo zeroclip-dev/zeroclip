@@ -40,6 +40,9 @@ fn top_bar(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
             let status = &app.status;
             let (color, text) = if status.recording {
                 (Color32::LIGHT_RED, "Recording".to_owned())
+            } else if status.capturing && status.buffered == Hns::ZERO {
+                // Nothing is buffered until the DVR arrives in Phase 3.
+                (Color32::LIGHT_GREEN, "Capturing".to_owned())
             } else if status.capturing {
                 (Color32::LIGHT_GREEN, format!("Buffering {}", human_duration(status.buffered)))
             } else {

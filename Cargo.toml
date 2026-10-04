@@ -93,6 +93,7 @@ publish.workspace = true
 [dependencies]
 zc-core.workspace = true
 zc-engine.workspace = true
+zc-video.workspace = true
 anyhow.workspace = true
 directories.workspace = true
 eframe.workspace = true
