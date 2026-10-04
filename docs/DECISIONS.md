@@ -85,3 +85,42 @@ license: forks can't ship under the ZeroClip name.
 ### D17 · Specs as ignored tests
 Designed-but-unbuilt behaviour lives as `#[ignore = "spec: …"]` tests beside the code.
 Progress is `cargo test -- --ignored`; a spec is only changed deliberately, with a reason.
+
+### D18 · Fragmented MP4, synced every fragment (settles Q3; refines D8)
+fMP4 is the only container we write. `create(Matroska)` returns `Unsupported`, but the
+enum variant stays so older settings files still load. Each GOP (1–2 s, D5) becomes one
+`moof`+`mdat` fragment. Recordings and crash-rescue dumps flush the IO stack and call
+`FlushFileBuffers` at every fragment boundary, even when an IO chunk isn't full yet. They
+are written as `*.mp4.partial` and renamed when finished. At startup the app truncates
+any leftover `.partial` to its last complete fragment and offers it to the user. That puts
+the worst case at about 1 s lost, whether the app crashes, the game crashes or the power
+fails. DVR clip dumps sync once at the end, because their source is still in RAM.
+fMP4 plays in browsers and Discord without a remux, which matters because Discord is the
+main destination (D14). Truncation-safety is the same in either container; how often we
+sync is what bounds the loss. Costs: about 300 more lines of box writing than MKV, and
+one fsync per second while recording.
+
+### D19 · DVR snapshots copy (settles Q4)
+`DvrBuffer::snapshot` copies the window out, as the specs already assume. The engine
+logs how long the recorder lock is held for each snapshot. Revisit with shared
+fixed-size segments only if a 300 s snapshot holds the lock for more than 20 ms or audio
+glitches during a dump. Cost: RAM briefly doubles during a dump.
+
+### D20 · DVR and recording run together, one recording at a time (settles Q5)
+The `Tee` feeds the DVR and at most one recording (manual or session) from a single
+encode. `ToggleRecording` stops whatever is recording. Keeping them exclusive would save
+nothing, because the DVR keeps buffering for free.
+
+### D21 · DVR resize is a brief writer pause (settles Q6)
+A profile switch resizes the buffer under the recorder mutex, and the pause is logged.
+Profiles are sticky, so resizes only happen when the tracked game changes. If the
+logged pause gets near 100 ms (10 dropped frames at 60 fps is 166 ms and trips the
+watchdog), allocate and page-lock outside the lock, then swap. No double buffering: it
+would double peak RAM.
+
+### D22 · Editor playback: keyframe thumbnails and an external player (settles Q7)
+The timeline shows keyframe thumbnails made by `ffmpeg.exe`
+(`-skip_frame nokey`), cached by file. "Preview" runs `ffplay -ss … -t …` from next to
+`ffmpeg.exe`, falling back to the default player. No libmpv (a heavy runtime DLL and an
+installer concern) and no `egui_video` (it links FFmpeg as a library, which breaks D3).
+Cost: no frame-accurate in-app scrubbing. Our cuts snap to keyframes anyway (D5).
