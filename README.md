@@ -6,7 +6,8 @@ the game, without copying frames off the GPU, and without losing the clip when t
 game crashes.
 
 > **Status: pre-alpha.** The foundations are in place and Phase 0 (the capture →
-> encode spike) is next. Nothing records yet. See the [roadmap](docs/ROADMAP.md).
+> encode spike) has proven the pipeline; Phase 1 (the real capture core) is next. The
+> app itself doesn't record yet. See the [roadmap](docs/ROADMAP.md).
 
 ## What makes it different
 

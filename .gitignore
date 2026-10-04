@@ -9,4 +9,4 @@
 /.claude/settings.local.json
 
 # Output of the Phase 0 spike when run from the repo root
-/spike-phase0.mp4
+/spike-phase0*.mp4
