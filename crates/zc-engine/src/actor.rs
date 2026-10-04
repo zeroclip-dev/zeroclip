@@ -6,9 +6,12 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use time::OffsetDateTime;
+use time::macros::format_description;
+
 use zc_core::control::{Command, EngineEvent, EngineStatus};
 use zc_core::ports::{
-    AudioSource, CaptureTarget, Emit, InputSource, OsEvent, VideoSource, VideoStart,
+    AudioSource, CaptureTarget, Emit, InputSource, OsEvent, SourceError, VideoSource, VideoStart,
 };
 use zc_core::settings::Settings;
 use zc_core::sink::{PacketSink, SharedSink};
@@ -214,6 +217,14 @@ fn video_start(settings: &Settings) -> VideoStart {
     }
 }
 
+/// `2026-10-05 14-03-22.123`: sortable, no colons (Windows forbids them in file
+/// names), and milliseconds so two screenshots in one second don't collide.
+fn file_stamp(t: OffsetDateTime) -> String {
+    let format =
+        format_description!("[year]-[month]-[day] [hour]-[minute]-[second].[subsecond digits:3]");
+    t.format(format).unwrap_or_else(|_| t.unix_timestamp().to_string())
+}
+
 impl Actor {
     fn run(mut self, rx: &Receiver<Msg>) {
         tracing::info!(output_dir = %self.output_dir.display(), "engine started");
@@ -305,7 +316,7 @@ impl Actor {
         match command {
             Command::SaveClip => self.not_implemented("Saving a DVR clip", 3),
             Command::ToggleRecording => self.not_implemented("Manual recording", 3),
-            Command::Screenshot => self.not_implemented("Screenshots", 1),
+            Command::Screenshot => self.take_screenshot(),
             Command::PushToTalk(down) => {
                 if let Some(mic) = self.ports.mic.as_mut() {
                     mic.set_gate(down);
@@ -322,6 +333,22 @@ impl Actor {
                 self.publish_status();
             }
             Command::Shutdown => unreachable!("handled by the run loop"),
+        }
+    }
+
+    /// Runs on the engine thread, off the hot path, so a ~100 ms PNG encode is fine.
+    fn take_screenshot(&mut self) {
+        let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+        let path = self.output_dir.join(format!("ZeroClip {}.png", file_stamp(now)));
+        let result = match self.ports.video.as_mut() {
+            Some(video) if self.status.capturing => std::fs::create_dir_all(&self.output_dir)
+                .map_err(|e| SourceError::Other(e.to_string()))
+                .and_then(|()| video.screenshot(&path)),
+            _ => Err(SourceError::Other("capture isn't running".into())),
+        };
+        match result {
+            Ok(()) => self.emit(EngineEvent::ScreenshotSaved { path }),
+            Err(e) => self.emit(EngineEvent::Error(format!("Screenshot failed: {e}"))),
         }
     }
 
@@ -350,8 +377,6 @@ impl Actor {
 mod tests {
     use std::path::Path;
     use std::sync::atomic::AtomicUsize;
-
-    use zc_core::ports::SourceError;
 
     use super::*;
 
@@ -470,6 +495,32 @@ mod tests {
         assert_eq!(start.max_bitrate_bps, 20_000_000);
         assert_eq!(start.keyframe_interval, zc_core::Hns::from_secs(1));
         assert!(!start.capture_cursor);
+    }
+
+    #[test]
+    fn file_stamp_is_sortable_and_has_no_colons() {
+        let t = time::macros::datetime!(2023-11-14 22:13:20.5 UTC);
+        assert_eq!(file_stamp(t), "2023-11-14 22-13-20.500");
+    }
+
+    #[test]
+    fn screenshot_is_saved_in_the_output_folder() {
+        let (engine, _) = spawn(with_video(false));
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.capturing));
+        engine.send(Command::Screenshot).unwrap();
+        let event = wait_for(&engine, |e| matches!(e, EngineEvent::ScreenshotSaved { .. }));
+        let EngineEvent::ScreenshotSaved { path } = event else { unreachable!() };
+        assert_eq!(path.parent(), Some(std::env::temp_dir().join("zeroclip-test").as_path()));
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("png"));
+        assert!(path.is_file());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn screenshot_without_capture_is_an_error() {
+        let (engine, _) = spawn(Ports::default());
+        engine.send(Command::Screenshot).unwrap();
+        wait_for(&engine, |e| matches!(e, EngineEvent::Error(m) if m.starts_with("Screenshot")));
     }
 
     #[test]

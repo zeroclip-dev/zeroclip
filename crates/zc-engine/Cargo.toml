@@ -11,6 +11,7 @@ publish.workspace = true
 zc-core.workspace = true
 zc-mux.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tracing.workspace = true
 
 [lints]
