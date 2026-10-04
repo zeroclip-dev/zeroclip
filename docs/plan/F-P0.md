@@ -8,8 +8,8 @@ Generated from the planning inventory (2026-10-04) and edited by hand. See [READ
 
 Tick a box when the card is done. Write `(awaiting HW check)` after the title while 0xtikaa still has to verify it on hardware.
 
-- [ ] F.0 · First build: get the untouched workspace to a green baseline
-- [ ] F.1 · Add the CI workflow (.github/workflows/ci.yml): fmt, clippy -D warnings, tests, rustdoc on windows-latest
+- [x] F.0 · First build: get the untouched workspace to a green baseline
+- [x] F.1 · Add the CI workflow (.github/workflows/ci.yml): fmt, clippy -D warnings, tests, rustdoc on windows-latest
 - [ ] P0.1 · Spike steps 1-2: hardware D3D11 device with multithread protection; GraphicsCaptureItem for the primary monitor (HW)
 - [ ] P0.2 · Spike step 3: Media Foundation sink writer with a DXGI device manager and hardware transforms (HW)
 - [ ] P0.3 · Spike step 4: WGC free-threaded frame pool, GPU copy, samples into the sink writer for 10 s (HW)
