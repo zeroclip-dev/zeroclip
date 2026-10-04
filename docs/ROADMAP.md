@@ -27,8 +27,8 @@ cards; tick a box here when its cards are done.
 Prove the riskiest assumption before building on it: WGC frame → Media Foundation
 hardware encoder → file on disk, with no system-memory round trip for the frame.
 
-- [ ] `spikes/phase0-capture-encode`: steps 1–4
-- [ ] Try H.264 first, then HEVC (and AV1 if your GPU has it)
+- [x] `spikes/phase0-capture-encode`: steps 1–4
+- [x] Try H.264 first, then HEVC (and AV1 if your GPU has it). H.264 and HEVC work; AV1 isn't supported on this GPU. Findings are in the spike's module doc.
 
 *Done when:* a 10-second hardware-encoded MP4 exists, plays in VLC and a browser, and Task
 Manager shows the GPU's Video Encode engine busy with no unexpected CPU copy overhead.
