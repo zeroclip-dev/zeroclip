@@ -6,7 +6,7 @@
 //!
 //! | Module | What it owns | Design doc |
 //! |---|---|---|
-//! | [`time`] | [`Hns`] (100 ns ticks) and the [`MasterClock`](time::MasterClock) | §3, §6 |
+//! | [`time`] | [`Hns`] (100 ns ticks), the [`FramePacer`](time::FramePacer) and the [`MasterClock`](time::MasterClock) | §3, §6 |
 //! | [`media`] | codecs and the capability ladder, tracks, encoded packets | §3 |
 //! | [`sink`] | how packets flow: [`PacketSink`](sink::PacketSink), [`Tee`](sink::Tee) | §5 |
 //! | [`dvr`] | the GOP-aware retrospective ring buffer | §4, §6 |
