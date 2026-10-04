@@ -12,7 +12,7 @@ Tick a box when the card is done. Write `(awaiting HW check)` after the title wh
 - [x] F.1 · Add the CI workflow (.github/workflows/ci.yml): fmt, clippy -D warnings, tests, rustdoc on windows-latest
 - [x] P0.1 · Spike steps 1-2: hardware D3D11 device with multithread protection; GraphicsCaptureItem for the primary monitor (HW)
 - [x] P0.2 · Spike step 3: Media Foundation sink writer with a DXGI device manager and hardware transforms (HW)
-- [ ] P0.3 · Spike step 4: WGC free-threaded frame pool, GPU copy, samples into the sink writer for 10 s (HW) (awaiting HW check)
+- [x] P0.3 · Spike step 4: WGC free-threaded frame pool, GPU copy, samples into the sink writer for 10 s (HW)
 - [ ] P0.4 · Spike: try HEVC and AV1, check Phase 0 done-when, record findings, tick roadmap (HW)
 
 Area notes (pitfalls, open-question background): see [P1.md](P1.md#notes-for-this-area).
