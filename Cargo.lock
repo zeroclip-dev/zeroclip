@@ -4001,6 +4001,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "zc-audio",
  "zc-core",
  "zc-engine",
  "zc-input",

@@ -387,7 +387,7 @@ impl Actor {
                 packets = c.packets.load(Ordering::Relaxed),
                 keyframes = c.keyframes.load(Ordering::Relaxed),
                 bytes = c.bytes.load(Ordering::Relaxed),
-                "video stream totals"
+                "stream totals (all tracks)"
             );
         }
         self.status.capturing = false;
