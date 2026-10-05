@@ -97,6 +97,7 @@ zc-core.workspace = true
 zc-engine.workspace = true
 zc-video.workspace = true
 zc-input.workspace = true
+zc-audio.workspace = true
 anyhow.workspace = true
 directories.workspace = true
 eframe.workspace = true

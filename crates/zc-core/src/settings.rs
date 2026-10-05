@@ -150,7 +150,7 @@ impl VideoSettings {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MicMode {
-    /// No mic track content (silence).
+    /// No microphone and no mic track.
     #[default]
     Off,
     /// Always recording.
