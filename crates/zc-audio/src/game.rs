@@ -13,10 +13,11 @@ use windows::Win32::Media::Audio::{
     IAudioClient, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
     VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
 };
+use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender};
 use windows::Win32::System::Com::StructuredStorage::{
     PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
 };
-use windows::Win32::System::Com::{BLOB, IAgileObject};
+use windows::Win32::System::Com::{BLOB, CLSCTX_ALL, CoCreateInstance, IAgileObject};
 use windows::Win32::System::Variant::VT_BLOB;
 use windows::core::{IUnknown, Interface, Ref, implement};
 use zc_core::media::TrackId;
@@ -77,6 +78,25 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Completion_Impl {
         let _ = self.done.try_send(());
         Ok(())
     }
+}
+
+/// Whole-system loopback of the default playback device: the fallback before
+/// Windows 11 build 20348 (D9). It records everything, Discord included, and
+/// delivers nothing while nothing plays; `SampleTimeline` fills those gaps with
+/// silence (up to 1 s) or restarts.
+fn open_endpoint_loopback(
+    format: &windows::Win32::Media::Audio::WAVEFORMATEX,
+) -> Result<Stream, SourceError> {
+    // SAFETY: plain COM calls on this thread's apartment.
+    let client: IAudioClient = unsafe {
+        let devices: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+            .context("MMDeviceEnumerator")?;
+        let device = devices
+            .GetDefaultAudioEndpoint(eRender, eConsole)
+            .context("default playback device")?;
+        device.Activate(CLSCTX_ALL, None).context("IMMDevice::Activate")?
+    };
+    Stream::start(client, true, format)
 }
 
 /// An audio client capturing process `pid` and its children.
@@ -174,9 +194,22 @@ impl AudioSource for GameAudioSource {
             let _mmcss = Mmcss::join();
             let format = pcm16_format(config.sample_rate, config.channels);
             let (mut current, mut stream) = (0u32, None::<Stream>);
+            // Set once process loopback turns out to be unsupported (pre-20348).
+            let mut endpoint = false;
             while !stop.load(Ordering::Acquire) {
                 let want = target.load(Ordering::Relaxed);
-                if want != current {
+                if endpoint {
+                    // Targets don't matter any more; (re)open after a device change.
+                    if stream.is_none() {
+                        stream = open_endpoint_loopback(&format)
+                            .inspect_err(|e| tracing::debug!(%e, "playback device unavailable"))
+                            .ok();
+                        if stream.is_none() {
+                            std::thread::sleep(Duration::from_secs(1));
+                            continue;
+                        }
+                    }
+                } else if want != current {
                     // A retarget leaves a gap; the timeline fills or restarts it.
                     stream = None;
                     current = want;
@@ -185,6 +218,10 @@ impl AudioSource for GameAudioSource {
                             Ok(s) => {
                                 tracing::info!(pid = want, "capturing game audio");
                                 stream = Some(s);
+                            }
+                            Err(SourceError::Unsupported(e)) => {
+                                tracing::info!(%e, "falling back to whole-system loopback");
+                                endpoint = true;
                             }
                             Err(e) => {
                                 tracing::warn!(pid = want, %e, "can't capture this process's audio")
