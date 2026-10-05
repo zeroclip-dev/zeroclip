@@ -35,13 +35,13 @@ Manager shows the GPU's Video Encode engine busy with no unexpected CPU copy ove
 
 ## Phase 1 — Capture core
 
-- [ ] `zc-video::device` — the shared D3D11 device, multithread-protected
-- [ ] `zc-video::capture` — WGC session, resize handling
-- [ ] `zc-video::convert` — BGRA → NV12 on the GPU (video processor)
-- [ ] `zc-video::encoder` — capability probe and the async hardware MFT; fixed GOP, VBR, no B-frames
+- [x] `zc-video::device` — the shared D3D11 device, multithread-protected
+- [x] `zc-video::capture` — WGC session, resize handling
+- [x] `zc-video::convert` — BGRA → NV12 on the GPU (video processor)
+- [x] `zc-video::encoder` — capability probe and the async hardware MFT; fixed GOP, VBR, no B-frames
 - [x] Specs: `Codec::step_down`, `Codec::select`, `Backoff` (HDCP retry)
-- [ ] `zc-video::screenshot`, and wire `Command::Screenshot` in the engine
-- [ ] Wire `GpuVideoSource` into `src/wiring.rs`; show the codec in the status bar
+- [x] `zc-video::screenshot`, and wire `Command::Screenshot` in the engine
+- [x] Wire `GpuVideoSource` into `src/wiring.rs`; show the codec in the status bar
 
 *Done when:* recording survives alt-tabbing, resolution changes, and a Netflix tab opening and closing.
 
