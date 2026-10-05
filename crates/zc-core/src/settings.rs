@@ -57,6 +57,9 @@ impl Settings {
         if !(1..=64).contains(&self.storage.write_chunk_mib) {
             problems.push("The write chunk size must be between 1 and 64 MiB.".to_owned());
         }
+        if !AAC_BITRATES_KBPS.contains(&self.audio.bitrate_kbps) {
+            problems.push("The audio bitrate must be 96, 128, 160 or 192 kbps.".to_owned());
+        }
         if self.audio.mic == MicMode::PushToTalk && self.hotkeys.push_to_talk.is_none() {
             problems.push("Push-to-talk mode needs a push-to-talk hotkey.".to_owned());
         }
@@ -159,6 +162,9 @@ pub enum MicMode {
     PushToTalk,
 }
 
+/// The AAC bitrates the Microsoft encoder supports, in kbit/s.
+pub const AAC_BITRATES_KBPS: [u32; 4] = [96, 128, 160, 192];
+
 /// Audio settings.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -246,6 +252,15 @@ mod tests {
         assert_eq!(s.hotkeys.save_clip.to_string(), "Alt+F10");
         assert!(!s.uploads.delete_local_after_verified_upload, "auto-delete must default off");
         assert_eq!(s.audio.mic, MicMode::Off);
+    }
+
+    #[test]
+    fn audio_bitrate_must_be_one_the_encoder_supports() {
+        let mut s = Settings::default();
+        s.audio.bitrate_kbps = 200;
+        assert!(s.problems().iter().any(|p| p.contains("audio bitrate")));
+        s.audio.bitrate_kbps = 128;
+        assert!(s.problems().is_empty());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use eframe::egui::{self, RichText};
 use zc_core::control::Command;
 use zc_core::hotkey::Chord;
+use zc_core::settings::MicMode;
 
 use super::{human_duration, notice_color};
 use crate::app::ZeroClipApp;
@@ -19,7 +20,9 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
         hotkey_row(ui, &hotkeys.save_clip, "Save the buffer as a clip");
         hotkey_row(ui, &hotkeys.toggle_recording, "Start or stop recording");
         hotkey_row(ui, &hotkeys.screenshot, "Screenshot");
-        if let Some(ptt) = &hotkeys.push_to_talk {
+        if app.settings.audio.mic == MicMode::PushToTalk
+            && let Some(ptt) = &hotkeys.push_to_talk
+        {
             hotkey_row(ui, ptt, "Push-to-talk (hold)");
         }
     });

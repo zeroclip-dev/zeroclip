@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use eframe::egui::{self, Button, ComboBox, DragValue, Grid, TextEdit};
 use zc_core::hotkey::Chord;
 use zc_core::media::{Codec, ContainerFormat};
-use zc_core::settings::{MicMode, Settings};
+use zc_core::settings::{AAC_BITRATES_KBPS, MicMode, Settings};
 
 use super::{dvr_megabytes, human_duration};
 use crate::app::ZeroClipApp;
@@ -195,6 +195,10 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
         section(ui, "Audio", |ui| {
             let audio = &mut draft.settings.audio;
             ui.checkbox(&mut audio.game_audio, "Record the game's audio (track 1)");
+            ui.weak(
+                "Only the game in focus is captured: Discord, music and notifications stay \
+                 out of your clips. Needs Windows 11; older Windows records all system audio.",
+            );
             ui.horizontal(|ui| {
                 ui.label("Microphone (track 2)");
                 ComboBox::from_id_salt("mic").selected_text(mic_label(audio.mic)).show_ui(ui, |ui| {
@@ -203,11 +207,22 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
                     }
                 });
             });
-            ui.checkbox(&mut audio.mic_compressor, "Even out the mic level (compressor)");
+            ui.add_enabled(
+                audio.mic != MicMode::Off,
+                egui::Checkbox::new(&mut audio.mic_compressor, "Even out the mic level (compressor)"),
+            );
             ui.horizontal(|ui| {
                 ui.label("AAC bitrate");
-                ui.add(DragValue::new(&mut audio.bitrate_kbps).range(64..=320).suffix(" kbps"));
+                // The Microsoft AAC encoder supports exactly these.
+                ComboBox::from_id_salt("aac")
+                    .selected_text(format!("{} kbps", audio.bitrate_kbps))
+                    .show_ui(ui, |ui| {
+                        for kbps in AAC_BITRATES_KBPS {
+                            ui.selectable_value(&mut audio.bitrate_kbps, kbps, format!("{kbps} kbps"));
+                        }
+                    });
             });
+            ui.weak("Turning game audio or the microphone on or off takes effect the next time ZeroClip starts.");
         });
 
         section(ui, "Hotkeys", |ui| {
