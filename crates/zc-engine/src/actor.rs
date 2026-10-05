@@ -12,7 +12,8 @@ use time::macros::format_description;
 use zc_core::control::{Command, EngineEvent, EngineStatus};
 use zc_core::hotkey::{Binding, ChordMatcher, HotkeyEvent, Trigger};
 use zc_core::ports::{
-    AudioSource, CaptureTarget, Emit, InputSource, OsEvent, SourceError, VideoSource, VideoStart,
+    AudioSource, AudioStart, CaptureTarget, Emit, InputSource, OsEvent, SourceError, VideoSource,
+    VideoStart,
 };
 use zc_core::settings::{MicMode, Settings};
 use zc_core::sink::{PacketSink, SharedSink};
@@ -300,10 +301,19 @@ impl Actor {
         self.emit(EngineEvent::Status(self.status.clone()));
     }
 
+    /// Posts health signals from source threads into the engine's inbox.
+    fn health_emitter(&self) -> Emit<HealthEvent> {
+        let inbox = self.inbox.clone();
+        Arc::new(move |event| {
+            // Fails only while the engine is shutting down; nothing to do then.
+            let _ = inbox.send(Msg::Health(event));
+        })
+    }
+
     fn start_sources(&mut self) {
-        // Phase 2: start the audio sources too. Phase 3: hand them all the Recorder
-        // instead of the packet counter.
+        // Phase 3: hand every source the Recorder instead of the packet counter.
         self.start_video();
+        self.start_audio();
 
         let inbox = self.inbox.clone();
         let os_events: Emit<OsEvent> = Arc::new(move |event| {
@@ -315,12 +325,38 @@ impl Actor {
         }
     }
 
+    /// Both audio tracks: 48 kHz stereo AAC at the configured bitrate.
+    fn start_audio(&mut self) {
+        let config = AudioStart {
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate_bps: self.settings.audio.bitrate_kbps.saturating_mul(1_000),
+        };
+        let health = self.health_emitter();
+        let sink: SharedSink = Arc::clone(&self.packets) as SharedSink;
+        let gate_open = self.settings.audio.mic == MicMode::AlwaysOn;
+        let mut errors = Vec::new();
+        if let Some(Err(e)) = self
+            .ports
+            .game_audio
+            .as_mut()
+            .map(|a| a.start(&config, Arc::clone(&sink), Arc::clone(&health)))
+        {
+            errors.push(format!("Game audio unavailable: {e}"));
+        }
+        if let Some(mic) = self.ports.mic.as_mut() {
+            match mic.start(&config, sink, health) {
+                Ok(()) => mic.set_gate(gate_open),
+                Err(e) => errors.push(format!("Microphone unavailable: {e}")),
+            }
+        }
+        for error in errors {
+            self.emit(EngineEvent::Error(error));
+        }
+    }
+
     fn start_video(&mut self) {
-        let inbox = self.inbox.clone();
-        let health: Emit<HealthEvent> = Arc::new(move |event| {
-            // Fails only while the engine is shutting down; nothing to do then.
-            let _ = inbox.send(Msg::Health(event));
-        });
+        let health = self.health_emitter();
         let config = video_start(&self.settings);
         let sink: SharedSink = Arc::clone(&self.packets) as SharedSink;
         match self.ports.video.as_mut().map(|video| video.start(&config, sink, health)) {
@@ -425,10 +461,14 @@ impl Actor {
                 };
                 self.on_command(command);
             }
-            // Phase 4: resolve the profile, clamp its window to the RAM ceiling,
-            // resize the DVR buffer, retarget game audio, maybe start a session.
+            // Phase 2 policy: game audio follows every focus change. Phase 4 narrows
+            // it to profiled games, resolves the profile, resizes the DVR buffer and
+            // maybe starts a session.
             OsEvent::Foreground { pid, exe } => {
                 tracing::debug!(pid, exe, "foreground changed");
+                if let Some(game) = self.ports.game_audio.as_mut() {
+                    game.set_target_process(Some(pid));
+                }
                 self.status.game = Some(exe);
                 self.publish_status();
             }
@@ -705,6 +745,47 @@ mod tests {
     fn keystrokes_never_reach_the_log() {
         let msg = Msg::Os(OsEvent::Key { key: zc_core::hotkey::Key(0x41), down: true });
         assert_eq!(format!("{msg:?}"), "Os(Key)");
+    }
+
+    /// An audio source that records what the engine asked of it.
+    #[derive(Clone, Default)]
+    struct FakeAudio(Arc<Mutex<(usize, Vec<Option<u32>>)>>);
+
+    impl AudioSource for FakeAudio {
+        fn track(&self) -> zc_core::TrackId {
+            zc_core::TrackId::GameAudio
+        }
+        fn start(
+            &mut self,
+            _: &AudioStart,
+            _: SharedSink,
+            _: Emit<HealthEvent>,
+        ) -> Result<(), SourceError> {
+            self.0.lock().unwrap().0 += 1;
+            Ok(())
+        }
+        fn stop(&mut self) {}
+        fn set_target_process(&mut self, pid: Option<u32>) {
+            self.0.lock().unwrap().1.push(pid);
+        }
+    }
+
+    #[test]
+    fn game_audio_starts_and_follows_focus() {
+        let (input, game) = (FakeInput::default(), FakeAudio::default());
+        let ports = Ports {
+            input: Some(Box::new(input.clone())),
+            game_audio: Some(Box::new(game.clone())),
+            ..Ports::default()
+        };
+        let (engine, _) = spawn(ports);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        let emit = input.0.lock().unwrap().clone().expect("input started");
+        emit(OsEvent::Foreground { pid: 42, exe: "game.exe".into() });
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.game.is_some()));
+        let state = game.0.lock().unwrap();
+        assert_eq!(state.0, 1, "started once");
+        assert_eq!(state.1, [Some(42)]);
     }
 
     #[test]
