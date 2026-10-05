@@ -1,7 +1,8 @@
 //! Windows.Graphics.Capture (WGC): external, no injection, anti-cheat safe.
 
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use windows::Foundation::{TimeSpan, TypedEventHandler};
 use windows::Graphics::Capture::{
@@ -98,11 +99,17 @@ fn capture_error(context: &str, e: &windows::core::Error) -> SourceError {
 /// - Protected content: WGC keeps delivering frames (D23). Errors that do say
 ///   "access denied" become [`SourceError::Protected`], and `GpuVideoSource`
 ///   retries with backoff.
+/// - The item can close under us: a monitor switched off or re-assigned (e.g.
+///   Win+P "second screen only") ends capture for good. [`is_closed`](Self::is_closed)
+///   reports it, and `GpuVideoSource` reopens the target.
 #[derive(Debug)]
 pub struct WgcCapture {
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
+    item: GraphicsCaptureItem,
     token: i64,
+    closed_token: i64,
+    closed: Arc<AtomicBool>,
 }
 
 impl WgcCapture {
@@ -168,14 +175,30 @@ impl WgcCapture {
         if let Err(e) = session.SetMinUpdateInterval(TimeSpan { Duration: 10_000 }) {
             tracing::debug!(%e, "can't lower WGC's minimum update interval");
         }
+        let closed = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&closed);
+        let closed_token = item
+            .Closed(&TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(move |_, _| {
+                flag.store(true, Ordering::Release);
+                Ok(())
+            }))
+            .map_err(err("GraphicsCaptureItem::Closed"))?;
         session.StartCapture().map_err(err("StartCapture"))?;
-        Ok(Self { pool, session, token })
+        Ok(Self { pool, session, item: item.clone(), token, closed_token, closed })
+    }
+
+    /// Whether Windows closed the capture item (its monitor or window went away).
+    /// No more frames will come; open a new item.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 }
 
 impl Drop for WgcCapture {
     fn drop(&mut self) {
         // Nothing useful to do if these fail while tearing down.
+        let _ = self.item.RemoveClosed(self.closed_token);
         let _ = self.pool.RemoveFrameArrived(self.token);
         let _ = self.session.Close();
         let _ = self.pool.Close();
