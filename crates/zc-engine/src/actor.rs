@@ -466,7 +466,14 @@ impl Actor {
             // maybe starts a session.
             OsEvent::Foreground { pid, exe } => {
                 tracing::debug!(pid, exe, "foreground changed");
-                if let Some(game) = self.ports.game_audio.as_mut() {
+                // The taskbar, Start menu and desktop belong to explorer.exe, which
+                // makes no sound: clicking them mid-game must not retarget the game's
+                // audio track away from the game.
+                let is_shell = exe
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe"));
+                if !is_shell && let Some(game) = self.ports.game_audio.as_mut() {
                     game.set_target_process(Some(pid));
                 }
                 self.status.game = Some(exe);
@@ -781,8 +788,13 @@ mod tests {
         let (engine, _) = spawn(ports);
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
         let emit = input.0.lock().unwrap().clone().expect("input started");
-        emit(OsEvent::Foreground { pid: 42, exe: "game.exe".into() });
-        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.game.is_some()));
+        emit(OsEvent::Foreground { pid: 42, exe: r"C:\Games\game.exe".into() });
+        // Clicking the taskbar focuses explorer.exe, which must not take the audio.
+        emit(OsEvent::Foreground { pid: 7, exe: r"C:\Windows\Explorer.EXE".into() });
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Status(s) if s.game.as_deref() == Some(r"C:\Windows\Explorer.EXE")),
+        );
         let state = game.0.lock().unwrap();
         assert_eq!(state.0, 1, "started once");
         assert_eq!(state.1, [Some(42)]);
