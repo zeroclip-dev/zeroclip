@@ -1,9 +1,9 @@
 //! Retry schedule for protected (HDCP/DRM) content (DESIGN §3).
 //!
-//! Windows.Graphics.Capture fails with `DXGI_ERROR_ACCESS_DENIED` while protected
-//! content (a Netflix tab, say) is on screen, and gives no reliable event when it
-//! goes away. So capture retries on an exponential backoff — 250 ms doubling up to
-//! 5 s — and yields black/placeholder frames meanwhile, so PTS stays continuous.
+//! Windows.Graphics.Capture gives no event when protected (DRM) content comes and
+//! goes, and usually keeps delivering frames anyway (D23). If starting capture does
+//! fail with access denied, it is retried on this schedule: 250 ms doubling up to
+//! 5 s.
 
 use crate::time::Hns;
 
