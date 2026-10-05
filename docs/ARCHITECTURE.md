@@ -92,6 +92,8 @@ Sources stamp packets with **raw** QPC-based capture time. The `Recorder` owns t
 `MasterClock`: it anchors on the first video keyframe and maps every track onto the
 session timeline, applying constant per-track offsets (e.g. mic limiter lookahead).
 The anchor survives encoder re-inits, so PTS never restarts at zero (DESIGN §6, §8).
+Audio sources keep sample-exact timestamps but let `SampleTimeline` re-align them to QPC
+when the sound card's clock drifts more than 20 ms (DESIGN §6).
 
 Encoders run without B-frames, so decode order equals presentation order and packets
 carry only a PTS.

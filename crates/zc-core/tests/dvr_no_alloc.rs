@@ -1,6 +1,7 @@
-//! DESIGN §5: "All modes share one zero-allocation encode loop." This test swaps in
-//! a counting global allocator and checks that `DvrBuffer::push` never allocates
-//! once the buffer exists — including while it is evicting.
+//! Hot-path code must not allocate (CLAUDE.md rule 2; DESIGN §5: "All modes share
+//! one zero-allocation encode loop"). These tests swap in a counting global
+//! allocator and check the DVR push, hotkey matching, the mic DSP and the audio
+//! timeline.
 //!
 //! It lives in its own integration-test binary because a `#[global_allocator]`
 //! applies to the whole binary.
@@ -8,8 +9,12 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
+use zc_core::Hns;
+use zc_core::dsp::{Compressor, CompressorParams};
 use zc_core::dvr::{DvrBuffer, DvrConfig};
+use zc_core::hotkey::{Binding, Chord, ChordMatcher, Key, Trigger};
 use zc_core::testing::SyntheticStream;
+use zc_core::time::SampleTimeline;
 
 struct CountingAllocator;
 
@@ -71,6 +76,57 @@ fn dvr_push_never_allocates() {
         }
     });
     assert_eq!(allocations, 0, "DvrBuffer::push allocated {allocations} times");
+}
+
+#[test]
+fn chord_matcher_on_key_never_allocates() {
+    let binding = |keys: Vec<Key>, action, trigger| Binding {
+        chord: Chord::new(keys).expect("chord"),
+        action,
+        trigger,
+    };
+    let mut matcher = ChordMatcher::new(vec![
+        binding(vec![Key::ALT, Key::f(10)], 1, Trigger::Press),
+        binding(vec![Key::ALT, Key::f(9)], 2, Trigger::Press),
+        binding(vec![Key::MOUSE5], 3, Trigger::Hold),
+    ]);
+    let keys = [Key::ALT, Key::f(10), Key::f(9), Key::MOUSE5, Key(0x57)];
+    let allocations = allocations_during(|| {
+        for i in 0..1_000 {
+            let key = keys[i % keys.len()];
+            std::hint::black_box(matcher.on_key(key, true));
+            std::hint::black_box(matcher.on_key(key, true)); // auto-repeat
+            if i % 3 == 0 {
+                std::hint::black_box(matcher.on_key(key, false));
+            }
+        }
+        matcher.reset();
+    });
+    assert_eq!(allocations, 0, "ChordMatcher::on_key allocated {allocations} times");
+}
+
+#[test]
+fn compressor_process_never_allocates() {
+    let mut compressor = Compressor::new(CompressorParams::default());
+    let mut samples = vec![0.5f32; 48_000];
+    let allocations = allocations_during(|| compressor.process(&mut samples));
+    assert_eq!(allocations, 0, "Compressor::process allocated {allocations} times");
+}
+
+#[test]
+fn sample_timeline_place_never_allocates() {
+    let mut timeline = SampleTimeline::new(48_000);
+    let allocations = allocations_during(|| {
+        for k in 0..10_000_i64 {
+            let jitter = match k % 100 {
+                50 => Hns::from_millis(60),  // a gap: silence
+                75 => Hns::from_millis(-40), // a fast device: skip
+                _ => Hns::ZERO,
+            };
+            std::hint::black_box(timeline.place(Hns(k * 100_000) + jitter, 480));
+        }
+    });
+    assert_eq!(allocations, 0, "SampleTimeline::place allocated {allocations} times");
 }
 
 #[test]

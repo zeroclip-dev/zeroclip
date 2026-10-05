@@ -127,6 +127,8 @@ v1 described the ring buffer for video only. Retrospective DVR needs the last X 
 
 The pipeline extracts `SystemRelativeTime` from the WGC `Direct3D11CaptureFrame` and maps it to the muxer's presentation timestamps. This is the anchor for everything; both audio tracks are aligned against it rather than against each other.
 
+The sound card's sample clock and QPC disagree by 10–100 ppm, which is up to 180 ms over a 30-minute session. Audio timestamps therefore count samples (exact and contiguous, which AAC needs) but are re-aligned to the buffer's QPC time by `zc_core::time::SampleTimeline` whenever they drift more than 20 ms: a gap is filled with silence, a fast device has frames dropped, and a gap over 1 s restarts the timeline. Corrections stay under the ~45 ms where viewers notice lip-sync errors.
+
 ### Track 1 — system audio
 
 v1 proposed `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE` with a UI for picking multiple apps to ignore. **This doesn't map cleanly onto the API** — activation params target a single process tree per client, so "exclude Discord *and* Spotify" doesn't express directly.
