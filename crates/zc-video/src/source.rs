@@ -53,7 +53,12 @@ struct Shared {
     screenshot: Mutex<Option<SyncSender<Shot>>>,
     /// Frames WGC delivered, before pacing. For the periodic health log.
     arrived: AtomicU64,
+    /// Same, but never reset: the encoder thread watches it for stalls.
+    seen: AtomicU64,
 }
+
+/// How long WGC may send nothing before capture is restarted (see `run`).
+const STALL: Duration = Duration::from_secs(3);
 
 /// What the encoder thread reports once it's running.
 struct Started {
@@ -169,6 +174,7 @@ struct FrameHandler {
 impl FrameHandler {
     fn on_frame(&mut self, frame: &CapturedFrame) {
         self.shared.arrived.fetch_add(1, Ordering::Relaxed);
+        self.shared.seen.fetch_add(1, Ordering::Relaxed);
         if !self.pacer.accept(frame.time) {
             return;
         }
@@ -307,6 +313,7 @@ fn run(
     let mut credits = 0u32;
     let mut next_report = Instant::now() + Duration::from_secs(5);
     let mut submitted = 0u64;
+    let (mut seen, mut last_frame_at) = (0u64, Instant::now());
     let result = (|| -> Result<(), SourceError> {
         while !shared.stop.load(Ordering::Acquire) {
             if Instant::now() >= next_report {
@@ -321,6 +328,22 @@ fn run(
                     "video health (last 5 s)"
                 );
             }
+            let now_seen = shared.seen.load(Ordering::Relaxed);
+            if now_seen != seen {
+                (seen, last_frame_at) = (now_seen, Instant::now());
+            }
+            // Changing the main display can leave WGC open but silent (seen on
+            // 2026-10-05: 0 frames for 30 s, capture "open", device fine). A still
+            // screen is silent too, so restarting costs it one cheap re-open every
+            // few seconds and gets a fresh frame either way.
+            // ponytail: stall timer; react to WM_DISPLAYCHANGE once the Phase 2
+            // message thread exists.
+            if capture.is_some() && last_frame_at.elapsed() >= STALL {
+                tracing::debug!("no frames from WGC for {STALL:?}; restarting capture");
+                capture = None;
+                retry_at = Instant::now();
+                last_frame_at = Instant::now();
+            }
             if capture.as_ref().is_some_and(WgcCapture::is_closed) {
                 // The monitor went away (display switch, Win+P). The last frame keeps
                 // repeating until capture reopens, so the stream never stops.
@@ -332,7 +355,7 @@ fn run(
                 // Resolve the target again: after a display change the old item is dead.
                 match capture_item(config.target).and_then(|item| try_capture(&item)) {
                     Ok(c) => {
-                        tracing::info!("capture running");
+                        tracing::debug!("capture running");
                         capture = Some(c);
                         backoff.reset();
                     }
