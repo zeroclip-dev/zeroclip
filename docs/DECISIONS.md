@@ -152,3 +152,16 @@ rule under our control (the `wasapi` crate reads into a `VecDeque`), and keeps e
 line explainable. Cost: about 300 more lines in `zc-audio`, including the process-
 loopback activation, whose `PROPVARIANT` must be wrapped in `ManuallyDrop` (see the
 plan README's pitfalls).
+
+### D26 · Audio tracks are per source, and editable (extends D9)
+Besides the focused game and the mic, ZeroClip can record chosen apps (Discord,
+Spotify, a browser…) as their **own tracks**: one process-loopback client in include
+mode per app, all running at once. (D9's limit was about *exclude* mode, which takes
+one process tree per client; many include clients side by side are fine.) Each
+track keeps its own AAC stream, so the editor can set a volume, mute or solo each
+one afterwards. The original file keeps every track; "Share" exports one mixed
+track, because browsers and Discord play only the first audio track of an MP4.
+Costs: `TrackId` stops being a fixed three-value enum (a video track plus up to 6
+audio tracks); about 24 KB/s of RAM per extra track in the DVR buffer; an app that
+isn't running yet gets a silent track until it starts; export re-encodes audio
+(never video).
