@@ -165,3 +165,16 @@ Costs: `TrackId` stops being a fixed three-value enum (a video track plus up to 
 audio tracks); about 24 KB/s of RAM per extra track in the DVR buffer; an app that
 isn't running yet gets a silent track until it starts; export re-encodes audio
 (never video).
+
+### D27 · Audio is hybrid include-mode: a chosen set of apps, each its own track (settles Q1; builds on D9 and D26)
+Confirmed on hardware (2026-10-05: a browser's process tree captured by pid, in sync
+with the mic). Windows' process loopback takes one process tree per client, so an
+"ignore these apps" list can't be expressed, but any number of "include this app"
+clients can run side by side. So audio is configured as a list of tracks, each one
+either the focused game, the microphone, or a named app (`Discord.exe`,
+`Spotify.exe`…), and **each track can be switched on or off** (an off track is not
+recorded at all; the editor can also mute a recorded one, D26). **Defaults:** the
+focused-game track on, and Discord and Spotify pre-listed and on, with the mic off.
+An app that isn't running yet records silence until it starts. Costs: up to 6 audio
+tracks (D26), and audio from a process outside every listed tree (a launcher's helper
+process, a UWP game hosted by `ApplicationFrameHost.exe`) is missed.
