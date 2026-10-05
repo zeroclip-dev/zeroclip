@@ -10,7 +10,7 @@
 //! - **Engine thread**: only calls `start`, `stop`, `request_keyframe`, `screenshot`.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -51,6 +51,8 @@ struct Shared {
     keyframe: AtomicBool,
     screenshot_wanted: AtomicBool,
     screenshot: Mutex<Option<SyncSender<Shot>>>,
+    /// Frames WGC delivered, before pacing. For the periodic health log.
+    arrived: AtomicU64,
 }
 
 /// What the encoder thread reports once it's running.
@@ -166,6 +168,7 @@ struct FrameHandler {
 
 impl FrameHandler {
     fn on_frame(&mut self, frame: &CapturedFrame) {
+        self.shared.arrived.fetch_add(1, Ordering::Relaxed);
         if !self.pacer.accept(frame.time) {
             return;
         }
@@ -238,6 +241,12 @@ impl FrameHandler {
             }
             Ok(Err(TrySendError::Disconnected(_))) => {}
             Ok(Err(TrySendError::Full(_))) | Err(_) => {
+                if !self.dropping {
+                    match &sent {
+                        Err(e) => tracing::warn!(%e, "dropping frames: conversion failed"),
+                        _ => tracing::warn!("dropping frames: the encoder isn't keeping up"),
+                    }
+                }
                 (self.health)(HealthEvent::FrameDropped);
                 self.dropping = true;
             }
@@ -296,8 +305,22 @@ fn run(
     let _ = report.send(Ok(Started { codec, device: device.clone(), context: context.clone() }));
 
     let mut credits = 0u32;
+    let mut next_report = Instant::now() + Duration::from_secs(5);
+    let mut submitted = 0u64;
     let result = (|| -> Result<(), SourceError> {
         while !shared.stop.load(Ordering::Acquire) {
+            if Instant::now() >= next_report {
+                next_report += Duration::from_secs(5);
+                // SAFETY: plain COM call on a live device.
+                let device_ok = unsafe { device.GetDeviceRemovedReason() };
+                tracing::info!(
+                    wgc_frames = shared.arrived.swap(0, Ordering::Relaxed),
+                    submitted = std::mem::take(&mut submitted),
+                    capture_open = capture.as_ref().is_some_and(|c| !c.is_closed()),
+                    device = ?device_ok,
+                    "video health (last 5 s)"
+                );
+            }
             if capture.as_ref().is_some_and(WgcCapture::is_closed) {
                 // The monitor went away (display switch, Win+P). The last frame keeps
                 // repeating until capture reopens, so the stream never stops.
@@ -346,6 +369,7 @@ fn run(
                     }
                     encoder.submit(slot, pts)?;
                     credits -= 1;
+                    submitted += 1;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
