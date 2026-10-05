@@ -1,6 +1,7 @@
 //! The Settings tab, and the draft/save logic shared with the Profiles tab.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Button, ComboBox, DragValue, Grid, TextEdit};
 use zc_audio::MicDevice;
@@ -10,6 +11,8 @@ use zc_core::settings::{AAC_BITRATES_KBPS, MicMode, Settings};
 
 use super::{dvr_megabytes, human_duration};
 use crate::app::ZeroClipApp;
+
+const MIC_POLL: Duration = Duration::from_secs(2);
 
 /// Settings being edited. Free-text fields (paths, hotkeys) are kept as strings
 /// until saved, so a half-typed hotkey doesn't have to parse.
@@ -21,8 +24,9 @@ pub struct Draft {
     toggle_recording: String,
     screenshot: String,
     push_to_talk: String,
-    /// Microphones Windows reports; refreshed by the Refresh button.
+    /// Microphones Windows reports, re-listed every `MIC_POLL` while the screen is open.
     mics: Vec<MicDevice>,
+    mics_listed: Instant,
     /// Problems from the last save attempt.
     pub problems: Vec<String>,
 }
@@ -43,6 +47,7 @@ impl Draft {
             screenshot: hotkeys.screenshot.to_string(),
             push_to_talk: hotkeys.push_to_talk.as_ref().map(Chord::to_string).unwrap_or_default(),
             mics: zc_audio::list_microphones(),
+            mics_listed: Instant::now(),
             problems: Vec::new(),
         }
     }
@@ -198,7 +203,7 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
 
         section(ui, "Audio", |ui| {
             let audio = &mut draft.settings.audio;
-            let mics = &mut draft.mics;
+            let (mics, listed) = (&mut draft.mics, &mut draft.mics_listed);
             ui.checkbox(&mut audio.game_audio, "Record the game's audio (track 1)");
             ui.weak(
                 "Only the game in focus is captured: Discord, music and notifications stay \
@@ -228,11 +233,14 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
                             ui.selectable_value(&mut audio.mic_device, Some(m.id.clone()), &m.name);
                         }
                     });
-                    if ui.button("Refresh").clicked() {
-                        *mics = zc_audio::list_microphones();
-                    }
                 });
             });
+            // Hot-plug: re-list while this screen is open, so a mic plugged in appears by itself.
+            if listed.elapsed() >= MIC_POLL {
+                *mics = zc_audio::list_microphones();
+                *listed = Instant::now();
+            }
+            ui.ctx().request_repaint_after(MIC_POLL);
             ui.add_enabled(
                 audio.mic != MicMode::Off,
                 egui::Checkbox::new(&mut audio.mic_compressor, "Even out the mic level (compressor)"),
