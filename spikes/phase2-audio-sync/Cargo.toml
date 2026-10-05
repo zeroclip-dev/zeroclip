@@ -1,0 +1,20 @@
+[package]
+name = "spike-phase2"
+description = "Phase 2 spike: measure A/V drift over a long run, before the muxer exists."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+zc-core.workspace = true
+zc-win.workspace = true
+zc-audio.workspace = true
+zc-video.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

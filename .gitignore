@@ -13,3 +13,6 @@
 # Output of the zc-video smoke example
 /capture*
 /smoke.png
+# Output of the Phase 2 audio-sync spike
+/game.aac
+/mic.aac
