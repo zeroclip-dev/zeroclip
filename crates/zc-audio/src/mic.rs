@@ -91,6 +91,7 @@ impl AudioSource for MicSource {
             let (_apartment, _mf, mut encode, stream) = match setup {
                 Ok(parts) => {
                     ready(Ok(()));
+                    tracing::info!("microphone capturing");
                     parts
                 }
                 Err(e) => return ready(Err(e)),
@@ -114,6 +115,9 @@ impl AudioSource for MicSource {
                     stream = open_mic(&config)
                         .inspect_err(|e| tracing::debug!(%e, "mic still unavailable"))
                         .ok();
+                    if stream.is_some() {
+                        tracing::info!("microphone capturing again");
+                    }
                     continue;
                 };
                 let result = s.read(|data, frames, qpc| {
