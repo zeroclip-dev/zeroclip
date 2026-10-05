@@ -2709,6 +2709,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "spike-phase2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tracing",
+ "tracing-subscriber",
+ "zc-audio",
+ "zc-core",
+ "zc-video",
+ "zc-win",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
