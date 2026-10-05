@@ -17,7 +17,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use windows::Graphics::Capture::GraphicsCaptureItem;
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D};
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+};
 use zc_core::Hns;
 use zc_core::backoff::Backoff;
 use zc_core::media::Codec;
@@ -37,6 +39,10 @@ use crate::screenshot::{save_png, staging_copy};
 
 /// A staging copy of one frame, and its size.
 type Shot = Result<(ID3D11Texture2D, (u32, u32)), SourceError>;
+
+/// A GPU copy of the newest accepted frame: the texture, its buffer size, and the
+/// content size within it.
+type Latest = (ID3D11Texture2D, (u32, u32), (u32, u32));
 
 /// Flags the engine thread sets and the pipeline threads read.
 #[derive(Debug, Default)]
@@ -134,11 +140,9 @@ impl VideoSource for GpuVideoSource {
         *self.shared.screenshot.lock().map_err(|_| SourceError::Other("poisoned lock".into()))? =
             Some(tx);
         self.shared.screenshot_wanted.store(true, Ordering::Release);
-        let (staging, size) = rx.recv_timeout(Duration::from_secs(2)).map_err(|_| {
-            SourceError::Other(
-                "no new frame within 2 s (WGC only delivers frames when the screen changes)".into(),
-            )
-        })??;
+        let (staging, size) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| SourceError::Other("no frame captured yet".into()))??;
         save_png(context, &staging, size, path)
     }
 }
@@ -155,29 +159,61 @@ struct FrameHandler {
     context: ID3D11DeviceContext,
     last: Option<Hns>,
     dropping: bool,
+    /// Kept so a screenshot never waits for the screen to change (WGC sends nothing
+    /// while it's still).
+    latest: Option<Latest>,
 }
 
 impl FrameHandler {
     fn on_frame(&mut self, frame: &CapturedFrame) {
-        // Before the pacer, so a screenshot request isn't thinned out.
-        if self.shared.screenshot_wanted.swap(false, Ordering::Acquire)
-            && let Ok(mut slot) = self.shared.screenshot.try_lock()
-            && let Some(tx) = slot.take()
-        {
-            let _ = tx.try_send(
-                staging_copy(&self.device, &self.context, &frame.texture).map(|t| (t, frame.size)),
-            );
-        }
         if !self.pacer.accept(frame.time) {
             return;
         }
+        self.keep_latest(frame);
         let slot = self.converter.convert(&frame.texture, frame.size);
         self.hand_off(slot, frame.time);
     }
 
-    /// Called by the encoder thread on a timer: on a static screen WGC delivers
-    /// nothing, so repeat the last frame to keep GOPs on time (DESIGN §4).
+    /// One GPU copy per encoded frame into a reused texture (~8 MB of VRAM at 1080p).
+    /// Failures only cost screenshots, so they're logged and skipped.
+    fn keep_latest(&mut self, frame: &CapturedFrame) {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: `desc` is a valid out-parameter.
+        unsafe { frame.texture.GetDesc(&mut desc) };
+        let dims = (desc.Width, desc.Height);
+        if self.latest.as_ref().is_none_or(|(_, d, _)| *d != dims) {
+            desc.Usage = D3D11_USAGE_DEFAULT;
+            desc.BindFlags = 0;
+            desc.CPUAccessFlags = 0;
+            desc.MiscFlags = 0;
+            let mut texture = None;
+            // SAFETY: a valid descriptor and out-parameter.
+            if let Err(e) = unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut texture)) }
+            {
+                tracing::debug!(%e, "can't keep a frame for screenshots");
+                return;
+            }
+            self.latest = texture.map(|t| (t, dims, frame.size));
+        }
+        if let Some((texture, _, size)) = &mut self.latest {
+            // SAFETY: same size and format; a GPU copy on a multithread-protected device.
+            unsafe { self.context.CopyResource(&*texture, &frame.texture) };
+            *size = frame.size;
+        }
+    }
+
+    /// Called by the encoder thread about every millisecond: answers screenshot
+    /// requests from the latest frame, and on a static screen (WGC delivers nothing)
+    /// repeats the last frame to keep GOPs on time (DESIGN §4).
     fn tick(&mut self, now: Hns) {
+        if let Some((texture, _, size)) = &self.latest
+            && self.shared.screenshot_wanted.swap(false, Ordering::Acquire)
+            && let Ok(mut slot) = self.shared.screenshot.try_lock()
+            && let Some(tx) = slot.take()
+        {
+            let shot = staging_copy(&self.device, &self.context, texture).map(|t| (t, *size));
+            let _ = tx.try_send(shot);
+        }
         if let Some(time) = self.pacer.repeat_due(now)
             && let Some(slot) = self.converter.repeat_last()
         {
@@ -396,6 +432,7 @@ impl Pipeline {
             context: context.clone(),
             last: None,
             dropping: false,
+            latest: None,
         }));
         Ok(Self { device, context, codec, encoder, handler, frames, item })
     }
