@@ -51,7 +51,7 @@ Manager shows the GPU's Video Encode engine busy with no unexpected CPU copy ove
 - [x] `SampleTimeline` (audio clock drift)
 - [ ] `zc-win::message_thread`; `zc-input` Raw Input + foreground hook
 - [ ] `zc-audio` game audio (process loopback, include mode) and mic with push-to-talk
-- [ ] Resolve the loopback include/exclude question (docs/OPEN_QUESTIONS.md) before building the audio settings UI
+- [x] Resolve the loopback include/exclude question: include mode, per-app tracks (D27)
 - [x] Hotkeys drive commands in the engine
 
 *Done when:* a 30-minute recording has no measurable A/V drift at the end.

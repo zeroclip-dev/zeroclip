@@ -133,7 +133,7 @@ The sound card's sample clock and QPC disagree by 10–100 ppm, which is up to 1
 
 v1 proposed `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE` with a UI for picking multiple apps to ignore. **This doesn't map cleanly onto the API** — activation params target a single process tree per client, so "exclude Discord *and* Spotify" doesn't express directly.
 
-Inverting to include-mode — capture the game's process tree, using `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE` — is simpler and usually gets the same result, since the game is already identified by the profile engine. Verify against the `AUDIOCLIENT_ACTIVATION_PARAMS` docs before designing the UI, because this choice determines whether the UI says "capture from" or "ignore these."
+Inverting to include-mode — capture the game's process tree, using `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE` — is simpler and usually gets the same result, since the game is already identified by the profile engine. **Resolved (D27):** the UI says "capture from". Audio is a list of tracks, each the focused game, the mic, or a named app, with one include-mode client per app and an on/off switch per track; Discord and Spotify are pre-listed by default.
 
 ### Track 2 — microphone
 
@@ -308,7 +308,7 @@ Write the disk writer and muxer against synthetic frames before wiring real capt
 
 Things to verify against documentation before designing around them. Several of these shape the UI, so resolving them early avoids rework.
 
-- **WASAPI process loopback mode.** Confirm whether include-mode or exclude-mode fits better, and whether multiple exclusions are expressible at all. This determines the entire audio settings UI (§6).
+- ~~**WASAPI process loopback mode.**~~ Resolved: include mode, one client per app, each its own track (D27).
 - **HDCP resume signalling.** Does WGC surface any usable event on protected-content transitions, or is polling with backoff genuinely the only option? (§3)
 - **libmpv vs egui_video.** Affects installer size and packaging. Decide before Phase 5. (§2, §9)
 - **Buffer resize under load.** Is a brief writer pause acceptable, or is double-buffering the allocation worth the complexity? (§7)
