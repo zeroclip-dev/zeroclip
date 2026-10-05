@@ -14,10 +14,11 @@
 //!
 //! Both run an event-driven capture loop on their own thread, registered with
 //! MMCSS (`AvSetMmThreadCharacteristicsW("Pro Audio")`) so they don't glitch
-//! under game load. The `wasapi` crate (DESIGN §2) wraps much of the WASAPI side;
-//! using it or the raw `windows` APIs is a Phase 2 call.
+//! under game load. WASAPI is used through the raw `windows` APIs rather than the
+//! `wasapi` crate (DECISIONS), so the audio loop's no-allocation rule stays ours.
 
 mod aac;
+mod capture;
 mod game;
 mod mic;
 

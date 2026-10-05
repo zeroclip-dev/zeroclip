@@ -1,31 +1,47 @@
+use std::mem::ManuallyDrop;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{self, SyncSender};
+use std::time::Duration;
+
+use windows::Win32::Foundation::{E_NOINTERFACE, E_NOTIMPL};
+use windows::Win32::Media::Audio::{
+    AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
+    AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
+    ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
+    IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
+    IAudioClient, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+    VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+};
+use windows::Win32::System::Com::StructuredStorage::{
+    PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
+};
+use windows::Win32::System::Com::{BLOB, IAgileObject};
+use windows::Win32::System::Variant::VT_BLOB;
+use windows::core::{IUnknown, Interface, Ref, implement};
 use zc_core::media::TrackId;
 use zc_core::ports::{AudioSource, AudioStart, Emit, SourceError};
 use zc_core::sink::SharedSink;
 use zc_core::watchdog::HealthEvent;
+use zc_win::com::Apartment;
+use zc_win::error::{WinResultExt, platform_error};
+use zc_win::mf::MediaFoundation;
 
-/// Track 1: the focused game's audio via WASAPI process loopback.
+use crate::capture::{Encode, Mmcss, Stream, Worker, pcm16_format};
+
+/// Track 1: the focused game's audio via WASAPI *process loopback*, include mode
+/// (D9): only the target process and its children are captured, so Discord, music
+/// and notifications stay out.
 ///
-/// Phase 2 plan:
-/// 1. `AUDIOCLIENT_ACTIVATION_PARAMS { ActivationType:
-///    AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, ProcessLoopbackParams: {
-///    TargetProcessId: pid, ProcessLoopbackMode:
-///    PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE } }`, wrapped in a
-///    `VT_BLOB` `PROPVARIANT`.
-/// 2. `ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
-///    IAudioClient::IID, …)` with a completion handler (implement
-///    `IActivateAudioInterfaceCompletionHandler`) → `IAudioClient`.
-/// 3. `Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK |
-///    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, …)` with an explicit format (process
-///    loopback has no mix format: use 48 kHz stereo float), `SetEventHandle`,
-///    `GetService::<IAudioCaptureClient>()`, `Start`.
-/// 4. Loop: wait on the event → `GetBuffer(…, Some(&mut qpc_position))` (100 ns
-///    units) → AAC → `sink.push`. Honour `AUDCLNT_BUFFERFLAGS_SILENT` and
-///    `DATA_DISCONTINUITY` (report a gap).
-/// 5. On `set_target_process`, restart against the new pid.
+/// Activation goes through `ActivateAudioInterfaceAsync` with
+/// [`AUDIOCLIENT_ACTIVATION_PARAMS`](https://learn.microsoft.com/windows/win32/api/audioclientactivationparams/ns-audioclientactivationparams-audioclient_activation_params)
+/// (see Microsoft's ApplicationLoopback sample). Needs Windows 11 (build 20348+).
+/// Retargeting is live: the capture thread notices a new pid within 100 ms.
 #[derive(Debug, Default)]
 pub struct GameAudioSource {
-    target_pid: Option<u32>,
-    running: bool,
+    /// The target pid; 0 means none (pid 0 is the Idle process, never a game).
+    target: Arc<AtomicU32>,
+    worker: Option<Worker>,
 }
 
 impl GameAudioSource {
@@ -35,11 +51,97 @@ impl GameAudioSource {
         Self::default()
     }
 
-    /// The process tree currently being captured.
+    /// The process tree being captured.
     #[must_use]
     pub fn target_pid(&self) -> Option<u32> {
-        self.target_pid
+        Some(self.target.load(Ordering::Relaxed)).filter(|&p| p != 0)
     }
+}
+
+/// Signals when the asynchronous activation finishes. Agile and panic-free, as
+/// COM callbacks must be.
+#[implement(IActivateAudioInterfaceCompletionHandler, IAgileObject)]
+struct Completion {
+    done: SyncSender<()>,
+}
+
+// IAgileObject is a marker interface: no methods, it just tells COM the handler can
+// be called from any thread.
+impl windows::Win32::System::Com::IAgileObject_Impl for Completion_Impl {}
+
+impl IActivateAudioInterfaceCompletionHandler_Impl for Completion_Impl {
+    fn ActivateCompleted(
+        &self,
+        _operation: Ref<IActivateAudioInterfaceAsyncOperation>,
+    ) -> windows::core::Result<()> {
+        let _ = self.done.try_send(());
+        Ok(())
+    }
+}
+
+/// An audio client capturing process `pid` and its children.
+fn activate(pid: u32) -> Result<IAudioClient, SourceError> {
+    let params = AUDIOCLIENT_ACTIVATION_PARAMS {
+        ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+        Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+            ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                TargetProcessId: pid,
+                ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+            },
+        },
+    };
+    // ManuallyDrop: windows-rs gives PROPVARIANT a Drop that calls PropVariantClear,
+    // which would CoTaskMemFree this blob's stack pointer and corrupt the heap.
+    // `params` outlives the wait below.
+    let prop = ManuallyDrop::new(PROPVARIANT {
+        Anonymous: PROPVARIANT_0 {
+            Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
+                vt: VT_BLOB,
+                Anonymous: PROPVARIANT_0_0_0 {
+                    blob: BLOB {
+                        cbSize: size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+                        pBlobData: (&raw const params).cast_mut().cast(),
+                    },
+                },
+                ..Default::default()
+            }),
+        },
+    });
+    let (tx, rx) = mpsc::sync_channel(1);
+    let handler: IActivateAudioInterfaceCompletionHandler = Completion { done: tx }.into();
+    let unsupported =
+        || SourceError::Unsupported("process loopback needs Windows 11 (build 20348+)".into());
+    // SAFETY: valid device id, IID, property and handler; `params` and `prop` live
+    // until the activation has completed (or timed out, after which nothing reads them).
+    let operation = unsafe {
+        ActivateAudioInterfaceAsync(
+            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+            &IAudioClient::IID,
+            Some(&*prop),
+            &handler,
+        )
+    }
+    .map_err(|e| {
+        if e.code() == E_NOTIMPL || e.code() == E_NOINTERFACE {
+            unsupported()
+        } else {
+            platform_error("ActivateAudioInterfaceAsync", &e)
+        }
+    })?;
+    rx.recv_timeout(Duration::from_secs(5))
+        .map_err(|_| SourceError::Other("process loopback activation timed out".into()))?;
+    let mut hr = windows::core::HRESULT(0);
+    let mut unknown: Option<IUnknown> = None;
+    // SAFETY: the operation has completed; valid out-parameters.
+    unsafe { operation.GetActivateResult(&mut hr, &mut unknown) }.context("GetActivateResult")?;
+    if hr == E_NOTIMPL || hr == E_NOINTERFACE {
+        return Err(unsupported());
+    }
+    hr.ok().context("process loopback activation")?;
+    unknown
+        .ok_or_else(|| SourceError::Other("activation returned no client".into()))?
+        .cast()
+        .context("IAudioClient")
 }
 
 impl AudioSource for GameAudioSource {
@@ -51,22 +153,69 @@ impl AudioSource for GameAudioSource {
         &mut self,
         config: &AudioStart,
         sink: SharedSink,
-        health: Emit<HealthEvent>,
+        _health: Emit<HealthEvent>,
     ) -> Result<(), SourceError> {
-        let _ = (config, sink, health);
-        todo!("Phase 2: process loopback capture (see the plan above)")
+        self.stop();
+        let (config, target) = (*config, Arc::clone(&self.target));
+        self.worker = Some(Worker::spawn("zc-game-audio", move |stop, ready| {
+            let setup = (|| {
+                let apartment = Apartment::multithreaded()?;
+                let mf = MediaFoundation::start()?;
+                let encode = Encode::new(TrackId::GameAudio, &config)?;
+                Ok((apartment, mf, encode))
+            })();
+            let (_apartment, _mf, mut encode) = match setup {
+                Ok(parts) => {
+                    ready(Ok(()));
+                    parts
+                }
+                Err(e) => return ready(Err(e)),
+            };
+            let _mmcss = Mmcss::join();
+            let format = pcm16_format(config.sample_rate, config.channels);
+            let (mut current, mut stream) = (0u32, None::<Stream>);
+            while !stop.load(Ordering::Acquire) {
+                let want = target.load(Ordering::Relaxed);
+                if want != current {
+                    // A retarget leaves a gap; the timeline fills or restarts it.
+                    stream = None;
+                    current = want;
+                    if want != 0 {
+                        match activate(want).and_then(|c| Stream::start(c, true, &format)) {
+                            Ok(s) => {
+                                tracing::info!(pid = want, "capturing game audio");
+                                stream = Some(s);
+                            }
+                            Err(e) => {
+                                tracing::warn!(pid = want, %e, "can't capture this process's audio")
+                            }
+                        }
+                    }
+                }
+                match &stream {
+                    Some(s) => {
+                        if let Err(e) =
+                            s.read(|pcm, frames, qpc| encode.push(pcm, frames, qpc, &*sink))
+                        {
+                            tracing::warn!(%e, "game audio capture stopped");
+                            stream = None;
+                        }
+                    }
+                    None => std::thread::sleep(Duration::from_millis(100)),
+                }
+            }
+            encode.finish(&*sink);
+        })?);
+        Ok(())
     }
 
     fn stop(&mut self) {
-        if self.running {
-            todo!("Phase 2: signal the capture thread, Stop() the client, join")
+        if let Some(mut worker) = self.worker.take() {
+            worker.stop();
         }
     }
 
     fn set_target_process(&mut self, pid: Option<u32>) {
-        self.target_pid = pid;
-        if self.running {
-            todo!("Phase 2: restart capture against the new process tree")
-        }
+        self.target.store(pid.unwrap_or(0), Ordering::Relaxed);
     }
 }

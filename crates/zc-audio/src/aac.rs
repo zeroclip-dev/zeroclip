@@ -38,7 +38,6 @@ fn aac_bytes_per_second(bitrate_bps: u32) -> u32 {
 /// (21.33 ms at 48 kHz). The muxer builds the AudioSpecificConfig itself. Input and
 /// output samples are allocated once, so encoding allocates nothing.
 #[derive(Debug)]
-#[cfg_attr(not(test), expect(dead_code, reason = "scaffold: used by the capture threads (P2.15)"))]
 pub(crate) struct AacEncoder {
     transform: IMFTransform,
     track: TrackId,
@@ -52,7 +51,6 @@ pub(crate) struct AacEncoder {
     output_buffer: IMFMediaBuffer,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "scaffold: used by the capture threads (P2.15)"))]
 impl AacEncoder {
     /// Opens the encoder for `track`. COM and Media Foundation must be started on
     /// this thread.
