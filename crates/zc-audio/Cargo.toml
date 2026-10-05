@@ -13,6 +13,7 @@ zc-win.workspace = true
 tracing.workspace = true
 windows-core.workspace = true
 windows = { workspace = true, features = [
+    "Win32_Devices_FunctionDiscovery",
     "Win32_Foundation",
     "Win32_Media_Audio",
     "Win32_Media_MediaFoundation",
@@ -21,6 +22,7 @@ windows = { workspace = true, features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Threading",
     "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
 ] }
 
 [dev-dependencies]
