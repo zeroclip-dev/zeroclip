@@ -95,9 +95,9 @@ fn capture_error(context: &str, e: &windows::core::Error) -> SourceError {
 ///   on every display refresh (up to 200 times a second).
 /// - When the content size changes, the pool is recreated (Microsoft's documented
 ///   pattern); the converter letterboxes the new size into the fixed encode size.
-/// - Protected content: WGC is expected to draw DRM content black rather than fail
-///   (Q2, checked on hardware in P1.15). Errors that do say "access denied" become
-///   [`SourceError::Protected`], and `GpuVideoSource` retries with backoff.
+/// - Protected content: WGC keeps delivering frames (D23). Errors that do say
+///   "access denied" become [`SourceError::Protected`], and `GpuVideoSource`
+///   retries with backoff.
 #[derive(Debug)]
 pub struct WgcCapture {
     pool: Direct3D11CaptureFramePool,

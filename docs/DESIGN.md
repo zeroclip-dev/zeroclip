@@ -58,7 +58,7 @@ Store the winner in SQLite and re-probe only on GPU or driver change. Surface th
 
 **Bitrate (VBR).** Minimum around 5 Mbps to save space on static scenes, maximum around 20 Mbps to allocate data during high-motion fights. Note the interaction with buffer sizing in §4: the ring buffer must be sized for the *maximum*, so a wide min/max spread means a lot of allocated-but-usually-unused RAM. That's an accepted tradeoff, but it's worth exposing max bitrate in the UI since it directly drives the memory footprint.
 
-**HDCP / DRM handling.** The capture loop catches `DXGI_ERROR_ACCESS_DENIED` from protected content. v1 said capture "resumes automatically when DRM content clears" — worth flagging that WGC doesn't reliably give a clean event for that transition. Implement it as a retry loop with exponential backoff (say 250ms up to 5s) rather than waiting on a signal, and yield black frames or a placeholder in the meantime so PTS continuity is preserved and the muxer doesn't see a gap.
+**HDCP / DRM handling.** WGC gives no event for protected-content transitions, and in practice it keeps delivering frames: on the Phase 1 test machine a Netflix tab was simply recorded, and hardware-DRM players are expected to show up black. Capture is retried with exponential backoff (250 ms up to 5 s) only if starting it actually fails with access denied; the repeat-last-frame ticker keeps PTS continuous whenever WGC goes quiet (D23).
 
 ## 4. Memory & Storage Strategy
 

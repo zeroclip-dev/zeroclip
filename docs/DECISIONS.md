@@ -124,3 +124,23 @@ The timeline shows keyframe thumbnails made by `ffmpeg.exe`
 `ffmpeg.exe`, falling back to the default player. No libmpv (a heavy runtime DLL and an
 installer concern) and no `egui_video` (it links FFmpeg as a library, which breaks D3).
 Cost: no frame-accurate in-app scrubbing. Our cuts snap to keyframes anyway (D5).
+
+### D23 · Protected content: back off only on a real failure (settles Q2)
+WGC raises no event when protected (DRM) content appears or goes away. On
+2026-10-05, a Netflix tab in Brave on an NVIDIA RTX 5000 didn't interrupt capture at
+all: frames kept arriving and the video was recorded. A browser using hardware DRM
+(e.g. Edge with PlayReady) may instead draw the area black; either way WGC keeps
+delivering frames. So `GpuVideoSource` restarts capture with `Backoff::hdcp()` only
+when starting capture actually fails with access denied
+(`SourceError::Protected`), and there is no placeholder-frame generator. The
+repeat-last-frame ticker keeps the stream continuous whenever WGC goes quiet.
+Encoders may refuse `CODECAPI_AVEncMPVDefaultBPictureCount`; NVIDIA does, but its
+low-latency mode still emits only I and P frames. Check `pict_type` with ffprobe on
+each new GPU vendor, because the muxer relies on no B-frames (D6).
+
+### D24 · v0.1 captures the primary monitor in SDR at a fixed size (narrows Q8)
+`CaptureTarget::PrimaryMonitor`, BGRA8, with DWM converting HDR to SDR. The encode
+size is fixed when capture starts (rounded down to even); later sizes are scaled and
+letterboxed by the video processor, so the encoder and the stream never restart.
+Following the game to another monitor waits for the Phase 4 profile engine; real HDR
+(FP16 capture, 10-bit HEVC/AV1) comes after v0.1.

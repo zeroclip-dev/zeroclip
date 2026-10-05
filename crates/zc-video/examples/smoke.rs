@@ -101,5 +101,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         faults = faults.load(Ordering::Relaxed),
         "done"
     );
+
+    // Players (VLC especially) often won't open a raw stream with no timestamps, so
+    // wrap it in an MP4 when ffmpeg is installed. Phase 3 writes real MP4s itself.
+    let mp4 = format!("{file}.mp4");
+    let format = match codec {
+        Codec::Hevc => "hevc",
+        Codec::H264 => "h264",
+        Codec::Av1 => "obu",
+    };
+    let fps = fps.to_string();
+    let mut args = vec!["-v", "error", "-y", "-r", &fps, "-f", format, "-i", file, "-c", "copy"];
+    if codec == Codec::Hevc {
+        args.extend(["-tag:v", "hvc1"]); // Windows players and browsers want hvc1
+    }
+    args.push(&mp4);
+    match std::process::Command::new("ffmpeg").args(&args).status() {
+        Ok(status) if status.success() => tracing::info!(file = mp4, "wrapped for playback"),
+        Ok(status) => tracing::warn!(%status, "ffmpeg couldn't wrap the stream"),
+        Err(_) => tracing::warn!("ffmpeg isn't on PATH; play the raw stream with ffplay"),
+    }
     Ok(())
 }
