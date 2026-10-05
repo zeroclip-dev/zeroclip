@@ -5,9 +5,10 @@ few minutes of gameplay in memory and saves them with one hotkey — without tou
 the game, without copying frames off the GPU, and without losing the clip when the
 game crashes.
 
-> **Status: pre-alpha.** The foundations are in place and Phase 0 (the capture →
-> encode spike) has proven the pipeline; Phase 1 (the real capture core) is next. The
-> app itself doesn't record yet. See the [roadmap](docs/ROADMAP.md).
+> **Status: pre-alpha.** The app captures the screen and encodes it on the GPU (H.264 or
+> HEVC, 60 fps, fixed keyframe interval), surviving alt-tab, resolution and display changes.
+> It doesn't save clips yet: audio and hotkeys (Phase 2) and the DVR buffer and files
+> (Phase 3) come next. See the [roadmap](docs/ROADMAP.md).
 
 ## What makes it different
 
