@@ -356,13 +356,34 @@ pub enum HotkeyEvent<A> {
 #[derive(Clone, Debug)]
 pub struct ChordMatcher<A> {
     bindings: Vec<Binding<A>>,
+    /// Held keys: a 256-bit set indexed by normalised virtual-key code.
+    // ponytail: one bit per normalised key, so pressing both Ctrls and releasing one
+    // clears Ctrl. Rare enough not to matter.
+    held: [u64; 4],
+    /// Per binding: a [`Trigger::Hold`] binding that is currently pressed.
+    active: Vec<bool>,
 }
 
 impl<A: Copy> ChordMatcher<A> {
     /// A matcher for these bindings.
     #[must_use]
     pub fn new(bindings: Vec<Binding<A>>) -> Self {
-        Self { bindings }
+        let active = vec![false; bindings.len()];
+        Self { bindings, held: [0; 4], active }
+    }
+
+    fn is_held(&self, key: Key) -> bool {
+        let k = usize::from(key.0);
+        self.held[k / 64] & (1 << (k % 64)) != 0
+    }
+
+    fn set_held(&mut self, key: Key, down: bool) {
+        let k = usize::from(key.0);
+        if down {
+            self.held[k / 64] |= 1 << (k % 64);
+        } else {
+            self.held[k / 64] &= !(1 << (k % 64));
+        }
     }
 
     /// The bindings, as given.
@@ -373,14 +394,54 @@ impl<A: Copy> ChordMatcher<A> {
 
     /// Feeds one key transition and returns the resulting hotkey event, if any.
     pub fn on_key(&mut self, key: Key, down: bool) -> Option<HotkeyEvent<A>> {
-        let _ = (key, down);
-        todo!("Phase 2: chord matching (see the `hotkey_*` specs)")
+        let k = key.normalized();
+        if usize::from(k.0) >= 256 {
+            return None;
+        }
+        if !down {
+            if !self.is_held(k) {
+                return None;
+            }
+            self.set_held(k, false);
+            let i = (0..self.bindings.len())
+                .find(|&i| self.active[i] && self.bindings[i].chord.contains(k))?;
+            self.active[i] = false;
+            return Some(HotkeyEvent::Released(self.bindings[i].action));
+        }
+        if self.is_held(k) {
+            return None; // auto-repeat
+        }
+        self.set_held(k, true);
+        let modifier_held = |m: Key| self.is_held(m);
+        let mut best: Option<usize> = None;
+        for (i, b) in self.bindings.iter().enumerate() {
+            let keys = b.chord.keys();
+            if !b.chord.contains(k) || !keys.iter().all(|&c| self.is_held(c)) {
+                continue;
+            }
+            // A press needs exactly the chord's modifiers; a hold only its own.
+            let exact = [Key::CTRL, Key::SHIFT, Key::ALT, Key::WIN]
+                .into_iter()
+                .all(|m| modifier_held(m) == keys.contains(&m));
+            if b.trigger == Trigger::Press && !exact {
+                continue;
+            }
+            if best.is_none_or(|j| keys.len() > self.bindings[j].chord.keys().len()) {
+                best = Some(i);
+            }
+        }
+        let i = best?;
+        if self.bindings[i].trigger == Trigger::Hold {
+            self.active[i] = true;
+        }
+        Some(HotkeyEvent::Pressed(self.bindings[i].action))
     }
 
     /// Forgets every held key, e.g. after the input thread restarts. Holds that
     /// were active are *not* reported as released; the engine handles that.
     pub fn reset(&mut self) {
-        todo!("Phase 2")
+        self.held = [0; 4];
+        self.active.fill(false);
     }
 }
 
@@ -457,7 +518,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: ChordMatcher::on_key (Phase 2)"]
     fn hotkey_fires_when_the_chord_completes() {
         let mut m = matcher();
         assert_eq!(m.on_key(Key::ALT, true), None);
@@ -467,7 +527,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: ChordMatcher::on_key (Phase 2)"]
     fn hotkey_ignores_auto_repeat() {
         let mut m = matcher();
         m.on_key(Key::ALT, true);
@@ -476,7 +535,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: ChordMatcher::on_key (Phase 2)"]
     fn hotkey_is_not_blocked_by_held_movement_keys() {
         let mut m = matcher();
         m.on_key(W, true);
@@ -486,7 +544,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: ChordMatcher::on_key (Phase 2)"]
     fn hotkey_requires_exactly_the_chords_modifiers() {
         let mut m = matcher();
         assert_eq!(m.on_key(Key::f(10), true), None, "F10 alone isn't Alt+F10");
@@ -497,7 +554,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: ChordMatcher::on_key (Phase 2)"]
     fn hotkey_treats_left_and_right_modifiers_alike() {
         let mut m = matcher();
         m.on_key(Key(0xA5), true); // VK_RMENU, right Alt
@@ -505,7 +561,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: ChordMatcher::on_key (Phase 2)"]
     fn hotkey_push_to_talk_works_while_holding_modifiers() {
         let mut m = matcher();
         m.on_key(Key::SHIFT, true); // sprinting
@@ -515,7 +570,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: ChordMatcher::on_key (Phase 2)"]
     fn hotkey_hold_binding_reports_press_and_release() {
         let mut m = matcher();
         assert_eq!(m.on_key(Key::MOUSE5, true), Some(HotkeyEvent::Pressed(Act::Ptt)));

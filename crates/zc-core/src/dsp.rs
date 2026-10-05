@@ -27,6 +27,8 @@ pub struct CompressorParams {
     pub makeup_db: f32,
     /// Sample rate of the signal, in Hz.
     pub sample_rate: u32,
+    /// Interleaved channels; all are linked (one gain for the whole frame).
+    pub channels: u16,
 }
 
 impl Default for CompressorParams {
@@ -38,6 +40,7 @@ impl Default for CompressorParams {
             release_ms: 100.0,
             makeup_db: 0.0,
             sample_rate: 48_000,
+            channels: 2,
         }
     }
 }
@@ -48,8 +51,11 @@ impl CompressorParams {
     /// every `ratio` dB of input yields 1 dB of output.
     #[must_use]
     pub fn output_level_db(&self, input_db: f32) -> f32 {
-        let _ = input_db;
-        todo!("Phase 2: the static gain curve (see the `compressor_*` specs)")
+        if input_db <= self.threshold_db {
+            input_db + self.makeup_db
+        } else {
+            self.threshold_db + (input_db - self.threshold_db) / self.ratio + self.makeup_db
+        }
     }
 }
 
@@ -58,14 +64,24 @@ impl CompressorParams {
 #[derive(Clone, Debug)]
 pub struct Compressor {
     params: CompressorParams,
-    // Phase 2: envelope follower state and attack/release coefficients go here.
+    /// Current gain reduction in dB (<= 0), smoothed by attack/release.
+    envelope_db: f32,
+    /// One-pole smoothing coefficients, per frame.
+    attack: f32,
+    release: f32,
 }
 
 impl Compressor {
     /// A compressor with `params`.
     #[must_use]
     pub fn new(params: CompressorParams) -> Self {
-        Self { params }
+        let coeff = |ms: f32| (-1.0 / (ms * 0.001 * params.sample_rate as f32)).exp();
+        Self {
+            params,
+            envelope_db: 0.0,
+            attack: coeff(params.attack_ms),
+            release: coeff(params.release_ms),
+        }
     }
 
     /// The parameters in use.
@@ -77,8 +93,22 @@ impl Compressor {
     /// Compresses `samples` (interleaved, all channels linked) in place.
     /// Runs on the audio thread: must not allocate or lock.
     pub fn process(&mut self, samples: &mut [f32]) {
-        let _ = samples;
-        todo!("Phase 2: envelope follower + gain computer (see the `compressor_*` specs)")
+        let p = self.params;
+        for frame in samples.chunks_exact_mut(usize::from(p.channels.max(1))) {
+            let peak = frame.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            let target = if peak <= 1e-9 {
+                0.0
+            } else {
+                let level = 20.0 * peak.log10();
+                (p.output_level_db(level) - p.makeup_db - level).min(0.0)
+            };
+            let coeff = if target < self.envelope_db { self.attack } else { self.release };
+            self.envelope_db = coeff * self.envelope_db + (1.0 - coeff) * target;
+            let gain = 10f32.powf((self.envelope_db + p.makeup_db) / 20.0);
+            for s in frame {
+                *s *= gain;
+            }
+        }
     }
 
     /// Delay this processor adds to the signal. Zero: there is no lookahead.
@@ -97,7 +127,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: CompressorParams::output_level_db (Phase 2)"]
     fn compressor_curve_passes_quiet_signals_unchanged() {
         let p = CompressorParams::default();
         assert!((p.output_level_db(-30.0) - -30.0).abs() < 1e-4);
@@ -105,7 +134,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: CompressorParams::output_level_db (Phase 2)"]
     fn compressor_curve_applies_the_ratio_above_threshold() {
         let p = CompressorParams::default();
         // -6 dBFS is 12 dB over the threshold → 4 dB over at 3:1 → -14 dBFS.
@@ -115,7 +143,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: Compressor::process (Phase 2)"]
     fn compressor_settles_on_the_static_curve() {
         let mut c = Compressor::new(CompressorParams::default());
         // One second of a steady -6 dBFS signal (DC keeps peak == RMS).
@@ -127,7 +154,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: Compressor::process (Phase 2)"]
     fn compressor_leaves_silence_silent() {
         let mut c = Compressor::new(CompressorParams { makeup_db: 12.0, ..Default::default() });
         let mut samples = vec![0.0; 4_800];
