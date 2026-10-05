@@ -95,7 +95,7 @@ fn main() -> Result<()> {
     let mut game = zc_audio::GameAudioSource::new();
     game.set_target_process(Some(pid));
     game.start(&audio, sink.clone(), health.clone())?;
-    let mut mic = zc_audio::MicSource::new(true, true);
+    let mut mic = zc_audio::MicSource::new(true, true, None);
     if let Err(e) = mic.start(&audio, sink.clone(), health.clone()) {
         tracing::warn!(%e, "no microphone; measuring game audio and video only");
     }

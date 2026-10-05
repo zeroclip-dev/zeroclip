@@ -2,11 +2,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Media::Audio::{
-    AUDCLNT_E_DEVICE_INVALIDATED, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator, eCapture,
-    eCommunications,
+    AUDCLNT_E_DEVICE_INVALIDATED, DEVICE_STATE_ACTIVE, IAudioClient, IMMDevice,
+    IMMDeviceEnumerator, MMDeviceEnumerator, eCapture, eCommunications,
 };
-use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
+use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, STGM_READ};
+use windows_core::HSTRING;
 use zc_core::dsp::{Compressor, CompressorParams};
 use zc_core::media::TrackId;
 use zc_core::ports::{AudioSource, AudioStart, Emit, SourceError};
@@ -20,25 +22,29 @@ use crate::capture::{Encode, Mmcss, Stream, Worker, pcm16_format};
 
 /// Track 2: the microphone, gated by push-to-talk.
 ///
-/// The default *communications* capture device (the headset mic, usually), in
-/// shared mode. A closed gate writes silence, so the track keeps its length and
+/// The chosen capture device, or the default *communications* one (the headset
+/// mic, usually), in shared mode. A closed gate writes silence, so the track keeps its length and
 /// timestamps (DESIGN §6). The optional compressor has no lookahead, so the Mic
 /// track needs no offset (`Compressor::latency`, `MasterClock::set_track_offset`).
 /// If the mic is unplugged or the default device changes, capture reopens every
-/// second; the gap becomes silence.
+/// second; the gap becomes silence. A chosen device that is missing is waited for,
+/// never swapped for another microphone.
 #[derive(Debug)]
 pub struct MicSource {
     /// Shared with the capture thread; flipped by the push-to-talk hotkey.
     gate: Arc<AtomicBool>,
     compressor: bool,
+    /// Endpoint id of the chosen mic; `None` is the Windows default.
+    device: Option<String>,
     worker: Option<Worker>,
 }
 
 impl MicSource {
-    /// A stopped mic source. `always_on` opens the gate permanently (no PTT).
+    /// A stopped mic source. `always_on` opens the gate permanently (no PTT);
+    /// `device` is an id from [`list_microphones`], or `None` for the default.
     #[must_use]
-    pub fn new(always_on: bool, compressor: bool) -> Self {
-        Self { gate: Arc::new(AtomicBool::new(always_on)), compressor, worker: None }
+    pub fn new(always_on: bool, compressor: bool, device: Option<String>) -> Self {
+        Self { gate: Arc::new(AtomicBool::new(always_on)), compressor, device, worker: None }
     }
 
     /// Whether the dynamics compressor is enabled.
@@ -54,14 +60,73 @@ impl MicSource {
     }
 }
 
-fn open_mic(config: &AudioStart) -> Result<Stream, SourceError> {
+/// A capture device Windows reports as plugged in and enabled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MicDevice {
+    /// Stable Windows endpoint id; what `AudioSettings::mic_device` stores.
+    pub id: String,
+    /// What the user sees, for example "Microphone (Realtek Audio)".
+    pub name: String,
+}
+
+/// The microphones available right now, in Windows' order. Empty on any failure.
+///
+/// Safe to call from the UI thread: the COM work runs on its own short-lived thread.
+#[must_use]
+pub fn list_microphones() -> Vec<MicDevice> {
+    std::thread::Builder::new()
+        .name("zc-mic-list".into())
+        .spawn(|| {
+            enumerate()
+                .inspect_err(|e| tracing::warn!(%e, "couldn't list microphones"))
+                .unwrap_or_default()
+        })
+        .ok()
+        .and_then(|t| t.join().ok())
+        .unwrap_or_default()
+}
+
+fn enumerate() -> Result<Vec<MicDevice>, SourceError> {
+    let _apartment = Apartment::multithreaded()?;
+    let mut found = Vec::new();
+    // SAFETY: plain COM calls on this thread's apartment; the id string is freed
+    // with `CoTaskMemFree` after it is copied.
+    unsafe {
+        let devices: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+            .context("MMDeviceEnumerator")?;
+        let list = devices
+            .EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)
+            .context("EnumAudioEndpoints")?;
+        for i in 0..list.GetCount().context("GetCount")? {
+            let device = list.Item(i).context("Item")?;
+            let raw = device.GetId().context("GetId")?;
+            let id = raw.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(raw.as_ptr().cast()));
+            let name = device
+                .OpenPropertyStore(STGM_READ)
+                .and_then(|store| store.GetValue(&PKEY_Device_FriendlyName))
+                .map_or_else(|_| "Microphone".to_owned(), |v| v.to_string());
+            if !id.is_empty() {
+                found.push(MicDevice { id, name });
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn open_mic(config: &AudioStart, chosen: Option<&str>) -> Result<Stream, SourceError> {
     // SAFETY: plain COM calls on this thread's apartment.
     let client: IAudioClient = unsafe {
         let devices: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
             .context("MMDeviceEnumerator")?;
-        let device = devices
-            .GetDefaultAudioEndpoint(eCapture, eCommunications)
-            .map_err(|_| SourceError::Unsupported("no microphone".into()))?;
+        let device: IMMDevice = match chosen {
+            Some(id) => devices.GetDevice(&HSTRING::from(id)).map_err(|_| {
+                SourceError::Unsupported("the chosen microphone isn't connected".into())
+            })?,
+            None => devices
+                .GetDefaultAudioEndpoint(eCapture, eCommunications)
+                .map_err(|_| SourceError::Unsupported("no microphone".into()))?,
+        };
         device.Activate(CLSCTX_ALL, None).context("IMMDevice::Activate")?
     };
     Stream::start(client, false, &pcm16_format(config.sample_rate, config.channels))
@@ -80,18 +145,26 @@ impl AudioSource for MicSource {
     ) -> Result<(), SourceError> {
         self.stop();
         let (config, gate, use_compressor) = (*config, Arc::clone(&self.gate), self.compressor);
+        let device = self.device.clone();
         self.worker = Some(Worker::spawn("zc-mic", move |stop, ready| {
             let setup = (|| {
                 let apartment = Apartment::multithreaded()?;
                 let mf = MediaFoundation::start()?;
                 let encode = Encode::new(TrackId::Mic, &config)?;
-                let stream = open_mic(&config)?;
+                // A missing mic isn't fatal: the loop below keeps trying (a dock, a USB plug).
+                let stream = open_mic(&config, device.as_deref())
+                    .inspect_err(
+                        |e| tracing::warn!(%e, "microphone not available yet; will keep trying"),
+                    )
+                    .ok();
                 Ok((apartment, mf, encode, stream))
             })();
             let (_apartment, _mf, mut encode, stream) = match setup {
                 Ok(parts) => {
                     ready(Ok(()));
-                    tracing::info!("microphone capturing");
+                    if parts.3.is_some() {
+                        tracing::info!("microphone capturing");
+                    }
                     parts
                 }
                 Err(e) => return ready(Err(e)),
@@ -108,11 +181,11 @@ impl AudioSource for MicSource {
                     ..CompressorParams::default()
                 })
             });
-            let mut stream = Some(stream);
+            let mut stream = stream;
             while !stop.load(Ordering::Acquire) {
                 let Some(s) = &stream else {
                     std::thread::sleep(Duration::from_secs(1));
-                    stream = open_mic(&config)
+                    stream = open_mic(&config, device.as_deref())
                         .inspect_err(|e| tracing::debug!(%e, "mic still unavailable"))
                         .ok();
                     if stream.is_some() {

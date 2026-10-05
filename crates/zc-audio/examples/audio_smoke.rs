@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sink = Arc::new(Count::default());
     let health = Arc::new(|_| {});
 
-    let mut mic = zc_audio::MicSource::new(true, true);
+    let mut mic = zc_audio::MicSource::new(true, true, None);
     match mic.start(&config, sink.clone(), health.clone()) {
         Ok(()) => tracing::info!("mic started"),
         Err(e) => tracing::warn!(%e, "mic unavailable"),

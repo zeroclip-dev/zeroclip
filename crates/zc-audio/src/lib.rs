@@ -24,4 +24,4 @@ mod game;
 mod mic;
 
 pub use game::GameAudioSource;
-pub use mic::MicSource;
+pub use mic::{MicDevice, MicSource, list_microphones};

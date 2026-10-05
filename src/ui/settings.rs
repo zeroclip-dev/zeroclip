@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use eframe::egui::{self, Button, ComboBox, DragValue, Grid, TextEdit};
+use zc_audio::MicDevice;
 use zc_core::hotkey::Chord;
 use zc_core::media::{Codec, ContainerFormat};
 use zc_core::settings::{AAC_BITRATES_KBPS, MicMode, Settings};
@@ -20,6 +21,8 @@ pub struct Draft {
     toggle_recording: String,
     screenshot: String,
     push_to_talk: String,
+    /// Microphones Windows reports; refreshed by the Refresh button.
+    mics: Vec<MicDevice>,
     /// Problems from the last save attempt.
     pub problems: Vec<String>,
 }
@@ -39,6 +42,7 @@ impl Draft {
             toggle_recording: hotkeys.toggle_recording.to_string(),
             screenshot: hotkeys.screenshot.to_string(),
             push_to_talk: hotkeys.push_to_talk.as_ref().map(Chord::to_string).unwrap_or_default(),
+            mics: zc_audio::list_microphones(),
             problems: Vec::new(),
         }
     }
@@ -194,6 +198,7 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
 
         section(ui, "Audio", |ui| {
             let audio = &mut draft.settings.audio;
+            let mics = &mut draft.mics;
             ui.checkbox(&mut audio.game_audio, "Record the game's audio (track 1)");
             ui.weak(
                 "Only the game in focus is captured: Discord, music and notifications stay \
@@ -204,6 +209,27 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
                 ComboBox::from_id_salt("mic").selected_text(mic_label(audio.mic)).show_ui(ui, |ui| {
                     for option in [MicMode::Off, MicMode::AlwaysOn, MicMode::PushToTalk] {
                         ui.selectable_value(&mut audio.mic, option, mic_label(option));
+                    }
+                });
+            });
+            ui.add_enabled_ui(audio.mic != MicMode::Off, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Microphone device");
+                    let name = match &audio.mic_device {
+                        None => "Windows default".to_owned(),
+                        Some(id) => mics.iter().find(|m| &m.id == id).map_or_else(
+                            || "Chosen microphone (not connected)".to_owned(),
+                            |m| m.name.clone(),
+                        ),
+                    };
+                    ComboBox::from_id_salt("mic-device").selected_text(name).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut audio.mic_device, None, "Windows default");
+                        for m in mics.iter() {
+                            ui.selectable_value(&mut audio.mic_device, Some(m.id.clone()), &m.name);
+                        }
+                    });
+                    if ui.button("Refresh").clicked() {
+                        *mics = zc_audio::list_microphones();
                     }
                 });
             });
@@ -222,7 +248,7 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
                         }
                     });
             });
-            ui.weak("Turning game audio or the microphone on or off takes effect the next time ZeroClip starts.");
+            ui.weak("Turning game audio or the microphone on or off, or changing the microphone, takes effect the next time ZeroClip starts.");
         });
 
         section(ui, "Hotkeys", |ui| {

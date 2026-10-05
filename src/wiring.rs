@@ -29,8 +29,11 @@ pub fn ports(settings: &Settings) -> Ports {
             .game_audio
             .then(|| Box::new(zc_audio::GameAudioSource::new()) as Box<dyn AudioSource>),
         mic: (audio.mic != MicMode::Off).then(|| {
-            Box::new(zc_audio::MicSource::new(audio.mic == MicMode::AlwaysOn, audio.mic_compressor))
-                as Box<dyn AudioSource>
+            Box::new(zc_audio::MicSource::new(
+                audio.mic == MicMode::AlwaysOn,
+                audio.mic_compressor,
+                audio.mic_device.clone(),
+            )) as Box<dyn AudioSource>
         }),
     }
 }

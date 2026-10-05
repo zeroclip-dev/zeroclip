@@ -173,6 +173,9 @@ pub struct AudioSettings {
     pub game_audio: bool,
     /// Microphone behaviour (track 2).
     pub mic: MicMode,
+    /// Which microphone, as a Windows endpoint id. `None` follows the Windows
+    /// default communications device.
+    pub mic_device: Option<String>,
     /// Run the mic through the dynamics compressor (DESIGN §6).
     pub mic_compressor: bool,
     /// AAC bitrate per track, kbit/s.
@@ -181,7 +184,13 @@ pub struct AudioSettings {
 
 impl Default for AudioSettings {
     fn default() -> Self {
-        Self { game_audio: true, mic: MicMode::Off, mic_compressor: true, bitrate_kbps: 192 }
+        Self {
+            game_audio: true,
+            mic: MicMode::Off,
+            mic_device: None,
+            mic_compressor: true,
+            bitrate_kbps: 192,
+        }
     }
 }
 
