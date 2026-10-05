@@ -56,6 +56,8 @@ Manager shows the GPU's Video Encode engine busy with no unexpected CPU copy ove
 
 *Done when:* a 30-minute recording has no measurable A/V drift at the end.
 
+Measured 2026-10-05 with `spike-phase2`: every track within ±11 ms of its minute-1 position over 30 minutes. Repeat it end to end once Phase 3 writes real files (a clap or flash test). A constant offset, such as AAC encoder priming, isn't drift; it's corrected with `MasterClock::set_track_offset`.
+
 ## Phase 3 — Buffers, modes, muxing
 
 - [ ] Specs: `DvrBuffer` (all of them, including `dvr_push_never_allocates`), `Tee`, `ChunkedWriter`, `WritePacer`
