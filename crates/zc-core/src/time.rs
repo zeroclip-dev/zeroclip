@@ -229,8 +229,9 @@ impl MasterClock {
 
     /// Anchors the timeline at `raw`. Only the first call has any effect.
     pub fn anchor(&mut self, raw: Hns) {
-        let _ = raw;
-        todo!("Phase 2: anchor the master clock (see the `master_clock_*` specs)")
+        if self.origin.is_none() {
+            self.origin = Some(raw);
+        }
     }
 
     /// Whether [`anchor`](Self::anchor) has been called.
@@ -250,8 +251,8 @@ impl MasterClock {
     /// before the start of the session (negative PTS).
     #[must_use]
     pub fn to_pts(&self, track: TrackId, raw: Hns) -> Option<Hns> {
-        let _ = (track, raw);
-        todo!("Phase 2: map raw timestamps to session PTS (see the `master_clock_*` specs)")
+        let pts = raw - self.origin? + self.offsets[track.index()];
+        (pts >= Hns::ZERO).then_some(pts)
     }
 }
 
@@ -350,7 +351,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: MasterClock::to_pts (Phase 2)"]
     fn master_clock_pts_is_relative_to_the_anchor() {
         let mut clock = MasterClock::new();
         clock.anchor(Hns(1_000_000));
@@ -359,7 +359,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: MasterClock::anchor (Phase 2)"]
     fn master_clock_anchor_is_set_once() {
         // A pipeline re-init re-anchoring would restart PTS at zero, which makes
         // files seek incorrectly (DESIGN §8). The first anchor wins.
@@ -371,7 +370,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: MasterClock::to_pts (Phase 2)"]
     fn master_clock_rejects_samples_before_the_session() {
         let mut clock = MasterClock::new();
         assert_eq!(clock.to_pts(TrackId::Video, Hns(5)), None, "not anchored yet");
@@ -380,7 +378,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: MasterClock::to_pts (Phase 2)"]
     fn master_clock_applies_per_track_offsets() {
         // DESIGN §6: a lookahead limiter delays the mic by a constant; that delay is
         // compensated explicitly, per track, instead of being discovered later as drift.
