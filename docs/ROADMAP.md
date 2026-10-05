@@ -47,7 +47,8 @@ Manager shows the GPU's Video Encode engine busy with no unexpected CPU copy ove
 
 ## Phase 2 — Audio, input, sync
 
-- [ ] Specs: `MasterClock`, `ChordMatcher`, `Compressor`, `mouse_buttons`
+- [x] Specs: `MasterClock`, `ChordMatcher`, `Compressor`, `mouse_buttons`
+- [x] `SampleTimeline` (audio clock drift)
 - [ ] `zc-win::message_thread`; `zc-input` Raw Input + foreground hook
 - [ ] `zc-audio` game audio (process loopback, include mode) and mic with push-to-talk
 - [ ] Resolve the loopback include/exclude question (docs/OPEN_QUESTIONS.md) before building the audio settings UI

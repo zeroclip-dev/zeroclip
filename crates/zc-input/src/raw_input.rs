@@ -38,8 +38,16 @@ pub fn decode(lparam: LPARAM, emit: impl FnMut(OsEvent)) {
 /// = 0x0040, `_UP` = 0x0080, `RI_MOUSE_BUTTON_5_DOWN` = 0x0100, `_UP` = 0x0200.)
 #[must_use]
 pub fn mouse_buttons(button_flags: u16) -> Vec<(Key, bool)> {
-    let _ = button_flags;
-    todo!("Phase 2: map the RI_MOUSE_* bits (see the `mouse_*` spec)")
+    const TABLE: [(u16, Key, bool); 6] = [
+        (0x0010, Key::MOUSE3, true),
+        (0x0020, Key::MOUSE3, false),
+        (0x0040, Key::MOUSE4, true),
+        (0x0080, Key::MOUSE4, false),
+        (0x0100, Key::MOUSE5, true),
+        (0x0200, Key::MOUSE5, false),
+    ];
+    // Mouse moves (no button bits) give an empty Vec, which doesn't allocate.
+    TABLE.iter().filter(|(bit, ..)| button_flags & bit != 0).map(|&(_, k, d)| (k, d)).collect()
 }
 
 #[cfg(test)]
@@ -47,7 +55,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "spec: mouse_buttons (Phase 2)"]
     fn mouse_side_buttons_map_to_virtual_keys() {
         assert_eq!(mouse_buttons(0x0040), [(Key::MOUSE4, true)]);
         assert_eq!(mouse_buttons(0x0200), [(Key::MOUSE5, false)]);

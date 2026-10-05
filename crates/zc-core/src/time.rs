@@ -256,6 +256,98 @@ impl MasterClock {
     }
 }
 
+/// What to do with one captured PCM buffer (see [`SampleTimeline::place`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placement {
+    /// Raw (QPC-timeline) PTS of the first frame to emit: the first silence frame
+    /// if there is any, otherwise the first kept audio frame.
+    pub pts: Hns,
+    /// Zero frames to emit before the buffer, to close a gap.
+    pub silence: u32,
+    /// Frames to drop from the start of the buffer, because the device ran fast.
+    pub skip: u32,
+    /// The timeline (re)started here: drain the encoder before encoding this.
+    pub restart: bool,
+}
+
+/// Keeps a stream of PCM buffers continuous and on the QPC timeline (DESIGN §6).
+///
+/// The sound card's sample clock and QPC disagree by 10-100 ppm, up to 180 ms over
+/// 30 minutes. Timestamps here count samples, so they are exact and contiguous,
+/// but whenever they drift more than [`TOLERANCE`](Self::TOLERANCE) from the
+/// buffer's QPC time, the timeline re-aligns by inserting silence or dropping
+/// frames. Pure logic, no allocation: it runs on the audio threads.
+#[derive(Clone, Debug)]
+pub struct SampleTimeline {
+    rate: u32,
+    /// (frame index, its QPC time): the reference for sample-exact timestamps.
+    anchor: Option<(u64, Hns)>,
+    /// Index of the next frame to be emitted.
+    next: u64,
+}
+
+impl SampleTimeline {
+    /// How far timestamps may drift from QPC before a correction. A calibration
+    /// knob: corrections stay well under the ~45 ms where viewers notice lip-sync
+    /// errors (ITU-R BT.1359).
+    pub const TOLERANCE: Hns = Hns::from_millis(20);
+    /// Gaps longer than this restart the timeline instead of filling with silence.
+    pub const MAX_FILL: Hns = Hns::from_secs(1);
+
+    /// A timeline for `sample_rate` frames per second.
+    #[must_use]
+    pub fn new(sample_rate: u32) -> Self {
+        Self { rate: sample_rate.max(1), anchor: None, next: 0 }
+    }
+
+    /// The time of the next frame, `None` before the first buffer.
+    #[must_use]
+    pub fn expected(&self) -> Option<Hns> {
+        self.anchor.map(|_| self.time_of(self.next))
+    }
+
+    fn time_of(&self, n: u64) -> Hns {
+        let (anchor_n, anchor_t) = self.anchor.unwrap_or((0, Hns::ZERO));
+        let ticks = i128::from(n - anchor_n) * i128::from(Hns::PER_SECOND) / i128::from(self.rate);
+        anchor_t + Hns(i64::try_from(ticks).unwrap_or(i64::MAX))
+    }
+
+    fn frames_in(&self, d: Hns) -> u32 {
+        let frames = i128::from(d.ticks()) * i128::from(self.rate) / i128::from(Hns::PER_SECOND);
+        u32::try_from(frames.max(0)).unwrap_or(u32::MAX)
+    }
+
+    /// Places a buffer of `frames` frames whose first frame was captured at `qpc`.
+    pub fn place(&mut self, qpc: Hns, frames: u32) -> Placement {
+        let on_time = |pts| Placement { pts, silence: 0, skip: 0, restart: false };
+        let Some(_) = self.anchor else {
+            return self.restart(qpc, frames);
+        };
+        let expected = self.time_of(self.next);
+        let err = qpc - expected;
+        if err > Self::MAX_FILL {
+            self.restart(qpc, frames)
+        } else if err > Self::TOLERANCE {
+            let silence = self.frames_in(err);
+            self.next += u64::from(silence) + u64::from(frames);
+            Placement { silence, ..on_time(expected) }
+        } else if err < -Self::TOLERANCE {
+            let skip = self.frames_in(-err).min(frames);
+            self.next += u64::from(frames - skip);
+            Placement { skip, ..on_time(expected) }
+        } else {
+            self.next += u64::from(frames);
+            on_time(expected)
+        }
+    }
+
+    fn restart(&mut self, qpc: Hns, frames: u32) -> Placement {
+        self.anchor = Some((self.next, qpc));
+        self.next += u64::from(frames);
+        Placement { pts: qpc, silence: 0, skip: 0, restart: true }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,5 +479,91 @@ mod tests {
         let t = Hns::from_millis(100);
         assert_eq!(clock.to_pts(TrackId::Mic, t), Some(Hns::from_millis(95)));
         assert_eq!(clock.to_pts(TrackId::Video, t), Some(t), "other tracks untouched");
+    }
+
+    const MS: i64 = Hns::PER_MILLI;
+    /// 480 frames at 48 kHz: 10 ms.
+    const BUF: Hns = Hns(100_000);
+
+    #[test]
+    fn sample_timeline_first_buffer_restarts() {
+        let mut t = SampleTimeline::new(48_000);
+        assert_eq!(t.expected(), None);
+        let p = t.place(Hns(5_000), 480);
+        assert_eq!(p, Placement { pts: Hns(5_000), silence: 0, skip: 0, restart: true });
+        assert_eq!(t.expected(), Some(Hns(5_000) + BUF));
+    }
+
+    #[test]
+    fn sample_timeline_is_sample_exact_when_on_time() {
+        let mut t = SampleTimeline::new(48_000);
+        let t0 = Hns(123_456_789);
+        t.place(t0, 480);
+        for k in 1..1_000 {
+            let p = t.place(t0 + Hns(k * BUF.ticks()), 480);
+            assert_eq!(
+                p,
+                Placement { pts: t0 + Hns(k * BUF.ticks()), silence: 0, skip: 0, restart: false }
+            );
+        }
+    }
+
+    #[test]
+    fn sample_timeline_ignores_jitter_within_tolerance() {
+        let mut t = SampleTimeline::new(48_000);
+        t.place(Hns::ZERO, 480);
+        for k in 1..500 {
+            let noise = [5, -5, 3, -2, 0][k as usize % 5] * MS;
+            let p = t.place(Hns(k * BUF.ticks() + noise), 480);
+            assert_eq!((p.silence, p.skip, p.restart), (0, 0, false));
+            assert_eq!(p.pts, Hns(k * BUF.ticks()), "timestamps stay sample-exact");
+        }
+    }
+
+    #[test]
+    fn sample_timeline_fills_a_gap_with_silence() {
+        let mut t = SampleTimeline::new(48_000);
+        t.place(Hns::ZERO, 480);
+        let p = t.place(BUF + Hns(50 * MS), 480);
+        assert_eq!((p.pts, p.silence, p.skip), (BUF, 2_400, 0));
+        assert_eq!(t.expected(), Some(BUF + Hns(50 * MS) + BUF));
+    }
+
+    #[test]
+    fn sample_timeline_drops_frames_when_the_device_runs_fast() {
+        let mut t = SampleTimeline::new(48_000);
+        t.place(Hns::ZERO, 4_800);
+        let p = t.place(Hns(100 * MS - 30 * MS), 4_800);
+        assert_eq!((p.pts, p.silence, p.skip), (Hns(100 * MS), 0, 1_440));
+    }
+
+    #[test]
+    fn sample_timeline_restarts_after_a_long_gap() {
+        let mut t = SampleTimeline::new(48_000);
+        t.place(Hns::ZERO, 480);
+        let late = Hns::from_secs(5);
+        let p = t.place(late, 480);
+        assert!(p.restart);
+        assert_eq!(p.pts, late);
+    }
+
+    #[test]
+    fn sample_timeline_bounds_drift_over_30_minutes() {
+        for ppm in [-100.0_f64, 100.0] {
+            let mut t = SampleTimeline::new(48_000);
+            let step = BUF.ticks() as f64 * (1.0 + ppm * 1e-6);
+            for k in 0..180_000_i64 {
+                let qpc = Hns((k as f64 * step).round() as i64);
+                let p = t.place(qpc, 480);
+                // Where the first kept frame lands, versus where it really was captured.
+                let kept_at = p.pts + Hns(i64::from(p.silence) * Hns::PER_SECOND / 48_000);
+                let captured_at = qpc + Hns(i64::from(p.skip) * Hns::PER_SECOND / 48_000);
+                let error = (kept_at - captured_at).ticks().abs();
+                assert!(
+                    error <= (SampleTimeline::TOLERANCE + Hns(MS)).ticks(),
+                    "{ppm} ppm, buffer {k}: {error}"
+                );
+            }
+        }
     }
 }
