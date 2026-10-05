@@ -10,10 +10,11 @@ use time::OffsetDateTime;
 use time::macros::format_description;
 
 use zc_core::control::{Command, EngineEvent, EngineStatus};
+use zc_core::hotkey::{Binding, ChordMatcher, HotkeyEvent, Trigger};
 use zc_core::ports::{
     AudioSource, CaptureTarget, Emit, InputSource, OsEvent, SourceError, VideoSource, VideoStart,
 };
-use zc_core::settings::Settings;
+use zc_core::settings::{MicMode, Settings};
 use zc_core::sink::{PacketSink, SharedSink};
 use zc_core::watchdog::HealthEvent;
 use zc_core::{Codec, PacketRef};
@@ -90,6 +91,7 @@ impl Engine {
                 .output_dir
                 .clone()
                 .unwrap_or(config.default_output_dir),
+            hotkeys: ChordMatcher::new(bindings(&config.settings)),
             settings: config.settings,
             ports,
             inbox: inbox.clone(),
@@ -123,6 +125,9 @@ impl fmt::Debug for Msg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Command(c) => write!(f, "Command({c:?})"),
+            // Never print which key: the input thread sees every keystroke on the
+            // system, passwords included, and `run` traces every message.
+            Self::Os(OsEvent::Key { .. }) => write!(f, "Os(Key)"),
             Self::Os(e) => write!(f, "Os({e:?})"),
             Self::Health(e) => write!(f, "Health({e:?})"),
         }
@@ -182,6 +187,42 @@ struct Actor {
     wake: Emit<()>,
     status: EngineStatus,
     packets: Arc<PacketCounter>,
+    hotkeys: ChordMatcher<HotkeyAction>,
+}
+
+/// What a hotkey does. Engine-local: only the matcher's bindings use it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HotkeyAction {
+    SaveClip,
+    ToggleRecording,
+    Screenshot,
+    PushToTalk,
+}
+
+/// The hotkey bindings for these settings. Push-to-talk is bound only in
+/// push-to-talk mode.
+fn bindings(settings: &Settings) -> Vec<Binding<HotkeyAction>> {
+    let h = &settings.hotkeys;
+    let press = |chord: &zc_core::hotkey::Chord, action| Binding {
+        chord: chord.clone(),
+        action,
+        trigger: Trigger::Press,
+    };
+    let mut bindings = vec![
+        press(&h.save_clip, HotkeyAction::SaveClip),
+        press(&h.toggle_recording, HotkeyAction::ToggleRecording),
+        press(&h.screenshot, HotkeyAction::Screenshot),
+    ];
+    if settings.audio.mic == MicMode::PushToTalk
+        && let Some(chord) = &h.push_to_talk
+    {
+        bindings.push(Binding {
+            chord: chord.clone(),
+            action: HotkeyAction::PushToTalk,
+            trigger: Trigger::Hold,
+        });
+    }
+    bindings
 }
 
 /// Counts what the video source produces. A Phase 1 stand-in for the `Recorder`,
@@ -330,6 +371,11 @@ impl Actor {
                 // Phase 3/4: also re-size the DVR buffer.
                 let video_changed = self.settings.video != settings.video;
                 self.settings = *settings;
+                self.hotkeys = ChordMatcher::new(bindings(&self.settings));
+                // Switching modes must never leave the push-to-talk gate open.
+                if let Some(mic) = self.ports.mic.as_mut() {
+                    mic.set_gate(self.settings.audio.mic == MicMode::AlwaysOn);
+                }
                 if video_changed && let Some(video) = self.ports.video.as_mut() {
                     tracing::info!("video settings changed; restarting capture");
                     video.stop();
@@ -364,9 +410,21 @@ impl Actor {
 
     fn on_os_event(&mut self, event: OsEvent) {
         match event {
-            // Phase 2: feed a `ChordMatcher` built from `settings.hotkeys` and turn
-            // its output into commands (SaveClip, ToggleRecording, Screenshot, PTT).
-            OsEvent::Key { key, down } => tracing::trace!(%key, down, "key"),
+            OsEvent::Key { key, down } => {
+                let Some(event) = self.hotkeys.on_key(key, down) else {
+                    return;
+                };
+                tracing::debug!(?event, "hotkey");
+                let command = match event {
+                    HotkeyEvent::Pressed(HotkeyAction::SaveClip) => Command::SaveClip,
+                    HotkeyEvent::Pressed(HotkeyAction::ToggleRecording) => Command::ToggleRecording,
+                    HotkeyEvent::Pressed(HotkeyAction::Screenshot) => Command::Screenshot,
+                    HotkeyEvent::Pressed(HotkeyAction::PushToTalk) => Command::PushToTalk(true),
+                    HotkeyEvent::Released(HotkeyAction::PushToTalk) => Command::PushToTalk(false),
+                    HotkeyEvent::Released(_) => return,
+                };
+                self.on_command(command);
+            }
             // Phase 4: resolve the profile, clamp its window to the RAM ceiling,
             // resize the DVR buffer, retarget game audio, maybe start a session.
             OsEvent::Foreground { pid, exe } => {
@@ -386,6 +444,7 @@ impl Actor {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
@@ -555,6 +614,97 @@ mod tests {
         let (engine, _) = spawn(Ports::default());
         engine.send(Command::Screenshot).unwrap();
         wait_for(&engine, |e| matches!(e, EngineEvent::Error(m) if m.starts_with("Screenshot")));
+    }
+
+    /// An input source whose emitter the test can fire.
+    #[derive(Clone, Default)]
+    struct FakeInput(Arc<Mutex<Option<Emit<OsEvent>>>>);
+
+    impl InputSource for FakeInput {
+        fn start(&mut self, events: Emit<OsEvent>) -> Result<(), SourceError> {
+            *self.0.lock().unwrap() = Some(events);
+            Ok(())
+        }
+        fn stop(&mut self) {}
+    }
+
+    impl FakeInput {
+        fn key(&self, key: zc_core::hotkey::Key, down: bool) {
+            let emit = self.0.lock().unwrap().clone().expect("input started");
+            emit(OsEvent::Key { key, down });
+        }
+    }
+
+    /// A mic that records every gate change.
+    #[derive(Clone, Default)]
+    struct FakeMic(Arc<Mutex<Vec<bool>>>);
+
+    impl AudioSource for FakeMic {
+        fn track(&self) -> zc_core::TrackId {
+            zc_core::TrackId::Mic
+        }
+        fn start(
+            &mut self,
+            _: &zc_core::ports::AudioStart,
+            _: SharedSink,
+            _: Emit<HealthEvent>,
+        ) -> Result<(), SourceError> {
+            Ok(())
+        }
+        fn stop(&mut self) {}
+        fn set_gate(&mut self, open: bool) {
+            self.0.lock().unwrap().push(open);
+        }
+    }
+
+    #[test]
+    fn alt_f10_saves_a_clip() {
+        use zc_core::hotkey::Key;
+        let input = FakeInput::default();
+        let (engine, _) = spawn(Ports { input: Some(Box::new(input.clone())), ..Ports::default() });
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        input.key(Key::ALT, true);
+        input.key(Key::f(10), true);
+        // Phase 3: expect ClipSaved instead.
+        wait_for(&engine, |e| {
+            matches!(e, EngineEvent::NotImplemented { feature: "Saving a DVR clip", .. })
+        });
+    }
+
+    #[test]
+    fn push_to_talk_opens_and_closes_the_mic_gate() {
+        use zc_core::hotkey::{Chord, Key};
+        let mut settings = Settings::default();
+        settings.audio.mic = MicMode::PushToTalk;
+        settings.hotkeys.push_to_talk = Some(Chord::new([Key::MOUSE5]).unwrap());
+        let (input, mic) = (FakeInput::default(), FakeMic::default());
+        let ports = Ports {
+            input: Some(Box::new(input.clone())),
+            mic: Some(Box::new(mic.clone())),
+            ..Ports::default()
+        };
+        let engine = Engine::spawn(
+            EngineConfig {
+                settings,
+                default_output_dir: std::env::temp_dir().join("zeroclip-test"),
+            },
+            ports,
+            Arc::new(|()| {}),
+        )
+        .expect("spawn");
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        input.key(Key::MOUSE5, true);
+        input.key(Key::MOUSE5, false);
+        // A barrier: once this is answered, the key events before it were handled.
+        engine.send(Command::SaveClip).unwrap();
+        wait_for(&engine, |e| matches!(e, EngineEvent::NotImplemented { .. }));
+        assert!(mic.0.lock().unwrap().ends_with(&[true, false]));
+    }
+
+    #[test]
+    fn keystrokes_never_reach_the_log() {
+        let msg = Msg::Os(OsEvent::Key { key: zc_core::hotkey::Key(0x41), down: true });
+        assert_eq!(format!("{msg:?}"), "Os(Key)");
     }
 
     #[test]
