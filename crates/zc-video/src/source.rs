@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use windows::Graphics::Capture::GraphicsCaptureItem;
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D};
 use zc_core::Hns;
 use zc_core::backoff::Backoff;
@@ -236,16 +237,16 @@ fn run(
 
     // Protected content (HDCP) can block starting capture; retry with backoff.
     let mut backoff = Backoff::hdcp();
-    let try_capture = || {
+    let try_capture = |item: &GraphicsCaptureItem| {
         let handler = Arc::clone(&handler);
-        WgcCapture::start(&device, &item, config.capture_cursor, move |frame| {
+        WgcCapture::start(&device, item, config.capture_cursor, move |frame| {
             if let Ok(mut handler) = handler.lock() {
                 handler.on_frame(&frame);
             }
         })
     };
     let mut retry_at = Instant::now();
-    let mut capture = match try_capture() {
+    let mut capture = match try_capture(&item) {
         Ok(capture) => Some(capture),
         Err(SourceError::Protected) => {
             retry_at += backoff.next_delay().to_duration().unwrap_or_default();
@@ -261,17 +262,27 @@ fn run(
     let mut credits = 0u32;
     let result = (|| -> Result<(), SourceError> {
         while !shared.stop.load(Ordering::Acquire) {
+            if capture.as_ref().is_some_and(WgcCapture::is_closed) {
+                // The monitor went away (display switch, Win+P). The last frame keeps
+                // repeating until capture reopens, so the stream never stops.
+                tracing::warn!("capture target closed; reopening");
+                capture = None;
+                retry_at = Instant::now();
+            }
             if capture.is_none() && Instant::now() >= retry_at {
-                match try_capture() {
+                // Resolve the target again: after a display change the old item is dead.
+                match capture_item(config.target).and_then(|item| try_capture(&item)) {
                     Ok(c) => {
+                        tracing::info!("capture running");
                         capture = Some(c);
                         backoff.reset();
                     }
-                    Err(SourceError::Protected) => {
+                    // Protected content, or the display is still settling.
+                    Err(e) => {
+                        tracing::debug!(%e, "capture not available yet; retrying");
                         retry_at =
                             Instant::now() + backoff.next_delay().to_duration().unwrap_or_default();
                     }
-                    Err(e) => return Err(e),
                 }
             }
             while let Some(event) = encoder.next_event()? {
