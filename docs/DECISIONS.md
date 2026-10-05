@@ -144,3 +144,11 @@ size is fixed when capture starts (rounded down to even); later sizes are scaled
 letterboxed by the video processor, so the encoder and the stream never restart.
 Following the game to another monitor waits for the Phase 4 profile engine; real HDR
 (FP16 capture, 10-bit HEVC/AV1) comes after v0.1.
+
+### D25 · WASAPI through windows-rs, not the `wasapi` crate
+Mic and game-audio capture call WASAPI directly through the `windows` crate. That
+avoids a second windows-rs version in the build, keeps the audio loop's no-allocation
+rule under our control (the `wasapi` crate reads into a `VecDeque`), and keeps every
+line explainable. Cost: about 300 more lines in `zc-audio`, including the process-
+loopback activation, whose `PROPVARIANT` must be wrapped in `ManuallyDrop` (see the
+plan README's pitfalls).

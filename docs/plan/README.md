@@ -137,9 +137,14 @@ Every card repeats the pitfalls that apply to it locally. These apply everywhere
     `logic()`; `ui()` doesn't run while the window is hidden.
 12. **SQLite:** turn on `PRAGMA foreign_keys` on every connection and use WAL. Never edit
     `0001_init.sql`; add `0002_*.sql` instead.
-13. **Panics across FFI abort the process.** Keep `extern "system"` callbacks and COM
+13. **windows-rs 0.62 gives `PROPVARIANT` a `Drop` that calls `PropVariantClear`**
+    (in `src/extensions`, not the generated bindings). A `VT_BLOB` pointing at stack
+    memory then gets `CoTaskMemFree`d and the heap is corrupted
+    (`0xC0000374`). Wrap such a `PROPVARIANT` in `ManuallyDrop` (P2.16 found this the
+    hard way).
+14. **Panics across FFI abort the process.** Keep `extern "system"` callbacks and COM
     `_Impl` methods trivial, and use `try_borrow_mut` and `try_lock`, never `unwrap`.
-14. **Docs that are out of date.** Each phase's close-out card fixes the drift in its
+15. **Docs that are out of date.** Each phase's close-out card fixes the drift in its
     own area:
     - CLAUDE.md's "Current phase" line.
     - The ARCHITECTURE thread table: one IO thread per dump or recording, and tokio only
