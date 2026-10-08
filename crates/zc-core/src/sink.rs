@@ -61,7 +61,6 @@ pub struct SinkId(u32);
 #[derive(Default)]
 pub struct Tee {
     writers: Vec<(SinkId, Box<dyn PacketWriter>)>,
-    #[expect(dead_code, reason = "scaffold: used once attach is implemented")]
     next_id: u32,
 }
 
@@ -74,14 +73,17 @@ impl Tee {
 
     /// Attaches a writer. Call off the hot path (it may allocate).
     pub fn attach(&mut self, writer: Box<dyn PacketWriter>) -> SinkId {
-        let _ = writer;
-        todo!("Phase 3: attach a writer (see the `tee_*` specs)")
+        let id = SinkId(self.next_id);
+        self.next_id = self.next_id.wrapping_add(1);
+        self.writers.push((id, writer));
+        id
     }
 
     /// Detaches and returns a writer, e.g. to finalise its file.
     pub fn detach(&mut self, id: SinkId) -> Option<Box<dyn PacketWriter>> {
-        let _ = id;
-        todo!("Phase 3: detach a writer (see the `tee_*` specs)")
+        let index = self.writers.iter().position(|(sink, _)| *sink == id)?;
+        // `remove` keeps delivery order deterministic, unlike `swap_remove`.
+        Some(self.writers.remove(index).1)
     }
 
     /// Number of attached writers.
@@ -97,9 +99,13 @@ impl Tee {
     }
 
     /// Delivers `packet` to every writer, calling `on_error` for each one that fails.
-    pub fn write(&mut self, packet: PacketRef<'_>, on_error: impl FnMut(SinkId, &SinkError)) {
-        let _ = (packet, on_error);
-        todo!("Phase 3: fan out to every writer (see the `tee_*` specs)")
+    /// Runs on the hot path, so it never allocates.
+    pub fn write(&mut self, packet: PacketRef<'_>, mut on_error: impl FnMut(SinkId, &SinkError)) {
+        for (id, writer) in &mut self.writers {
+            if let Err(e) = writer.write(packet) {
+                on_error(*id, &e);
+            }
+        }
     }
 }
 
@@ -138,7 +144,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: Tee::attach + Tee::write (Phase 3)"]
     fn tee_delivers_every_packet_to_every_writer() {
         let mut tee = Tee::new();
         let (a, seen_a) = probe(false);
@@ -155,7 +160,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: Tee::write (Phase 3)"]
     fn tee_keeps_feeding_healthy_writers_when_one_fails() {
         let mut tee = Tee::new();
         let (bad, _) = probe(true);
@@ -170,7 +174,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: Tee::detach (Phase 3)"]
     fn tee_detach_stops_delivery() {
         let mut tee = Tee::new();
         let (w, seen) = probe(false);
