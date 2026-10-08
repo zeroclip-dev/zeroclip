@@ -200,4 +200,6 @@ and pre-faults the copy outside it, then copies a few MiB per lock hold, oldest 
 Every ring counts the bytes it has ever written, so a packet the writer has overwritten
 in the meantime is detected, not copied; the clip then starts at the next keyframe. The
 2 s of headroom `DvrConfig::for_window` adds makes that rare. Cost: a save takes about
-as long as before in total, but no hold is longer than a few milliseconds.
+as long as before in total, but no hold is longer than a few milliseconds. Measured after
+P3.17b (release build, 20 Mbps): longest single hold 0.99 ms for a 60 s window (89 ms in
+total) and 1.24 ms for 300 s (470 ms in total), down from 115–135 ms and about 1 s.
