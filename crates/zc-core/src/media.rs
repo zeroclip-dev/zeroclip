@@ -84,6 +84,50 @@ impl ContainerFormat {
     }
 }
 
+/// Codec-specific description of a track, taken from the encoder's output media type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrackKind {
+    /// A video track.
+    Video {
+        /// Codec.
+        codec: Codec,
+        /// Width, pixels.
+        width: u32,
+        /// Height, pixels.
+        height: u32,
+        /// Nominal frame rate.
+        fps: u32,
+    },
+    /// An AAC audio track.
+    Audio {
+        /// Sample rate, Hz.
+        sample_rate: u32,
+        /// Channel count.
+        channels: u16,
+    },
+}
+
+/// One track in a container.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackInfo {
+    /// Which track.
+    pub track: TrackId,
+    /// Human-readable name such as "Game" or "Microphone", set when the track starts.
+    pub label: String,
+    /// What it contains.
+    pub kind: TrackKind,
+    /// Decoder configuration, as the encoder reports it. It holds the Annex-B parameter
+    /// sets (H.264 SPS and PPS, HEVC VPS, SPS and PPS) or the AV1 sequence header OBU,
+    /// as Media Foundation gives them in `MF_MT_MPEG_SEQUENCE_HEADER`
+    /// (<https://learn.microsoft.com/windows/win32/medfound/mf-mt-mpeg-sequence-header-attribute>),
+    /// or an AAC `AudioSpecificConfig`.
+    ///
+    /// It may be empty. The fMP4 writer then takes the parameter sets from the first
+    /// keyframe, and builds the AAC config from the sample rate and channel count.
+    /// Never pass AAC `MF_MT_USER_DATA` raw: it starts with 12 bytes of HEAACWAVEINFO.
+    pub codec_private: Vec<u8>,
+}
+
 /// Most audio tracks a recording can carry. Video is always one more track (DESIGN §6).
 pub const MAX_AUDIO_TRACKS: u8 = 6;
 
@@ -93,7 +137,7 @@ pub const MAX_AUDIO_TRACKS: u8 = 6;
 pub struct AudioTrack(u8);
 
 /// The tracks of a recording: one video track and up to [`MAX_AUDIO_TRACKS`] audio
-/// tracks (DESIGN §6). Labels such as "Game" live in `zc_mux::TrackInfo`, not here,
+/// tracks (DESIGN §6). Labels such as "Game" live in [`TrackInfo`], not here,
 /// so this type stays `Copy` and allocation-free.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TrackId {
