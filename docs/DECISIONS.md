@@ -203,3 +203,17 @@ in the meantime is detected, not copied; the clip then starts at the next keyfra
 as long as before in total, but no hold is longer than a few milliseconds. Measured after
 P3.17b (release build, 20 Mbps): longest single hold 0.99 ms for a 60 s window (89 ms in
 total) and 1.24 ms for 300 s (470 ms in total), down from 115–135 ms and about 1 s.
+
+### D30 · Audio track 1 is a live Master mix; the per-source tracks are for editing (extends D26, D27)
+Found in the Phase 3 hardware test: Windows' player, browsers and Discord play only the
+first audio track, so the mic (track 2) was "missing" everywhere but VLC. Now the first
+audio track is **Master**, a live mix of every enabled source (game, mic, app tracks),
+encoded once more as AAC. The per-source tracks follow it unchanged, for the editor (D26).
+Layout: `Audio(0)` Master, `Audio(1)` Game, `Audio(2)` Microphone, `Audio(3..)` app tracks;
+`MAX_AUDIO_TRACKS` goes from 6 to 7, so four app tracks still fit. The mixer works on one
+48 kHz sample timeline taken from each source's QPC-aligned PTS, mixes 200 ms behind real
+time so a late source still lands in place, treats a missing source as silence, and
+soft-clips the sum. Each source's mix gain is a setting (default 0 dB). Costs: one more
+AAC encode (about 1% of a core); Master trails the side tracks by 200 ms in the DVR, so a
+save and a recording stop wait 250 ms before they snapshot or close; a source's volume in
+Master is fixed at record time (rebalance from the side tracks in the editor, P5.14).
