@@ -91,8 +91,21 @@ pub fn clamp_window(
     max_video_bitrate_bps: u64,
     ram_ceiling_bytes: u64,
 ) -> WindowClamp {
-    let _ = (requested, max_video_bitrate_bps, ram_ceiling_bytes);
-    todo!("Phase 4: clamp the window (see the `profile_clamp_*` specs)")
+    if max_video_bitrate_bps == 0 {
+        // No bitrate means no estimate of the ring's size, so nothing to clamp against.
+        return WindowClamp { window: requested, clamped: false };
+    }
+    // bytes * 8 bits / (bits per second) = seconds, then to ticks. The u128 holds
+    // u64::MAX * 8 * 10^7 without overflow, and the quotient saturates into i64.
+    let ticks_per_sec = u128::from(Hns::PER_SECOND.unsigned_abs());
+    let max_ticks =
+        u128::from(ram_ceiling_bytes) * 8 * ticks_per_sec / u128::from(max_video_bitrate_bps);
+    let max = Hns(i64::try_from(max_ticks).unwrap_or(i64::MAX));
+    if requested > max {
+        WindowClamp { window: max, clamped: true }
+    } else {
+        WindowClamp { window: requested, clamped: false }
+    }
 }
 
 #[cfg(test)]
@@ -147,7 +160,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: clamp_window (Phase 4)"]
     fn profile_clamp_keeps_windows_that_fit() {
         // 2 min at 20 Mbps = 300 MB, under a 1 GiB ceiling.
         let c = clamp_window(Hns::from_secs(120), 20_000_000, 1 << 30);
@@ -155,7 +167,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: clamp_window (Phase 4)"]
     fn profile_clamp_shrinks_windows_over_the_ceiling() {
         // 5 min at 20 Mbps = 750 MB > 500 MB ceiling → 500 MB / 2.5 MB/s = 200 s.
         let c = clamp_window(Hns::from_secs(300), 20_000_000, 500_000_000);
