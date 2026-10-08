@@ -357,6 +357,10 @@ fn save_clip_file(
     let (path, file) = output::create_file(&cfg.dir, "clip", cfg.format.extension())
         .map_err(|e| ClipError::Failed(e.to_string()))?;
     output::write_clip(&clip, file, tracks, cfg).map_err(|e| ClipError::Failed(e.to_string()))?;
+    // The clip still plays without its length in the mehd, so a failure to set it is only logged.
+    if let Err(error) = zc_mux::repair::set_fragment_duration(&path) {
+        tracing::warn!(error = %error, "could not set a clip's length");
+    }
     Ok((path, clip.duration()))
 }
 
