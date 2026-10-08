@@ -15,8 +15,8 @@ use zc_core::dvr::{DvrConfig, DvrError};
 use zc_core::hotkey::{Binding, ChordMatcher, HotkeyEvent, Trigger};
 use zc_core::media::{TrackId, TrackInfo, TrackKind};
 use zc_core::ports::{
-    AudioSource, AudioStart, CaptureTarget, Emit, InputSource, OsEvent, SeekPenalty, SourceError,
-    VideoSource, VideoStart,
+    AudioSource, AudioStart, CaptureTarget, Emit, InputSource, LockMemory, OsEvent, SeekPenalty,
+    SourceError, VideoSource, VideoStart,
 };
 use zc_core::profile::{WindowClamp, clamp_window};
 use zc_core::settings::{MicMode, Settings};
@@ -44,6 +44,8 @@ pub struct Ports {
     /// Drive-type probe for the output folder (`zc-win`, P3.23). Without it the drive is
     /// unknown, and DVR dumps are not paced.
     pub seek_penalty: Option<SeekPenalty>,
+    /// Pins the DVR rings in RAM (`zc-win`, P3.25). Without it the rings can be paged out.
+    pub lock_memory: Option<LockMemory>,
 }
 
 impl fmt::Debug for Ports {
@@ -54,6 +56,7 @@ impl fmt::Debug for Ports {
             .field("mic", &self.mic.is_some())
             .field("input", &self.input.is_some())
             .field("seek_penalty", &self.seek_penalty.is_some())
+            .field("lock_memory", &self.lock_memory.is_some())
             .finish()
     }
 }
@@ -362,6 +365,9 @@ impl Actor {
         tracing::info!(output_dir = %self.output_dir.display(), "engine started");
         self.update_window();
         self.detect_drive();
+        // Before the sources start: pinning holds the recorder lock while Windows commits the
+        // whole buffer, which would stall the encoder and audio threads if they were running.
+        self.page_lock_dvr();
         self.start_sources();
         self.publish_status();
         let mut next_tick = Instant::now() + STATUS_INTERVAL;
@@ -423,7 +429,7 @@ impl Actor {
     /// device calls, at startup and when the output folder changes. An unknown or failed answer
     /// leaves the writes unpaced.
     fn detect_drive(&mut self) {
-        // Create the folder now, as the first recording will, so the probe sees its volume.
+        // Create the folder now, as the first recording would. The probe itself doesn't need it.
         let _ = std::fs::create_dir_all(&self.output_dir);
         self.drive = match self.ports.seek_penalty {
             Some(probe) => match probe(&self.output_dir) {
@@ -445,6 +451,37 @@ impl Actor {
                 "Clips go to a hard disk, so they're written at {} MB/s to keep games smooth.",
                 self.settings.storage.hdd_write_mb_per_sec,
             )));
+        }
+    }
+
+    /// Pins the DVR rings of the tracks that have a source: video, and each audio source this run
+    /// was built with (P3.25, DESIGN §4). The other audio slots stay unpinned (pitfall 26). Runs
+    /// once, before the sources start; a video restart keeps the same rings, so their pins stay.
+    /// A ring that can't be pinned is reported once, and recording goes on unpinned.
+    fn page_lock_dvr(&mut self) {
+        let Some(lock) = self.ports.lock_memory else { return };
+        if !self.settings.dvr.enabled {
+            return;
+        }
+        let video = self.ports.video.is_some().then_some(TrackId::Video);
+        let audio = [&self.ports.game_audio, &self.ports.mic]
+            .into_iter()
+            .filter_map(|source| source.as_ref().map(|source| source.track()));
+        let tracks: Vec<TrackId> = video.into_iter().chain(audio).collect();
+        let started = Instant::now();
+        match self.recorder.lock_memory(lock, &tracks) {
+            Ok(bytes) => tracing::info!(
+                mib = bytes >> 20,
+                took = ?started.elapsed(),
+                "DVR buffer page-locked",
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "DVR buffer not page-locked");
+                self.emit(EngineEvent::Warning(format!(
+                    "Couldn't page-lock the DVR buffer ({e}). Clipping still works, but Windows \
+                     may page it out under memory pressure."
+                )));
+            }
         }
     }
 
@@ -570,6 +607,7 @@ impl Actor {
                             "Video settings changed, so the recording was stopped.".into(),
                         ));
                     }
+                    // `clear` keeps the rings' memory, so the pins taken at startup still hold.
                     self.recorder.clear();
                     self.status.capturing = false;
                     self.start_video();
@@ -1346,6 +1384,79 @@ mod tests {
         );
         engine.shutdown();
         let _ = std::fs::remove_dir(other);
+    }
+
+    /// A page lock that refuses, as Windows does when the working-set quota can't grow.
+    fn refuse_lock(_: &[u8]) -> Result<Box<dyn Send>, SourceError> {
+        Err(SourceError::Other("no working-set quota".into()))
+    }
+
+    /// Set by [`record_pin`]. Only `the_dvr_is_pinned_before_any_source_starts` pins with it.
+    static PINNED: AtomicBool = AtomicBool::new(false);
+
+    fn record_pin(_: &[u8]) -> Result<Box<dyn Send>, SourceError> {
+        PINNED.store(true, Ordering::SeqCst);
+        Ok(Box::new(()))
+    }
+
+    /// A video source that notes whether the DVR was already pinned when it was started.
+    struct PinOrderVideo(Arc<AtomicBool>);
+
+    impl VideoSource for PinOrderVideo {
+        fn start(
+            &mut self,
+            _: &VideoStart,
+            _: SharedSink,
+            _: Emit<HealthEvent>,
+        ) -> Result<Codec, SourceError> {
+            self.0.store(PINNED.load(Ordering::SeqCst), Ordering::SeqCst);
+            Ok(Codec::Hevc)
+        }
+        fn format(&self) -> Option<TrackInfo> {
+            None
+        }
+        fn stop(&mut self) {}
+        fn request_keyframe(&mut self) {}
+        fn screenshot(&mut self, _: &Path) -> Result<(), SourceError> {
+            Err(SourceError::Unsupported("no pixels".into()))
+        }
+    }
+
+    #[test]
+    fn the_dvr_is_pinned_before_any_source_starts() {
+        // Pinning holds the recorder lock while Windows commits the whole buffer, so a source
+        // that was already pushing would stall (audio drops after 100 ms).
+        let pinned_first = Arc::new(AtomicBool::new(false));
+        let ports = Ports {
+            video: Some(Box::new(PinOrderVideo(Arc::clone(&pinned_first)))),
+            lock_memory: Some(record_pin),
+            ..Ports::default()
+        };
+        let (engine, _) = spawn(ports);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.capturing));
+        assert!(pinned_first.load(Ordering::SeqCst), "the pin ran after a source had started");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_refused_page_lock_is_one_warning_and_capture_goes_on() {
+        let video = SyntheticVideoSource::new().realtime(true);
+        let ports = Ports {
+            video: Some(Box::new(video)),
+            lock_memory: Some(refuse_lock),
+            ..Ports::default()
+        };
+        let (engine, _) = spawn(ports);
+        let mut warnings = 0;
+        loop {
+            match engine.wait_event(TIMEOUT).expect("status") {
+                EngineEvent::Status(status) if status.capturing => break,
+                EngineEvent::Warning(m) if m.starts_with("Couldn't page-lock") => warnings += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(warnings, 1);
+        engine.shutdown();
     }
 
     #[test]
