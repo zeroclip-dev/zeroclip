@@ -25,6 +25,8 @@ use zc_mux::container::{self, ContainerWriter};
 use zc_mux::durable::DurableFile;
 use zc_mux::pacing::{DriveKind, PacedWriter, WritePacer};
 
+use crate::spool;
+
 /// What the output stack needs from the settings, resolved once per file.
 #[derive(Clone, Debug)]
 pub(crate) struct OutputConfig {
@@ -77,10 +79,7 @@ impl OutputConfig {
 /// # Errors
 /// Any error creating the folder or the file.
 pub(crate) fn create_file(dir: &Path, label: &str, ext: &str) -> io::Result<(PathBuf, File)> {
-    // The local offset can't always be read (on Unix, in a multithreaded process), so fall back
-    // to UTC rather than fail the save.
-    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
-    create_file_at(dir, label, ext, now)
+    create_file_at(dir, label, ext, local_now())
 }
 
 /// [`create_file`] with the time given, so a test can name two files in the same second.
@@ -91,8 +90,7 @@ fn create_file_at(
     when: OffsetDateTime,
 ) -> io::Result<(PathBuf, File)> {
     fs::create_dir_all(dir)?;
-    let format = format_description!("[year]-[month]-[day] [hour]-[minute]-[second]");
-    let stamp = when.format(&format).map_err(io::Error::other)?;
+    let stamp = name_stamp(when)?;
     let mut copy = 1;
     loop {
         let suffix = if copy == 1 { String::new() } else { format!(" ({copy})") };
@@ -103,6 +101,89 @@ fn create_file_at(
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Starts a recording in `dir`. Returns the `.partial` path it is written to, and the writer
+/// over that file.
+///
+/// The final name, `ZeroClip <label> <local time>.mp4`, is reserved first. An empty placeholder
+/// is created there with `create_new` and kept until the recording finishes, so no other file
+/// can take the name. The rename in [`spool::drain`] then replaces only that placeholder. The
+/// `.partial` file is claimed the same way. A name in use gets ` (2)`, ` (3)` and so on.
+///
+/// # Errors
+/// Any error creating the folder or the files, or the container's refusal of the track list.
+/// A failed start removes the files it created.
+pub(crate) fn create_recording(
+    cfg: &OutputConfig,
+    tracks: &[TrackInfo],
+    label: &str,
+) -> io::Result<(PathBuf, Box<dyn ContainerWriter>)> {
+    let (partial, file) = create_recording_file_at(&cfg.dir, label, local_now())?;
+    match open_writer(file, tracks, cfg, Durability::PerFragment) {
+        Ok(writer) => Ok((partial, writer)),
+        Err(e) => {
+            discard_recording(&partial);
+            Err(e)
+        }
+    }
+}
+
+/// [`create_recording`]'s file step, with the time given so a test can name two in one second.
+fn create_recording_file_at(
+    dir: &Path,
+    label: &str,
+    when: OffsetDateTime,
+) -> io::Result<(PathBuf, File)> {
+    fs::create_dir_all(dir)?;
+    let stamp = name_stamp(when)?;
+    let mut copy = 1;
+    loop {
+        let suffix = if copy == 1 { String::new() } else { format!(" ({copy})") };
+        let stem = format!("ZeroClip {label} {stamp}{suffix}");
+        let final_path = dir.join(format!("{stem}.mp4"));
+        match File::create_new(&final_path) {
+            // The placeholder stays empty, so dropping the handle is all it needs.
+            Ok(placeholder) => drop(placeholder),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                copy += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+        let partial = dir.join(format!("{stem}.mp4.partial"));
+        match File::create_new(&partial) {
+            Ok(file) => return Ok((partial, file)),
+            Err(e) => {
+                // Give the placeholder back before trying the next name, or report the error.
+                let _ = fs::remove_file(&final_path);
+                if e.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(e);
+                }
+                copy += 1;
+            }
+        }
+    }
+}
+
+/// Removes a recording's `.partial` file and its placeholder, when the recording never got
+/// going. Errors are ignored: nothing useful can be done with them, and the files are only
+/// clutter.
+pub(crate) fn discard_recording(partial: &Path) {
+    let _ = fs::remove_file(partial);
+    let _ = fs::remove_file(spool::final_path(partial));
+}
+
+/// The local time, for file names. Falls back to UTC, because the local offset can't always be
+/// read (on Unix, in a multithreaded process), and a save shouldn't fail over that.
+fn local_now() -> OffsetDateTime {
+    OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc())
+}
+
+/// A time as file-name text, `2026-10-08 14-03-27`. Windows forbids colons, so hyphens.
+fn name_stamp(when: OffsetDateTime) -> io::Result<String> {
+    let format = format_description!("[year]-[month]-[day] [hour]-[minute]-[second]");
+    when.format(&format).map_err(io::Error::other)
 }
 
 /// When a file's bytes are synced to disk.
@@ -238,6 +319,40 @@ mod tests {
         assert_eq!(first.file_name().unwrap(), "ZeroClip Clip 2026-10-08 14-03-27.mp4");
         assert_ne!(first, second);
         assert!(second.to_string_lossy().ends_with(" (2).mp4"), "{second:?}");
+    }
+
+    #[test]
+    fn a_recording_reserves_its_final_name_and_skips_names_in_use() {
+        let scratch = Scratch::new("recording-names");
+        let when = datetime!(2026-10-08 14:03:27 +2);
+        let (first, _) = create_recording_file_at(&scratch.0, "recording", when).unwrap();
+        assert_eq!(
+            first.file_name().unwrap(),
+            "ZeroClip recording 2026-10-08 14-03-27.mp4.partial"
+        );
+        let reserved = scratch.0.join("ZeroClip recording 2026-10-08 14-03-27.mp4");
+        assert!(reserved.is_file(), "the final name is held by the placeholder");
+        assert_eq!(fs::metadata(&reserved).unwrap().len(), 0);
+
+        let (second, _) = create_recording_file_at(&scratch.0, "recording", when).unwrap();
+        assert!(second.to_string_lossy().ends_with(" (2).mp4.partial"), "{second:?}");
+
+        // A finished clip already holds (3), so the next recording must skip it.
+        let finished = scratch.0.join("ZeroClip recording 2026-10-08 14-03-27 (3).mp4");
+        fs::write(&finished, b"clip").unwrap();
+        let (third, _) = create_recording_file_at(&scratch.0, "recording", when).unwrap();
+        assert!(third.to_string_lossy().ends_with(" (4).mp4.partial"), "{third:?}");
+        assert_eq!(fs::read(&finished).unwrap(), b"clip");
+    }
+
+    #[test]
+    fn a_recording_that_cannot_start_leaves_no_files() {
+        let scratch = Scratch::new("recording-start");
+        let cfg = config(&scratch.0);
+        // The container refuses a track list with no video track, after the files exist.
+        let audio_only = &tracks()[1..];
+        assert!(create_recording(&cfg, audio_only, "recording").is_err());
+        assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 
     #[test]

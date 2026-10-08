@@ -22,8 +22,8 @@
 //! modes get tested deterministically (DESIGN §12, "synthetic-load test harness").
 
 mod actor;
-// Scaffolding: P3.20 (DVR save) and P3.22 (recording) are the first callers.
-#[cfg_attr(not(test), expect(dead_code, reason = "scaffold: P3.20 and P3.22 use the output stack"))]
+// Scaffolding: `write_clip` has no caller until P3.20 (DVR save).
+#[cfg_attr(not(test), expect(dead_code, reason = "scaffold: P3.20 writes DVR clips"))]
 mod output;
 pub mod recorder;
 pub mod spool;
