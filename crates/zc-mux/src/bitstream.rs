@@ -16,6 +16,13 @@ const H264_SPS: u8 = 7;
 /// H.264 `nal_unit_type` of a picture parameter set.
 const H264_PPS: u8 = 8;
 
+/// H.265 `nal_unit_type` of a video parameter set.
+const HEVC_VPS: u8 = 32;
+/// H.265 `nal_unit_type` of a sequence parameter set.
+const HEVC_SPS: u8 = 33;
+/// H.265 `nal_unit_type` of a picture parameter set.
+const HEVC_PPS: u8 = 34;
+
 /// AAC-LC `audioObjectType`.
 const AAC_LC: u8 = 2;
 /// Sampling frequencies by `samplingFrequencyIndex` (ISO/IEC 14496-3).
@@ -107,6 +114,95 @@ pub fn aac_lc_config(sample_rate: u32, channels: u16) -> [u8; 2] {
     // Bits: audioObjectType (5), samplingFrequencyIndex (4), channelConfiguration (4), then
     // the three GASpecificConfig flags, which are all 0 for AAC-LC.
     [(AAC_LC << 3) | (index >> 1), ((index & 1) << 7) | (((channels as u8) & 0x0F) << 3)]
+}
+
+/// The first VPS, SPS and PPS of an HEVC Annex-B stream, in that order. Hardware encoders
+/// repeat them ahead of each IDR frame.
+#[must_use]
+pub fn hevc_parameter_sets(data: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
+    let vps = first_hevc_nal_of_type(data, HEVC_VPS)?;
+    let sps = first_hevc_nal_of_type(data, HEVC_SPS)?;
+    let pps = first_hevc_nal_of_type(data, HEVC_PPS)?;
+    Some((vps, sps, pps))
+}
+
+/// Removes the emulation-prevention bytes from a NAL unit. A NAL unit never contains
+/// `00 00` followed by `00` to `03`, so the encoder inserts a `03` after such a pair. The
+/// parameter-set fields are defined on the bytes without them.
+#[must_use]
+pub fn unescape(nal: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(nal.len());
+    let mut zeros = 0usize;
+    for &byte in nal {
+        if zeros >= 2 && byte == 0x03 {
+            // The emulation_prevention_three_byte. The count of zeros starts again after it.
+            zeros = 0;
+            continue;
+        }
+        zeros = if byte == 0 { zeros + 1 } else { 0 };
+        out.push(byte);
+    }
+    out
+}
+
+/// Builds the `hvcC` record (ISO/IEC 14496-15 §8.3.3) for one VPS, SPS and PPS. The general
+/// profile, tier, level and constraint flags are copied from the SPS, read with its
+/// emulation-prevention bytes removed. The parameter sets themselves are stored as they are.
+///
+/// Without all three parameter sets (synthetic payloads) it declares none, so the file still
+/// parses.
+///
+/// # Errors
+/// A parameter set longer than 65 535 bytes, which the 16-bit length cannot hold.
+pub fn hvcc(vps: &[u8], sps: &[u8], pps: &[u8]) -> Result<Vec<u8>, TryFromIntError> {
+    // Byte 2 of the SPS holds sps_video_parameter_set_id, sps_max_sub_layers_minus1 and
+    // sps_temporal_id_nesting_flag. Bytes 3 to 14 are the 12 profile_tier_level bytes that
+    // the record repeats.
+    let plain = unescape(sps);
+    let complete = !vps.is_empty() && !pps.is_empty();
+    let fields = match (plain.get(2), plain.get(3..15)) {
+        (Some(&byte), Some(ptl)) if complete => Some((byte, ptl)),
+        _ => None,
+    };
+
+    // configurationVersion, then the general profile_tier_level.
+    let mut record = vec![1];
+    match fields {
+        Some((_, ptl)) => record.extend_from_slice(ptl),
+        None => record.extend_from_slice(&[0; 12]),
+    }
+    // min_spatial_segmentation_idc 0, parallelismType 0, chromaFormat 1 (4:2:0), 8-bit luma
+    // and chroma, and avgFrameRate unknown. The reserved bits are ones, as the spec requires.
+    // ponytail: the bit depths and chroma format are fixed for 8-bit NV12. Revisit with HDR
+    // (open question Q8).
+    record.extend_from_slice(&[0xF0, 0x00, 0xFC, 0xFD, 0xF8, 0xF8, 0x00, 0x00]);
+    // constantFrameRate 0, numTemporalLayers, temporalIdNested, lengthSizeMinusOne 3.
+    let (layers, nested) = match fields {
+        // sps_max_sub_layers_minus1 is at most 6, so the layer count fits its three bits.
+        Some((byte, _)) => (((byte >> 1) & 0x07).min(6) + 1, byte & 1),
+        None => (1, 0),
+    };
+    record.push((layers << 3) | (nested << 2) | 3);
+
+    if fields.is_none() {
+        record.push(0); // numOfArrays
+        return Ok(record);
+    }
+    record.push(3); // numOfArrays: VPS, SPS and PPS
+    for (nal_type, nal) in [(HEVC_VPS, vps), (HEVC_SPS, sps), (HEVC_PPS, pps)] {
+        // array_completeness 1, then the NAL unit type.
+        record.push(0x80 | nal_type);
+        record.extend_from_slice(&1u16.to_be_bytes()); // numNalus
+        record.extend_from_slice(&u16::try_from(nal.len())?.to_be_bytes());
+        record.extend_from_slice(nal);
+    }
+    Ok(record)
+}
+
+/// The first NAL unit of an HEVC stream whose `nal_unit_type` is `nal_type`. In HEVC the type
+/// is six bits, from bit 1 of the first byte.
+fn first_hevc_nal_of_type(data: &[u8], nal_type: u8) -> Option<&[u8]> {
+    nal_units(data).find(|nal| nal.first().is_some_and(|&b| (b >> 1) & 0x3F == nal_type))
 }
 
 /// The first NAL unit whose `nal_unit_type` (the low five bits of its first byte) is `nal_type`.
@@ -239,5 +335,78 @@ mod tests {
         // Object type 00010, index 4 (44.1 kHz) = 0100, channels 1 = 0001, flags 000.
         // Bits 00010010 00001000 = 0x12 0x08.
         assert_eq!(aac_lc_config(44_100, 1), [0x12, 0x08]);
+    }
+
+    #[test]
+    fn unescape_removes_emulation_prevention() {
+        // 00 00 03 is a zero pair and an escape byte, so only the escape goes.
+        assert_eq!(unescape(&[0, 0, 3, 1]), [0, 0, 1]);
+        // The count of zeros starts again after an escape: 00 00 03 00 00 03 is four zeros.
+        assert_eq!(unescape(&[0, 0, 3, 0, 0, 3, 1]), [0, 0, 0, 0, 1]);
+        // A 03 that is not after two zeros is data.
+        assert_eq!(unescape(&[0x42, 3, 0, 3]), [0x42, 3, 0, 3]);
+    }
+
+    #[test]
+    fn hevc_parameter_sets_are_the_first_vps_sps_and_pps() {
+        // VPS (type 32), SPS (33), PPS (34) and an IDR slice (19), behind 4-byte start codes.
+        let stream = [
+            0, 0, 0, 1, 0x40, 0x01, 0x0C, // VPS
+            0, 0, 0, 1, 0x42, 0x01, 0x01, // SPS
+            0, 0, 0, 1, 0x44, 0x01, 0xC1, // PPS
+            0, 0, 1, 0x26, 0x01, 0xAF, // IDR
+        ];
+        let expected: (&[u8], &[u8], &[u8]) =
+            (&[0x40, 0x01, 0x0C], &[0x42, 0x01, 0x01], &[0x44, 0x01, 0xC1]);
+        assert_eq!(hevc_parameter_sets(&stream), Some(expected));
+        // Without a PPS there is nothing to declare.
+        assert_eq!(hevc_parameter_sets(&stream[..11]), None);
+    }
+
+    /// An SPS whose general profile constraint flags contain emulation-prevention bytes.
+    /// Unescaped, its header is `42 01 01`, its profile_tier_level bytes are `01`, `60 00 00
+    /// 00`, `90 00 00 00 00 00` and `3C` (level 60), and then `A0`.
+    const ESCAPED_SPS: [u8; 19] = [
+        0x42, 0x01, 0x01, 0x01, 0x60, // header, sub-layer byte, profile, compatibility flags
+        0x00, 0x00, 0x03, 0x00, // compatibility flags, escaped
+        0x90, // constraint flags
+        0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, // constraint flags, escaped
+        0x3C, 0xA0, // level, then one more byte of SPS
+    ];
+
+    #[test]
+    fn hvcc_copies_the_ptl_after_unescaping() {
+        let vps = [0x40, 0x01, 0x0C];
+        let pps = [0x44, 0x01, 0xC1];
+        let record = hvcc(&vps, &ESCAPED_SPS, &pps).unwrap();
+        // The record's bytes 1 to 12 are profile_tier_level, read without the escapes.
+        assert_eq!(record[1..13], [0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 0x3C]);
+    }
+
+    #[test]
+    fn hvcc_record_layout_is_literal() {
+        let vps = [0x40, 0x01, 0x0C];
+        let pps = [0x44, 0x01, 0xC1];
+        let expected = [
+            vec![1],                                              // configurationVersion
+            vec![0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 0x3C], // PTL, 12 bytes
+            vec![0xF0, 0x00, 0xFC, 0xFD, 0xF8, 0xF8, 0x00, 0x00], // reserved fields
+            vec![0x0F, 3], // 1 layer, nested 1, lengthSizeMinusOne 3, 3 arrays
+            vec![0xA0, 0x00, 0x01, 0x00, 0x03, 0x40, 0x01, 0x0C], // VPS, complete
+            vec![0xA1, 0x00, 0x01, 0x00, 0x13],
+            ESCAPED_SPS.to_vec(),
+            vec![0xA2, 0x00, 0x01, 0x00, 0x03, 0x44, 0x01, 0xC1], // PPS, complete
+        ]
+        .concat();
+        assert_eq!(hvcc(&vps, &ESCAPED_SPS, &pps).unwrap(), expected);
+    }
+
+    #[test]
+    fn hvcc_without_parameter_sets_declares_none() {
+        // One layer, nested 0, lengthSizeMinusOne 3, and zero arrays.
+        let mut expected = vec![1];
+        expected.extend_from_slice(&[0; 12]);
+        expected.extend_from_slice(&[0xF0, 0x00, 0xFC, 0xFD, 0xF8, 0xF8, 0x00, 0x00, 0x0B, 0]);
+        assert_eq!(hvcc(&[], &[], &[]).unwrap(), expected);
     }
 }
