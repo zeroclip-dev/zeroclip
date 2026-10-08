@@ -1,14 +1,16 @@
 //! Manual check for audio capture on a real machine:
 //! `cargo run -p zc-audio --example audio_smoke --release -- [secs=5] [game pid]`
 //!
-//! Runs the mic (always on) and, given a pid, process-loopback game audio; logs how
-//! many AAC packets each track produced and their timestamp span. Saves nothing.
+//! Runs the mic (always on) and, given a pid, process-loopback game audio, and the Master mix
+//! of both (D30); logs how many AAC packets each track produced and their timestamp span. Saves
+//! nothing.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use zc_core::Hns;
 use zc_core::media::{PacketRef, TrackId};
+use zc_core::mix::{MixBus, MixInput};
 use zc_core::ports::{AudioSource, AudioStart};
 use zc_core::sink::PacketSink;
 
@@ -40,20 +42,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sink = Arc::new(Count::default());
     let health = Arc::new(|_| {});
 
-    let mut mic = zc_audio::MicSource::new(true, true, None);
+    // The mic is input 0 of the Master mix, the game input 1; Master starts after both (D30).
+    let bus = Arc::new(Mutex::new(MixBus::new(2, 2)));
+    let mut mic = zc_audio::MicSource::new(true, true, None)
+        .with_mix(Some(MixInput::new(Arc::clone(&bus), 0)));
     match mic.start(&config, sink.clone(), health.clone()) {
         Ok(()) => tracing::info!("mic started"),
         Err(e) => tracing::warn!(%e, "mic unavailable"),
     }
-    let mut game = zc_audio::GameAudioSource::new();
+    let mut game =
+        zc_audio::GameAudioSource::new().with_mix(Some(MixInput::new(Arc::clone(&bus), 1)));
     game.set_target_process(pid);
-    game.start(&config, sink.clone(), health)?;
+    game.start(&config, sink.clone(), health.clone())?;
+    let mut master = zc_audio::MasterMix::new(bus);
+    master.start(&config, sink.clone(), health)?;
 
     std::thread::sleep(Duration::from_secs(secs));
     mic.stop();
     game.stop();
+    master.stop();
     let counts = sink.0.lock().map_err(|_| "poisoned")?;
-    for track in [TrackId::GameAudio, TrackId::Mic] {
+    for track in [TrackId::Master, TrackId::GameAudio, TrackId::Mic] {
         let (packets, bytes, first, last) = counts[track.index()];
         let span = first.map_or(0.0, |f| (last - f).as_secs_f64());
         tracing::info!(?track, packets, bytes, span_s = span, "track totals");

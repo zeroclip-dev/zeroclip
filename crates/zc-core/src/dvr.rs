@@ -222,8 +222,31 @@ impl DvrBuffer {
     /// # Errors
     /// [`DvrError::Empty`] if there's no video yet.
     pub fn plan_snapshot(&self, window: Hns) -> Result<SnapshotPlan, DvrError> {
+        self.plan(window, None)
+    }
+
+    /// [`plan_snapshot`](Self::plan_snapshot) for a clip that ends at `end` instead of at the
+    /// newest frame. Every track is cut at `end`, and the window is counted back from it. A
+    /// save uses this, so the clip ends where the press was, and the Master mix (D30) has time
+    /// to catch up to that point before the copy.
+    ///
+    /// # Errors
+    /// [`DvrError::Empty`] if there's no video yet.
+    pub fn plan_snapshot_until(&self, window: Hns, end: Hns) -> Result<SnapshotPlan, DvrError> {
+        self.plan(window, Some(end))
+    }
+
+    /// The end of the newest video frame: where a clip cut now would end. Zero when empty.
+    #[must_use]
+    pub fn newest_video_end(&self) -> Hns {
+        self.newest_video_end
+    }
+
+    /// The shared body of the two plans. `until` is the clip's end, if it isn't the newest frame.
+    fn plan(&self, window: Hns, until: Option<Hns>) -> Result<SnapshotPlan, DvrError> {
         let oldest = self.oldest_pts().ok_or(DvrError::Empty)?;
-        let target = self.newest_video_end.saturating_sub(window);
+        let end = until.unwrap_or(self.newest_video_end);
+        let target = end.saturating_sub(window);
         // The newest GOP that starts at or before `target` covers the window. If none does,
         // the buffer holds less than `window`, so start at the oldest GOP.
         let start = self.rings[VIDEO_RING]
@@ -235,7 +258,7 @@ impl DvrBuffer {
         let mut packets = Vec::with_capacity(self.rings.iter().map(PacketRing::len).sum());
         for ring in &self.rings {
             for (meta, abs, len) in ring.positions() {
-                if meta.pts >= start {
+                if meta.pts >= start && until.is_none_or(|end| meta.pts < end) {
                     packets.push(PlannedPacket { meta, abs, len });
                 }
             }
@@ -683,6 +706,30 @@ mod tests {
         }
         // Presentation order across tracks.
         assert!(clip.packets.windows(2).all(|w| w[0].meta.pts <= w[1].meta.pts));
+    }
+
+    #[test]
+    fn dvr_snapshot_until_cuts_every_track_at_the_end() {
+        let mut dvr = DvrBuffer::new(roomy());
+        let mut s = SyntheticStream::new();
+        push_all(&mut dvr, &s.take_secs(10));
+        // A save pressed at 6.5 s ends there, though the buffer holds to 10 s.
+        let end = Hns::from_millis(6_500);
+        let mut copy =
+            SnapshotCopy::new(dvr.plan_snapshot_until(Hns::from_millis(3_500), end).unwrap());
+        while !copy.is_done() {
+            copy.copy_chunk(&dvr, usize::MAX).unwrap();
+        }
+        let clip = copy.finish();
+        // The window counts back from 6.5 s to 3 s, a keyframe, so video runs from 3 s to 6.5 s.
+        let video: Vec<&Packet> = clip.video().collect();
+        assert_eq!(video.len(), 210, "3.5 s × 60 fps");
+        assert_eq!(video[0].meta.pts, Hns::from_secs(3));
+        assert!(video[0].meta.keyframe);
+        assert!(clip.packets.iter().all(|p| p.meta.pts < end), "no track runs past the cut");
+        // 3.5 s of 20 ms audio packets, on each track.
+        assert_eq!(clip.track(TrackId::GameAudio).count(), 175);
+        assert_eq!(clip.track(TrackId::Mic).count(), 175);
     }
 
     #[test]

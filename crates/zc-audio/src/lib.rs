@@ -1,8 +1,10 @@
 //! # zc-audio — audio capture (DESIGN §6)
 //!
-//! Two tracks, both timestamped from WASAPI's QPC position (same timeline as
-//! WGC's `SystemRelativeTime`) and encoded to AAC with Media Foundation:
+//! Every track is timestamped from WASAPI's QPC position (same timeline as WGC's
+//! `SystemRelativeTime`) and encoded to AAC with Media Foundation:
 //!
+//! - **Track 1, Master** — [`MasterMix`]: a live mix of the sources below, one mixer thread
+//!   200 ms behind real time (D30). Players and Discord play only this first track.
 //! - **Track 2, game audio** — [`GameAudioSource`]: WASAPI *process loopback* in
 //!   include mode, capturing the focused game's process tree. That's simpler than
 //!   excluding a list of apps, and the profile engine already knows the game.
@@ -22,6 +24,8 @@ mod aac;
 mod capture;
 mod game;
 mod mic;
+mod mix;
 
 pub use game::GameAudioSource;
 pub use mic::{MicDevice, MicSource, list_microphones};
+pub use mix::MasterMix;
