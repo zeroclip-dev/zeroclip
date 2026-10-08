@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
-use zc_core::media::Codec;
+use zc_core::media::{Codec, TrackId, TrackInfo, TrackKind};
 use zc_core::ports::{Emit, SourceError, VideoSource, VideoStart};
 use zc_core::sink::SharedSink;
 use zc_core::testing::SyntheticStream;
@@ -87,6 +87,16 @@ impl VideoSource for SyntheticVideoSource {
         )
     }
 
+    /// Always `Some`: the synthetic format never changes, so there is nothing to wait for.
+    fn format(&self) -> Option<TrackInfo> {
+        Some(TrackInfo {
+            track: TrackId::Video,
+            label: "Video".into(),
+            kind: TrackKind::Video { codec: Codec::H264, width: 1920, height: 1080, fps: 60 },
+            codec_private: Vec::new(),
+        })
+    }
+
     fn stop(&mut self) {
         if let Some(worker) = self.worker.take() {
             let _ = worker;
@@ -100,5 +110,21 @@ impl VideoSource for SyntheticVideoSource {
 
     fn screenshot(&mut self, _path: &Path) -> Result<(), SourceError> {
         Err(SourceError::Unsupported("the synthetic source has no pixels".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn declares_the_fixed_synthetic_video_track() {
+        let format = SyntheticVideoSource::new().format().expect("the synthetic format is fixed");
+        assert_eq!(format.track, TrackId::Video);
+        assert_eq!(
+            format.kind,
+            TrackKind::Video { codec: Codec::H264, width: 1920, height: 1080, fps: 60 }
+        );
+        assert!(format.codec_private.is_empty());
     }
 }

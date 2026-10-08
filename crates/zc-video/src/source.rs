@@ -22,7 +22,7 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use zc_core::Hns;
 use zc_core::backoff::Backoff;
-use zc_core::media::Codec;
+use zc_core::media::{Codec, TrackId, TrackInfo, TrackKind};
 use zc_core::ports::{Emit, SourceError, VideoSource, VideoStart};
 use zc_core::sink::SharedSink;
 use zc_core::time::FramePacer;
@@ -63,6 +63,8 @@ const STALL: Duration = Duration::from_secs(3);
 /// What the encoder thread reports once it's running.
 struct Started {
     codec: Codec,
+    /// Encoded size, pixels (even, as the encoder was opened).
+    size: (u32, u32),
     device: ID3D11Device,
     context: ID3D11DeviceContext,
 }
@@ -77,6 +79,8 @@ pub struct GpuVideoSource {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
     gpu: Option<(ID3D11Device, ID3D11DeviceContext)>,
+    /// Set by `start` once the encoder exists, cleared by `stop`.
+    format: Option<TrackInfo>,
 }
 
 impl GpuVideoSource {
@@ -110,8 +114,20 @@ impl VideoSource for GpuVideoSource {
             .map_err(|e| SourceError::Other(format!("couldn't start the video thread: {e}")))?;
         self.thread = Some(thread);
         match started.recv() {
-            Ok(Ok(Started { codec, device, context })) => {
+            Ok(Ok(Started { codec, size, device, context })) => {
                 self.gpu = Some((device, context));
+                self.format = Some(TrackInfo {
+                    track: TrackId::Video,
+                    label: "Video".into(),
+                    kind: TrackKind::Video {
+                        codec,
+                        width: size.0,
+                        height: size.1,
+                        fps: config.fps,
+                    },
+                    // Empty: the muxer takes the parameter sets from the first IDR.
+                    codec_private: Vec::new(),
+                });
                 Ok(codec)
             }
             Ok(Err(e)) => {
@@ -125,6 +141,10 @@ impl VideoSource for GpuVideoSource {
         }
     }
 
+    fn format(&self) -> Option<TrackInfo> {
+        self.format.clone()
+    }
+
     fn stop(&mut self) {
         if let Some(thread) = self.thread.take() {
             self.shared.stop.store(true, Ordering::Release);
@@ -133,6 +153,7 @@ impl VideoSource for GpuVideoSource {
             }
         }
         self.gpu = None;
+        self.format = None;
     }
 
     fn request_keyframe(&mut self) {
@@ -284,7 +305,7 @@ fn run(
             return;
         }
     };
-    let Pipeline { device, context, codec, mut encoder, handler, frames, item } = pipeline;
+    let Pipeline { device, context, codec, size, mut encoder, handler, frames, item } = pipeline;
 
     // Protected content (HDCP) can block starting capture; retry with backoff.
     let mut backoff = Backoff::hdcp();
@@ -308,7 +329,8 @@ fn run(
             return;
         }
     };
-    let _ = report.send(Ok(Started { codec, device: device.clone(), context: context.clone() }));
+    let _ =
+        report.send(Ok(Started { codec, size, device: device.clone(), context: context.clone() }));
 
     let mut credits = 0u32;
     let mut next_report = Instant::now() + Duration::from_secs(5);
@@ -418,6 +440,8 @@ struct Pipeline {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     codec: Codec,
+    /// The encoder's input and output size, pixels.
+    size: (u32, u32),
     encoder: HwEncoder,
     handler: Arc<Mutex<FrameHandler>>,
     frames: mpsc::Receiver<(usize, Hns)>,
@@ -481,6 +505,17 @@ impl Pipeline {
             dropping: false,
             latest: None,
         }));
-        Ok(Self { device, context, codec, encoder, handler, frames, item })
+        Ok(Self { device, context, codec, size: size_out, encoder, handler, frames, item })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No device is created here, so this runs on CI's GPU-less runners.
+    #[test]
+    fn a_stopped_source_declares_no_format() {
+        assert_eq!(GpuVideoSource::new().format(), None);
     }
 }
