@@ -4021,6 +4021,7 @@ dependencies = [
  "zc-input",
  "zc-mux",
  "zc-video",
+ "zc-win",
 ]
 
 [[package]]

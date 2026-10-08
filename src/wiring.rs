@@ -8,6 +8,8 @@
 //! - Phase 2 (done): `input` → `zc_input::RawInputSource`; `game_audio` →
 //!   `zc_audio::GameAudioSource` (if enabled); `mic` → `zc_audio::MicSource`
 //!   (unless the mic is off)
+//! - Phase 3 (P3.24): `seek_penalty` → `zc_win::drive::seek_penalty`, the drive probe
+//!   that sets DVR dump pacing
 //!
 //! Ports are built once at startup, so turning game audio or the mic on or off
 //! applies at the next launch; push-to-talk ⇄ always-on is live.
@@ -35,5 +37,6 @@ pub fn ports(settings: &Settings) -> Ports {
                 audio.mic_device.clone(),
             )) as Box<dyn AudioSource>
         }),
+        seek_penalty: Some(zc_win::drive::seek_penalty),
     }
 }
