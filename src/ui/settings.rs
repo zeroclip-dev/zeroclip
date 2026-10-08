@@ -131,12 +131,13 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
 
                 ui.label("Container");
                 let container = &mut draft.settings.recording.container;
+                // Fragmented MP4 is the only container written (D18). A settings file that still
+                // says Matroska shows that choice here, and Settings::problems blocks saving it.
                 ComboBox::from_id_salt("container")
                     .selected_text(container_label(*container))
                     .show_ui(ui, |ui| {
-                        for option in [ContainerFormat::FragmentedMp4, ContainerFormat::Matroska] {
-                            ui.selectable_value(container, option, container_label(option));
-                        }
+                        let option = ContainerFormat::FragmentedMp4;
+                        ui.selectable_value(container, option, container_label(option));
                     });
                 ui.end_row();
             });

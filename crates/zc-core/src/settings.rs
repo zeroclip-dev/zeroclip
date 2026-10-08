@@ -63,6 +63,11 @@ impl Settings {
         if self.audio.mic == MicMode::PushToTalk && self.hotkeys.push_to_talk.is_none() {
             problems.push("Push-to-talk mode needs a push-to-talk hotkey.".to_owned());
         }
+        if self.recording.container == ContainerFormat::Matroska {
+            problems.push(
+                "Matroska recordings aren't written. Choose Fragmented MP4 (.mp4).".to_owned(),
+            );
+        }
 
         let hotkeys = &self.hotkeys;
         let bound = [
@@ -90,7 +95,7 @@ impl Settings {
 pub struct RecordingSettings {
     /// Output folder. `None` means `<Videos>\ZeroClip`.
     pub output_dir: Option<PathBuf>,
-    /// Container for recordings. Both survive crashes; see docs/OPEN_QUESTIONS.md.
+    /// Container for recordings. Only fragmented MP4 is written (D18).
     pub container: ContainerFormat,
 }
 
@@ -286,6 +291,15 @@ mod tests {
         let problems = s.problems();
         assert_eq!(problems.len(), 3, "{problems:#?}");
         assert!(problems.iter().any(|p| p.contains("both use Alt+F10")));
+    }
+
+    #[test]
+    fn a_settings_file_that_chose_matroska_still_loads_but_is_flagged() {
+        let mut s: Settings = toml::from_str("[recording]\ncontainer = \"mkv\"\n").unwrap();
+        assert_eq!(s.recording.container, ContainerFormat::Matroska);
+        assert!(s.problems().iter().any(|p| p.contains("Matroska")));
+        s.recording.container = ContainerFormat::FragmentedMp4;
+        assert!(s.problems().is_empty());
     }
 
     #[test]

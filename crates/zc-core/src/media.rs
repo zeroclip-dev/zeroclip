@@ -68,7 +68,7 @@ pub enum ContainerFormat {
     #[default]
     #[serde(rename = "fmp4")]
     FragmentedMp4,
-    /// Matroska.
+    /// Matroska. Not written (D18); the variant stays so older settings files still parse.
     #[serde(rename = "mkv")]
     Matroska,
 }
