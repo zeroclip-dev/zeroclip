@@ -20,7 +20,7 @@ use zc_win::mf::MediaFoundation;
 
 use crate::capture::{Encode, Mmcss, Stream, Worker, pcm16_format};
 
-/// Track 2: the microphone, gated by push-to-talk.
+/// Audio track 3: the microphone, gated by push-to-talk (D30).
 ///
 /// The chosen capture device, or the default *communications* one (the headset
 /// mic, usually), in shared mode. A closed gate writes silence, so the track keeps its length and
