@@ -174,9 +174,9 @@ pub const AAC_BITRATES_KBPS: [u32; 4] = [96, 128, 160, 192];
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioSettings {
-    /// Record the focused game's audio (track 1).
+    /// Record the focused game's audio (track 2).
     pub game_audio: bool,
-    /// Microphone behaviour (track 2).
+    /// Microphone behaviour (track 3).
     pub mic: MicMode,
     /// Which microphone, as a Windows endpoint id. `None` follows the Windows
     /// default communications device.

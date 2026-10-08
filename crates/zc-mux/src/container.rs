@@ -75,3 +75,107 @@ pub fn create(
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use zc_core::media::{Codec, TrackId};
+    use zc_core::testing::SyntheticStream;
+
+    use super::*;
+
+    /// A writer output that the test keeps a handle on, to read the file back.
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedBuf {
+        fn bytes(&self) -> Vec<u8> {
+            self.0.lock().expect("the lock is never poisoned in tests").clone()
+        }
+    }
+
+    impl Write for SharedBuf {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("the lock is never poisoned in tests").extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Splits a buffer into its boxes: each box's type and body (without the header).
+    fn boxes(mut buf: &[u8]) -> Vec<([u8; 4], &[u8])> {
+        let mut found = Vec::new();
+        while buf.len() >= 8 {
+            let size = u32::from_be_bytes(buf[..4].try_into().expect("4 bytes")) as usize;
+            let kind: [u8; 4] = buf[4..8].try_into().expect("4 bytes");
+            found.push((kind, &buf[8..size]));
+            buf = &buf[size..];
+        }
+        found
+    }
+
+    /// The body of the first box of type `kind` directly inside `buf`.
+    fn child<'a>(buf: &'a [u8], kind: &[u8; 4]) -> &'a [u8] {
+        let (_, body) = boxes(buf).into_iter().find(|(k, _)| k == kind).expect("box present");
+        body
+    }
+
+    #[test]
+    fn master_is_declared_before_game_and_mic_whatever_the_input_order() {
+        // Players and Discord read only the first audio track, so Master must come first (D30).
+        let audio = |track: TrackId, label: &str| TrackInfo {
+            track,
+            label: label.into(),
+            kind: TrackKind::Audio { sample_rate: 48_000, channels: 2 },
+            codec_private: Vec::new(),
+        };
+        let video = TrackInfo {
+            track: TrackId::Video,
+            label: "Video".into(),
+            kind: TrackKind::Video { codec: Codec::H264, width: 320, height: 240, fps: 60 },
+            codec_private: Vec::new(),
+        };
+        let tracks = [
+            audio(TrackId::Mic, "Mic"),
+            video,
+            audio(TrackId::GameAudio, "Game"),
+            audio(TrackId::Master, "Master"),
+        ];
+        let out = SharedBuf::default();
+        let mut writer = create(ContainerFormat::FragmentedMp4, Box::new(out.clone()), &tracks)
+            .expect("a valid track list");
+        for packet in SyntheticStream::new().with_master().take_secs(1) {
+            writer.write_packet(packet.view()).expect("packets are in order");
+        }
+        writer.finish().expect("finish writes the file");
+
+        let file = out.bytes();
+        let moov = child(&file, b"moov");
+        let traks: Vec<&[u8]> = boxes(moov)
+            .into_iter()
+            .filter(|(kind, _)| kind == b"trak")
+            .map(|(_, body)| body)
+            .collect();
+        let names: Vec<String> = traks
+            .iter()
+            .map(|trak| {
+                let hdlr = child(child(trak, b"mdia"), b"hdlr");
+                String::from_utf8_lossy(&hdlr[24..hdlr.len() - 1]).into_owned()
+            })
+            .collect();
+        // The tkhd body is version and flags, creation and modification times, then the ID.
+        let ids: Vec<u32> = traks
+            .iter()
+            .map(|trak| {
+                u32::from_be_bytes(child(trak, b"tkhd")[12..16].try_into().expect("4 bytes"))
+            })
+            .collect();
+        assert_eq!(names, ["Video", "Master", "Game", "Mic"]);
+        assert_eq!(ids, [1, 2, 3, 4], "track IDs follow the declared order");
+    }
+}

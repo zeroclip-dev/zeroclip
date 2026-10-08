@@ -119,7 +119,11 @@ All modes share one zero-allocation encode loop. Memory is pre-allocated at laun
 
 ## 6. Audio Pipeline
 
-Tracks are dynamic: a recording carries one video track and up to six audio tracks (`TrackId`, D26). The game and mic tracks are the first two audio slots, and per-app tracks take the rest.
+Tracks are dynamic: a recording carries one video track and up to seven audio tracks (`TrackId`, D26, D30). Audio track 1 is Master (below). The game and mic tracks are audio tracks 2 and 3, and per-app tracks take the rest.
+
+### Audio track 1 — Master (D30)
+
+A live mix of every enabled source, encoded once more as AAC. Players, browsers and Discord play only the first audio track, so the mix goes there and the per-source tracks follow it unchanged, for the editor (D26). The mixer is built in P3.32; the layout reserves its slot now.
 
 ### Parallel audio ring buffers (the v1 gap)
 
@@ -131,13 +135,13 @@ The pipeline extracts `SystemRelativeTime` from the WGC `Direct3D11CaptureFrame`
 
 The sound card's sample clock and QPC disagree by 10–100 ppm, which is up to 180 ms over a 30-minute session. Audio timestamps therefore count samples (exact and contiguous, which AAC needs) but are re-aligned to the buffer's QPC time by `zc_core::time::SampleTimeline` whenever they drift more than 20 ms: a gap is filled with silence, a fast device has frames dropped, and a gap over 1 s restarts the timeline. Corrections stay under the ~45 ms where viewers notice lip-sync errors.
 
-### Track 1 — system audio
+### Audio track 2 — system audio
 
 v1 proposed `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE` with a UI for picking multiple apps to ignore. **This doesn't map cleanly onto the API** — activation params target a single process tree per client, so "exclude Discord *and* Spotify" doesn't express directly.
 
 Inverting to include-mode — capture the game's process tree, using `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE` — is simpler and usually gets the same result, since the game is already identified by the profile engine. **Resolved (D27):** the UI says "capture from". Audio is a list of tracks, each the focused game, the mic, or a named app, with one include-mode client per app and an on/off switch per track; Discord and Spotify are pre-listed by default.
 
-### Track 2 — microphone
+### Audio track 3 — microphone
 
 Bound to a push-to-talk key via Raw Input. Writes silence when released so track length stays constant and PTS alignment holds.
 

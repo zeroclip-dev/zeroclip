@@ -229,11 +229,18 @@ mod tests {
         };
 
         source.start(&config, sink.clone(), health).expect("the synthetic source starts");
-        std::thread::sleep(Duration::from_millis(300));
+        // Wait until the run is past the dropped frames, not for a fixed time: a busy machine
+        // (CI, a parallel build) can starve the worker for longer than any fixed sleep.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while sink.0.lock().unwrap_or_else(PoisonError::into_inner).last().is_none_or(|&n| n < 10)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         source.stop();
 
         let seen = sink.0.lock().unwrap_or_else(PoisonError::into_inner).clone();
-        let last = *seen.last().expect("300 ms of frames were delivered");
+        let last = *seen.last().expect("frames were delivered");
         assert!(last >= 8, "the run should pass the dropped frames, but stopped at {last}");
         // Frames 5, 6 and 7 are never delivered; every other frame arrives in order, from 0.
         let expected: Vec<u32> = (0..=last).filter(|n| !(5..8).contains(n)).collect();
