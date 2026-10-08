@@ -306,6 +306,18 @@ impl SampleTimeline {
         self.anchor.map(|_| self.time_of(self.next))
     }
 
+    /// Frames of silence owed at `now` to a track that has delivered nothing: from
+    /// [`expected`](Self::expected) up to `now − margin`. Rounded down to whole frames, so
+    /// the silence never reaches `now − margin`. Zero when nothing is due, or before the
+    /// first buffer.
+    #[must_use]
+    pub fn silence_due(&self, now: Hns, margin: Hns) -> u32 {
+        match self.expected() {
+            Some(next) => self.frames_in(now - margin - next),
+            None => 0,
+        }
+    }
+
     fn time_of(&self, n: u64) -> Hns {
         let (anchor_n, anchor_t) = self.anchor.unwrap_or((0, Hns::ZERO));
         let ticks = i128::from(n - anchor_n) * i128::from(Hns::PER_SECOND) / i128::from(self.rate);
@@ -545,6 +557,43 @@ mod tests {
         let p = t.place(late, 480);
         assert!(p.restart);
         assert_eq!(p.pts, late);
+    }
+
+    #[test]
+    fn sample_timeline_silence_due_counts_whole_frames_up_to_the_margin() {
+        let margin = Hns::from_millis(100);
+        let mut t = SampleTimeline::new(48_000);
+        assert_eq!(t.silence_due(Hns::from_secs(9), margin), 0, "not anchored yet");
+        t.place(Hns::ZERO, 480); // audio ends at 10 ms
+        assert_eq!(t.silence_due(Hns::from_millis(100), margin), 0, "audio already runs past it");
+        assert_eq!(t.silence_due(Hns::from_millis(110), margin), 0, "exactly at the margin");
+        assert_eq!(t.silence_due(Hns::from_millis(120), margin), 480, "10 ms is 480 frames");
+        assert_eq!(t.silence_due(Hns::from_millis(121), margin), 528, "11 ms is 528 frames");
+    }
+
+    #[test]
+    fn sample_timeline_silence_due_never_reaches_the_margin() {
+        // Padding in odd steps, at two rates, must stop within a frame of `now - margin`,
+        // never past it: a late real buffer is captured after that point.
+        let margin = Hns::from_millis(100);
+        for rate in [44_100, 48_000] {
+            let mut t = SampleTimeline::new(rate);
+            t.place(Hns::from_secs(1), 480);
+            let mut now = Hns::from_secs(1);
+            for _ in 0..2_000 {
+                now += Hns::from_millis(7) + Hns(3_333);
+                let limit = now - margin;
+                let frames = t.silence_due(now, margin);
+                let next = t.expected().expect("anchored");
+                let p = t.place(next, frames);
+                assert_eq!((p.silence, p.skip, p.restart), (0, 0, false));
+                if frames > 0 {
+                    let end = t.expected().expect("anchored");
+                    assert!(end <= limit, "rate {rate}: silence ran to {end}, past {limit}");
+                    assert!(limit - end < Hns::from_millis(1), "rate {rate}: {end} lags {limit}");
+                }
+            }
+        }
     }
 
     #[test]

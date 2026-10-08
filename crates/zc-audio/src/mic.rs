@@ -9,6 +9,7 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, STGM_READ};
 use windows_core::HSTRING;
+use zc_core::Hns;
 use zc_core::dsp::{Compressor, CompressorParams};
 use zc_core::media::TrackId;
 use zc_core::ports::{AudioSource, AudioStart, Emit, SourceError};
@@ -182,9 +183,20 @@ impl AudioSource for MicSource {
                 })
             });
             let mut stream = stream;
+            // While the mic is away, retry once a second but keep the track continuous.
+            let mut retry_at = Hns::ZERO;
             while !stop.load(Ordering::Acquire) {
                 let Some(s) = &stream else {
-                    std::thread::sleep(Duration::from_secs(1));
+                    // Silence up to 100 ms ago, so the mic track has no hole (as game audio).
+                    if let Err(e) = encode.pad_silence(zc_win::clock::now(), &*sink) {
+                        tracing::warn!(%e, "microphone silence failed");
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                    let now = zc_win::clock::now();
+                    if now < retry_at {
+                        continue;
+                    }
+                    retry_at = now + Hns::from_secs(1);
                     stream = open_mic(&config, device.as_deref())
                         .inspect_err(|e| tracing::debug!(%e, "mic still unavailable"))
                         .ok();
