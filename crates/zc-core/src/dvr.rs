@@ -20,7 +20,7 @@
 //! the engine page-locks it (`VirtualLock`) after allocation. Size it with
 //! [`DvrConfig::for_window`] against the *maximum* bitrate.
 
-use crate::media::{Packet, PacketRef, TrackId};
+use crate::media::{Packet, PacketMeta, PacketRef, TrackId};
 use crate::ring::PacketRing;
 use crate::time::Hns;
 
@@ -82,6 +82,9 @@ pub enum DvrError {
     /// There's no video in the buffer yet.
     #[error("the DVR buffer is empty")]
     Empty,
+    /// The buffer was cleared or resized while a snapshot was being copied.
+    #[error("the buffer changed while saving; try again")]
+    Changed,
 }
 
 /// Index of the video ring in [`DvrBuffer::rings`]. Audio rings follow it.
@@ -112,6 +115,9 @@ pub struct DvrBuffer {
     newest_video_end: Hns,
     /// Set at creation, after a refused GOP and after `clear`: drop video until a keyframe.
     skip_until_keyframe: bool,
+    /// Bumped by `clear` and `resize`. A plan from an older generation holds positions that
+    /// no longer mean anything (see [`SnapshotCopy`]).
+    generation: u64,
 }
 
 impl DvrBuffer {
@@ -133,6 +139,7 @@ impl DvrBuffer {
             current_gop_bytes: 0,
             newest_video_end: Hns::ZERO,
             skip_until_keyframe: true,
+            generation: 0,
         }
     }
 
@@ -187,35 +194,67 @@ impl DvrBuffer {
     ///
     /// If less than `window` is buffered, returns everything.
     ///
+    /// This is [`plan_snapshot`](Self::plan_snapshot) and a [`SnapshotCopy`] run in one go,
+    /// so the whole copy happens here. The engine copies in short holds instead (D29).
+    ///
     /// # Errors
     /// [`DvrError::Empty`] if there's no video yet.
     pub fn snapshot(&self, window: Hns) -> Result<DvrClip, DvrError> {
+        let mut copy = SnapshotCopy::new(self.plan_snapshot(window)?);
+        // One chunk holds the whole clip. Nothing can change while `&self` is borrowed, so
+        // the loop runs once.
+        while !copy.is_done() {
+            copy.copy_chunk(self, usize::MAX)?;
+        }
+        Ok(copy.finish())
+    }
+
+    /// Decides what [`snapshot`](Self::snapshot) copies for `window`, without copying any
+    /// bytes. This is quick, so the engine can call it under the lock.
+    ///
+    /// # Errors
+    /// [`DvrError::Empty`] if there's no video yet.
+    pub fn plan_snapshot(&self, window: Hns) -> Result<SnapshotPlan, DvrError> {
         let oldest = self.oldest_pts().ok_or(DvrError::Empty)?;
         let target = self.newest_video_end.saturating_sub(window);
         // The newest GOP that starts at or before `target` covers the window. If none does,
         // the buffer holds less than `window`, so start at the oldest GOP.
         let start = self.rings[VIDEO_RING]
-            .iter()
+            .positions()
             .rev()
-            .find(|(meta, _)| meta.keyframe && meta.pts <= target)
-            .map_or(oldest, |(meta, _)| meta.pts);
+            .find(|(meta, _, _)| meta.keyframe && meta.pts <= target)
+            .map_or(oldest, |(meta, _, _)| meta.pts);
 
-        // ponytail: copies under the caller's lock (Q4). Share segments by reference instead
-        // if the lock time measured in P3.17 is too long.
-        let mut packets = Vec::new();
+        let mut packets = Vec::with_capacity(self.rings.iter().map(PacketRing::len).sum());
         for ring in &self.rings {
-            for (meta, [first, second]) in ring.iter() {
+            for (meta, abs, len) in ring.positions() {
                 if meta.pts >= start {
-                    let mut data = Vec::with_capacity(first.len() + second.len());
-                    data.extend_from_slice(first);
-                    data.extend_from_slice(second);
-                    packets.push(Packet { meta, data });
+                    packets.push(PlannedPacket { meta, abs, len });
                 }
             }
         }
-        // Stable sort, and TrackId orders video first, so equal PTS keep video ahead of audio.
-        packets.sort_by_key(|p| (p.meta.pts, p.meta.track));
-        Ok(DvrClip { packets })
+        Ok(SnapshotPlan { generation: self.generation, packets })
+    }
+
+    /// Copies each planned packet's bytes into the matching pre-sized packet in `out`, in
+    /// order, and stops at the first one the writer has overwritten. Call it under the lock.
+    fn copy_planned(
+        &self,
+        generation: u64,
+        planned: &[PlannedPacket],
+        out: &mut [Packet],
+    ) -> CopyOutcome {
+        debug_assert_eq!(planned.len(), out.len());
+        if generation != self.generation {
+            return CopyOutcome::Stale;
+        }
+        for (index, (plan, packet)) in planned.iter().zip(out.iter_mut()).enumerate() {
+            let ring = &self.rings[plan.meta.track.index()];
+            if !ring.copy_if_intact(plan.abs, plan.len, &mut packet.data) {
+                return CopyOutcome::Overwritten { index };
+            }
+        }
+        CopyOutcome::Copied
     }
 
     /// Changes capacity when a game profile asks for a different window (DESIGN §7).
@@ -226,12 +265,14 @@ impl DvrBuffer {
     /// so it needs about twice the window's memory for a moment.
     pub fn resize(&mut self, config: DvrConfig) {
         let was_skipping = self.skip_until_keyframe;
+        let generation = self.generation + 1;
         // `Hns(i64::MAX)` reaches back past the oldest GOP, so this copies everything.
         let clip = self.snapshot(Hns(i64::MAX)).unwrap_or_default();
         // Free the old rings before allocating the new ones, so the peak is the copy plus
         // one buffer, not three.
         *self = Self::new(DvrConfig { video_bytes: 0, audio_bytes: 0 });
         *self = Self::new(config);
+        self.generation = generation;
         for packet in &clip.packets {
             // Whatever the new size can't hold is evicted or refused, as on any push.
             let _ = self.push(packet.view());
@@ -251,6 +292,7 @@ impl DvrBuffer {
         self.current_gop_bytes = 0;
         self.newest_video_end = Hns::ZERO;
         self.skip_until_keyframe = true;
+        self.generation += 1;
     }
 
     /// The video half of [`push`](Self::push). Keeps GOPs whole and starts at a keyframe.
@@ -365,6 +407,144 @@ impl DvrClip {
             _ => Hns::ZERO,
         }
     }
+}
+
+/// One packet that a snapshot will copy: its metadata, and where its payload sits in the ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlannedPacket {
+    /// Timing and track. The track also names the ring that holds the payload.
+    pub meta: PacketMeta,
+    /// Absolute byte position of the payload in that ring (see [`PacketRing`]).
+    pub abs: u64,
+    /// Payload length in bytes.
+    pub len: usize,
+}
+
+/// What a snapshot copies, chosen under the lock by [`DvrBuffer::plan_snapshot`]: metadata
+/// and byte positions only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotPlan {
+    /// The buffer's generation when the plan was made. A copy from another generation is refused.
+    pub generation: u64,
+    /// Video from the start keyframe on, then each audio track. Each track's packets are
+    /// oldest first.
+    pub packets: Vec<PlannedPacket>,
+}
+
+/// How far [`DvrBuffer::copy_planned`] got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyOutcome {
+    /// Every packet in the slice was copied.
+    Copied,
+    /// The packet at `index` in the slice was overwritten. Those before it were copied.
+    Overwritten { index: usize },
+    /// The buffer was cleared or resized since planning.
+    Stale,
+}
+
+/// A snapshot copy spread over several short lock holds (D29).
+///
+/// Plan under the lock with [`DvrBuffer::plan_snapshot`], then call [`copy_chunk`](Self::copy_chunk)
+/// once per hold, releasing the lock between calls. Pushes may happen in between. The writer
+/// can lap a planned packet before it is copied. The copy then gives that packet up, and the
+/// clip starts at the next keyframe instead. Torn bytes are never copied.
+pub struct SnapshotCopy {
+    plan: SnapshotPlan,
+    /// One pre-sized packet per planned packet, in plan order.
+    packets: Vec<Packet>,
+    /// Index of the first planned packet not yet copied or given up on.
+    next: usize,
+    /// Packets older than this are left out of the clip. It rises past each lost packet.
+    floor: Hns,
+}
+
+impl SnapshotCopy {
+    /// Allocates the clip's packets, zero-filled so that every page is touched now. Call it
+    /// outside the lock.
+    #[must_use]
+    pub fn new(plan: SnapshotPlan) -> Self {
+        let packets = plan
+            .packets
+            .iter()
+            .map(|p| {
+                // `vec![0; n]` may hand back untouched zero pages, so write the zeros instead.
+                #[expect(clippy::slow_vector_initialization, reason = "the writes fault pages in")]
+                let mut data = Vec::with_capacity(p.len);
+                data.resize(p.len, 0);
+                Packet { meta: p.meta, data }
+            })
+            .collect();
+        Self { plan, packets, next: 0, floor: Hns(i64::MIN) }
+    }
+
+    /// Whether every planned packet has been copied or given up on.
+    #[must_use]
+    pub fn is_done(&self) -> bool {
+        self.next >= self.plan.packets.len()
+    }
+
+    /// Copies the next packets from `buffer`: at most `max_bytes` of payload, and at least one
+    /// packet. Call it under the lock, once per hold.
+    ///
+    /// # Errors
+    /// [`DvrError::Changed`] if the buffer was cleared or resized since planning.
+    /// [`DvrError::Empty`] if the writer lapped the planned packets and no keyframe is left
+    /// to start from.
+    pub fn copy_chunk(&mut self, buffer: &DvrBuffer, max_bytes: usize) -> Result<(), DvrError> {
+        let end = self.next + chunk_len(&self.plan.packets[self.next..], max_bytes);
+        let outcome = buffer.copy_planned(
+            self.plan.generation,
+            &self.plan.packets[self.next..end],
+            &mut self.packets[self.next..end],
+        );
+        match outcome {
+            CopyOutcome::Copied => self.next = end,
+            CopyOutcome::Stale => return Err(DvrError::Changed),
+            CopyOutcome::Overwritten { index } => {
+                // The lost packet and everything before the next keyframe after it go: that GOP
+                // is broken, and audio must not outlive the video it plays against.
+                let lost = self.next + index;
+                let lost_pts = self.plan.packets[lost].meta.pts;
+                let key = self
+                    .plan
+                    .packets
+                    .iter()
+                    .find(|p| {
+                        p.meta.track == TrackId::Video && p.meta.keyframe && p.meta.pts > lost_pts
+                    })
+                    .ok_or(DvrError::Empty)?;
+                self.floor = self.floor.max(key.meta.pts);
+                self.next = lost + 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// The clip: every copied packet at or after the floor, in presentation order. Call it
+    /// once [`is_done`](Self::is_done).
+    #[must_use]
+    pub fn finish(mut self) -> DvrClip {
+        let floor = self.floor;
+        self.packets.retain(|p| p.meta.pts >= floor);
+        // Stable sort, and TrackId orders video first, so equal PTS keep video ahead of audio.
+        self.packets.sort_by_key(|p| (p.meta.pts, p.meta.track));
+        DvrClip { packets: self.packets }
+    }
+}
+
+/// How many packets, from the front of `planned`, fit in one lock hold: as many as keep the
+/// payload within `max_bytes`, and always at least one.
+fn chunk_len(planned: &[PlannedPacket], max_bytes: usize) -> usize {
+    let mut bytes = 0;
+    let mut count = 0;
+    for packet in planned {
+        if count > 0 && bytes + packet.len > max_bytes {
+            break;
+        }
+        bytes += packet.len;
+        count += 1;
+    }
+    count
 }
 
 #[cfg(test)]
@@ -546,5 +726,67 @@ mod tests {
         let _keyframe = s.next_video(); // frame 120 starts a GOP, but we skip it…
         let mid_gop = s.next_video(); // …so frame 121 has nothing to decode from.
         assert_eq!(dvr.push(mid_gop.view()), Ok(PushOutcome::Discarded));
+    }
+
+    #[test]
+    fn dvr_chunked_copy_matches_one_shot_snapshot() {
+        let mut dvr = DvrBuffer::new(roomy());
+        let mut s = SyntheticStream::new();
+        push_all(&mut dvr, &s.take_secs(10));
+        let one_shot = dvr.snapshot(Hns::from_millis(3_500)).unwrap();
+
+        let mut copy = SnapshotCopy::new(dvr.plan_snapshot(Hns::from_millis(3_500)).unwrap());
+        let mut later = s.take_secs(2).into_iter();
+        let mut chunks = 0;
+        while !copy.is_done() {
+            copy.copy_chunk(&dvr, 2_500).unwrap();
+            chunks += 1;
+            // New footage between chunks neither overwrites nor changes the plan.
+            if let Some(p) = later.next() {
+                dvr.push(p.view()).unwrap();
+            }
+        }
+        assert!(chunks > 10, "2.5 KB chunks should split the copy: {chunks} chunks");
+        assert_eq!(copy.finish(), one_shot);
+    }
+
+    #[test]
+    fn dvr_chunked_copy_skips_to_the_next_keyframe_when_overwritten() {
+        // Three 60 KB GOPs fill the 200 KB video ring, with 20 KB to spare.
+        let mut dvr = DvrBuffer::new(DvrConfig { video_bytes: 200_000, audio_bytes: 1_000_000 });
+        let mut s = SyntheticStream::new();
+        push_all(&mut dvr, &s.take_secs(3));
+        let mut copy = SnapshotCopy::new(dvr.plan_snapshot(Hns::from_millis(3_500)).unwrap());
+
+        // The next second evicts GOP 0 and writes over its first 40 KB, keyframe included.
+        push_all(&mut dvr, &s.take_secs(1));
+        while !copy.is_done() {
+            copy.copy_chunk(&dvr, 2_500).unwrap();
+        }
+        let clip = copy.finish();
+
+        // The clip starts at the keyframe at 1 s, frame 60, and runs to the end of the plan.
+        let frames: Vec<u32> =
+            clip.video().map(|p| SyntheticStream::sequence_number(&p.data)).collect();
+        assert_eq!(frames, (60..180).collect::<Vec<u32>>());
+        assert!(clip.video().next().is_some_and(|p| p.meta.keyframe));
+        // Audio from before 1 s is still intact in its ring, but it goes with the lost GOP.
+        assert_eq!(clip.track(TrackId::Mic).count(), 100, "2 s × 50 packets/s");
+        assert!(clip.packets.iter().all(|p| p.meta.pts >= Hns::from_secs(1)));
+    }
+
+    #[test]
+    fn dvr_copy_is_stale_after_resize_or_clear() {
+        let mut dvr = DvrBuffer::new(roomy());
+        let mut s = SyntheticStream::new();
+        push_all(&mut dvr, &s.take_secs(2));
+
+        let mut copy = SnapshotCopy::new(dvr.plan_snapshot(Hns::from_secs(1)).unwrap());
+        dvr.resize(DvrConfig { video_bytes: 20_000_000, audio_bytes: 2_000_000 });
+        assert_eq!(copy.copy_chunk(&dvr, usize::MAX), Err(DvrError::Changed));
+
+        let mut copy = SnapshotCopy::new(dvr.plan_snapshot(Hns::from_secs(1)).unwrap());
+        dvr.clear();
+        assert_eq!(copy.copy_chunk(&dvr, usize::MAX), Err(DvrError::Changed));
     }
 }
