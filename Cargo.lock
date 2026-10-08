@@ -4019,6 +4019,7 @@ dependencies = [
  "zc-core",
  "zc-engine",
  "zc-input",
+ "zc-mux",
  "zc-video",
 ]
 

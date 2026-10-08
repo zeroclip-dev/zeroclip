@@ -167,6 +167,8 @@ Profiles should be user-editable from the UI, and unknown executables should be 
 
 Detects unexpected termination of the tracked game process, dumps the current ring buffer to `recovery.tmp`, and prompts on next focus: *"Game closed unexpectedly. Keep the last X minutes?"* Because session recordings use a fragmented container, a crash mid-session needs no rescue at all — the file is already playable.
 
+A recording is written as `<name>.mp4.partial` and synced after every fragment (D18). A crash leaves that file behind. At startup the app cuts it back to its last complete fragment and renames it to `<name>.mp4`, so at most about 1 s is lost. A file with no complete fragment is left as it is.
+
 ### Encoder watchdog — make it a state machine
 
 v1 said the watchdog "reinitializes the D3D11 pipeline without crashing the app." That's the right goal, but reinitializing a device mid-session while the ring buffer is live is genuinely tricky and will corrupt the buffer if done ad hoc. Model it explicitly:
