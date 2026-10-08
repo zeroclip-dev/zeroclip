@@ -10,10 +10,11 @@
 //!    session recording).
 //!
 //! Nothing in here may allocate or touch the disk: the DVR buffer is
-//! pre-allocated, and disk writers only copy into their chunk buffers (the IO
+//! pre-allocated, and disk writers only copy into the recording spool (the IO
 //! thread does the actual writes).
 
 use std::sync::{Mutex, PoisonError};
+use std::time::Instant;
 
 use zc_core::dvr::{DvrBuffer, DvrClip, DvrConfig, DvrError};
 use zc_core::media::{PacketMeta, PacketRef, TrackId};
@@ -66,10 +67,27 @@ impl Recorder {
 
     /// Copies out the last `window` of the DVR buffer (see [`DvrBuffer::snapshot`]).
     ///
+    /// The copy runs under the recorder lock, so every source waits for it. Its
+    /// duration is logged at debug level (D19 asks for this measurement).
+    ///
     /// # Errors
     /// [`DvrError::Empty`] if nothing has been recorded yet.
     pub fn snapshot(&self, window: Hns) -> Result<DvrClip, DvrError> {
-        self.lock().dvr.snapshot(window)
+        let started = Instant::now();
+        let result = self.lock().dvr.snapshot(window);
+        // The guard was a temporary of the statement above, so the lock is free by now.
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_millis(),
+            packets = result.as_ref().map_or(0, |clip| clip.packets.len()),
+            "DVR snapshot copied (recorder lock held)"
+        );
+        result
+    }
+
+    /// Span of video the DVR buffer holds, for the status bar (see [`DvrBuffer::buffered`]).
+    #[must_use]
+    pub fn buffered(&self) -> Hns {
+        self.lock().dvr.buffered()
     }
 
     /// Starts feeding a disk writer (manual or session recording).
@@ -124,7 +142,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "spec: needs MasterClock + DvrBuffer (Phase 3)"]
     fn recorder_maps_capture_time_onto_the_session_timeline() {
         // Sources stamp packets with raw QPC-based capture time; the session starts
         // at the first video keyframe.
