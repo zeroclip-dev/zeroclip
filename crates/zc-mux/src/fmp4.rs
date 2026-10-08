@@ -6,12 +6,14 @@
 //! that fragments follow. Then there is one `moof` and `mdat` pair per GOP. Every number is
 //! big-endian, and every box size counts the 8-byte header.
 
-use std::io;
+use std::io::{self, Write};
 
 use tracing::warn;
-use zc_core::media::{Codec, TrackInfo, TrackKind};
+use zc_core::media::{Codec, PacketRef, TrackId, TrackInfo, TrackKind};
+use zc_core::time::Hns;
 
 use crate::bitstream;
+use crate::container::ContainerWriter;
 
 /// Ticks per second. Hns ticks are 100 ns, so every track uses them directly (D7).
 const TIMESCALE: u32 = 10_000_000;
@@ -325,11 +327,298 @@ fn video_entry(codec: Codec, size: (u16, u16), params: &[u8]) -> io::Result<Vec<
     }
 }
 
+/// The fragmented MP4 writer behind [`container::create`](crate::container::create).
+///
+/// Packets wait per track until the next video keyframe, which closes a fragment. A fragment
+/// is one `moof` and one `mdat`, and it starts on a sync sample.
+pub(crate) struct Fmp4Writer {
+    out: Box<dyn Write + Send>,
+    /// The declared tracks, in [`TrackId::index`] order, so game audio comes first (pitfall 8).
+    tracks: Vec<TrackInfo>,
+    /// Each track's position in `tracks`, by [`TrackId::index`].
+    slot: [Option<usize>; TrackId::COUNT],
+    /// The first keyframe's in-band parameter sets, for a video track that declares none.
+    /// Dropped once the init segment is written.
+    video_config: Option<Vec<u8>>,
+    init_written: bool,
+    /// The PTS of the first video keyframe, which becomes time zero.
+    origin: Option<Hns>,
+    /// The last video PTS accepted. A step backwards is an error, since B-frames are off.
+    last_video_pts: Option<Hns>,
+    /// Fragments written so far, so the next one has `sequence + 1` in its `mfhd`.
+    sequence: u32,
+    /// Samples waiting for the next fragment, per track position.
+    samples: Vec<Vec<Sample>>,
+    /// Their encoded bytes, per track position.
+    data: Vec<Vec<u8>>,
+}
+
+/// One sample waiting in a fragment.
+struct Sample {
+    /// Presentation time since the origin.
+    pts: Hns,
+    /// The packet's own duration. Only the last sample of a fragment uses it, because the
+    /// others run up to the next PTS (pitfall 7).
+    duration: Hns,
+    /// Length in bytes, as it was appended to the track's data.
+    size: u32,
+    /// A sync sample: a video keyframe, or any audio frame.
+    sync: bool,
+}
+
+impl Fmp4Writer {
+    /// Writes nothing yet. The init segment waits for the first fragment, so it can take its
+    /// parameter sets from the first keyframe.
+    ///
+    /// # Errors
+    /// [`io::ErrorKind::InvalidInput`] for a track list the writer cannot use: no video track,
+    /// a track declared twice, or a kind that does not match its track ID.
+    /// [`io::ErrorKind::Unsupported`] for a video codec that is not written yet.
+    pub(crate) fn new(out: Box<dyn Write + Send>, mut tracks: Vec<TrackInfo>) -> io::Result<Self> {
+        tracks.sort_by_key(|track| track.track.index());
+        let mut slot = [None; TrackId::COUNT];
+        for (position, track) in tracks.iter().enumerate() {
+            let kind_matches = matches!(
+                (track.track, &track.kind),
+                (TrackId::Video, TrackKind::Video { .. })
+                    | (TrackId::Audio(_), TrackKind::Audio { .. })
+            );
+            if !kind_matches {
+                let message = format!("track {:?} is declared with the wrong kind", track.track);
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+            }
+            if slot[track.track.index()].replace(position).is_some() {
+                let message = format!("track {:?} is declared twice", track.track);
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+            }
+            if let TrackKind::Video { codec, .. } = &track.kind
+                && *codec != Codec::H264
+            {
+                let message = format!("{} fragments aren't written yet", codec.name());
+                return Err(io::Error::new(io::ErrorKind::Unsupported, message));
+            }
+        }
+        if slot[TrackId::Video.index()].is_none() {
+            let message = "a fragmented MP4 needs a video track";
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+        }
+        let count = tracks.len();
+        Ok(Self {
+            out,
+            tracks,
+            slot,
+            video_config: None,
+            init_written: false,
+            origin: None,
+            last_video_pts: None,
+            sequence: 0,
+            samples: (0..count).map(|_| Vec::new()).collect(),
+            data: (0..count).map(|_| Vec::new()).collect(),
+        })
+    }
+
+    /// The position in `tracks` of a declared track.
+    fn position(&self, track: TrackId) -> Option<usize> {
+        self.slot[track.index()]
+    }
+
+    /// Whether any track has samples waiting.
+    fn has_pending(&self) -> bool {
+        self.samples.iter().any(|samples| !samples.is_empty())
+    }
+
+    /// Writes the init segment and drops the first keyframe's parameter sets.
+    fn write_init(&mut self) -> io::Result<()> {
+        let init = init_segment(&self.tracks, self.video_config.as_deref())?;
+        self.out.write_all(&init)?;
+        self.init_written = true;
+        self.video_config = None;
+        Ok(())
+    }
+
+    /// The `moof` for the tracks at `active` positions. Track `i`'s data starts
+    /// `data_offsets[i]` bytes after the start of the moof (default-base-is-moof).
+    fn moof(&self, active: &[usize], data_offsets: &[i32]) -> io::Result<Vec<u8>> {
+        let mut body = full_box(b"mfhd", 0, 0, &self.sequence.to_be_bytes())?;
+        for (&position, &data_offset) in active.iter().zip(data_offsets) {
+            body.extend(self.traf(position, data_offset)?);
+        }
+        boxed(b"moof", &body)
+    }
+
+    /// The `traf` for the samples of the track at `position`.
+    fn traf(&self, position: usize, data_offset: i32) -> io::Result<Vec<u8>> {
+        let Some(first) = self.samples[position].first() else {
+            return Ok(Vec::new());
+        };
+        let track_id = u32::try_from(position + 1).map_err(invalid_data)?;
+        // default-base-is-moof (0x020000): the trun offsets count from the start of the moof.
+        let tfhd = full_box(b"tfhd", 0, 0x0002_0000, &track_id.to_be_bytes())?;
+        // The base time is the first sample's true PTS, so timing restarts at every fragment.
+        let base = u64::try_from(first.pts.ticks()).map_err(invalid_data)?;
+        let tfdt = full_box(b"tfdt", 1, 0, &base.to_be_bytes())?;
+        let trun = self.trun(position, data_offset)?;
+        boxed(b"traf", &[tfhd, tfdt, trun].concat())
+    }
+
+    /// The `trun` listing the track's samples. Each duration runs to the next PTS of the same
+    /// track, because WGC delivers frames only when the screen changes (pitfall 7).
+    fn trun(&self, position: usize, data_offset: i32) -> io::Result<Vec<u8>> {
+        let samples = &self.samples[position];
+        let count = u32::try_from(samples.len()).map_err(invalid_data)?;
+        let mut body = u32s(&[count]);
+        body.extend_from_slice(&data_offset.to_be_bytes());
+        for (index, sample) in samples.iter().enumerate() {
+            let duration = match samples.get(index + 1) {
+                Some(next) => next.pts.saturating_sub(sample.pts),
+                None => sample.duration,
+            };
+            body.extend_from_slice(&clamp_u32(duration.ticks()).to_be_bytes());
+            body.extend_from_slice(&sample.size.to_be_bytes());
+            // Sync samples depend on nothing. Other video frames depend on an earlier frame.
+            let flags: u32 = if sample.sync { 0x0200_0000 } else { 0x0101_0000 };
+            body.extend_from_slice(&flags.to_be_bytes());
+        }
+        // Flags 0x701: data offset, sample duration, sample size and sample flags are present.
+        full_box(b"trun", 0, 0x0000_0701, &body)
+    }
+}
+
+impl ContainerWriter for Fmp4Writer {
+    fn write_packet(&mut self, packet: PacketRef<'_>) -> io::Result<()> {
+        let meta = packet.meta;
+        // A track that was not declared is ignored.
+        let Some(position) = self.position(meta.track) else {
+            return Ok(());
+        };
+        let is_video = !meta.track.is_audio();
+        // A file starts on a video keyframe, which becomes time zero. Everything before it
+        // is dropped, so no file starts on a P-frame.
+        let origin = match self.origin {
+            Some(origin) => origin,
+            None if is_video && meta.keyframe => {
+                if self.tracks[position].codec_private.is_empty() {
+                    self.video_config = Some(packet.data.to_vec());
+                }
+                self.origin = Some(meta.pts);
+                meta.pts
+            }
+            None => return Ok(()),
+        };
+        if meta.pts < origin {
+            return Ok(());
+        }
+        if is_video {
+            // B-frames are off (pitfall 27). A PTS that steps back would make a broken file,
+            // so refuse it and say why.
+            if let Some(last) = self.last_video_pts
+                && meta.pts < last
+            {
+                let message = format!(
+                    "video PTS went backwards ({} after {}): the MP4 writer assumes no B-frames",
+                    meta.pts, last
+                );
+                return Err(invalid_data(message));
+            }
+            // Each keyframe closes a fragment, so every fragment starts on a sync sample.
+            if meta.keyframe && self.has_pending() {
+                self.flush_fragment()?;
+            }
+            self.last_video_pts = Some(meta.pts);
+        }
+        let size = append_sample(&mut self.data[position], packet.data, is_video)?;
+        self.samples[position].push(Sample {
+            pts: meta.pts.saturating_sub(origin),
+            duration: meta.duration,
+            size,
+            sync: meta.keyframe || !is_video,
+        });
+        Ok(())
+    }
+
+    fn flush_fragment(&mut self) -> io::Result<()> {
+        if !self.has_pending() {
+            return Ok(());
+        }
+        if !self.init_written {
+            self.write_init()?;
+        }
+        self.sequence = self.sequence.wrapping_add(1);
+
+        let active: Vec<usize> = self
+            .samples
+            .iter()
+            .enumerate()
+            .filter(|(_, samples)| !samples.is_empty())
+            .map(|(position, _)| position)
+            .collect();
+        // The moof's size does not depend on its offsets, so measure it with placeholders.
+        let moof_len = self.moof(&active, &vec![0; active.len()])?.len();
+        // The data follows the moof and the 8-byte mdat header, one track after another.
+        let mut offset = moof_len + 8;
+        let mut offsets = Vec::with_capacity(active.len());
+        for &position in &active {
+            let data_offset = i32::try_from(offset)
+                .map_err(|_| invalid_data("fragment too large for a trun data offset"))?;
+            offsets.push(data_offset);
+            offset += self.data[position].len();
+        }
+        let moof = self.moof(&active, &offsets)?;
+
+        let payload: usize = active.iter().map(|&position| self.data[position].len()).sum();
+        self.out.write_all(&moof)?;
+        self.out.write_all(&box_header(b"mdat", payload)?)?;
+        for &position in &active {
+            self.out.write_all(&self.data[position])?;
+        }
+        for &position in &active {
+            self.samples[position].clear();
+            self.data[position].clear();
+        }
+        self.out.flush()
+    }
+
+    fn finish(mut self: Box<Self>) -> io::Result<()> {
+        self.flush_fragment()?;
+        if !self.init_written {
+            self.write_init()?;
+        }
+        self.out.flush()
+    }
+}
+
+/// Appends one packet's bytes to a track's buffer and returns how many were added. Video
+/// becomes length-prefixed NAL units (ISO/IEC 14496-15), and audio is copied as it is. On an
+/// error the buffer is left as it was.
+fn append_sample(buffer: &mut Vec<u8>, data: &[u8], is_video: bool) -> io::Result<u32> {
+    let start = buffer.len();
+    let converted = if is_video {
+        bitstream::append_length_prefixed(data, buffer).map_err(invalid_data)
+    } else {
+        buffer.extend_from_slice(data);
+        Ok(())
+    };
+    let added = converted.and_then(|()| u32::try_from(buffer.len() - start).map_err(invalid_data));
+    if added.is_err() {
+        buffer.truncate(start);
+    }
+    added
+}
+
+/// `ticks` clamped into a u32, for a sample duration. A negative gap counts as zero.
+fn clamp_u32(ticks: i64) -> u32 {
+    u32::try_from(ticks.clamp(0, i64::from(u32::MAX))).unwrap_or(u32::MAX)
+}
+
 #[cfg(test)]
 mod tests {
-    use zc_core::media::TrackId;
+    use std::sync::{Arc, Mutex};
+
+    use zc_core::media::{ContainerFormat, Packet, PacketMeta};
+    use zc_core::testing::SyntheticStream;
 
     use super::*;
+    use crate::container::create;
 
     fn video() -> TrackInfo {
         TrackInfo {
@@ -557,5 +846,309 @@ mod tests {
         let mut track = video();
         track.kind = TrackKind::Video { codec: Codec::Hevc, width: 320, height: 240, fps: 60 };
         assert_eq!(init_segment(&[track], None).unwrap_err().kind(), io::ErrorKind::Unsupported);
+    }
+
+    /// A writer output that the test keeps a handle on, to read the file back.
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedBuf {
+        fn bytes(&self) -> Vec<u8> {
+            self.0.lock().expect("the lock is never poisoned in tests").clone()
+        }
+    }
+
+    impl Write for SharedBuf {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("the lock is never poisoned in tests").extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The tracks a recording declares: video, then game audio, then the mic.
+    fn recording_tracks() -> Vec<TrackInfo> {
+        vec![video(), audio(TrackId::GameAudio, "Game"), audio(TrackId::Mic, "Mic")]
+    }
+
+    /// A video packet at `ms` milliseconds, lasting 16 ms, with a 4-byte payload.
+    fn video_packet(ms: i64, keyframe: bool) -> Packet {
+        Packet {
+            meta: PacketMeta {
+                track: TrackId::Video,
+                pts: Hns::from_millis(ms),
+                duration: Hns::from_millis(16),
+                keyframe,
+            },
+            data: vec![0x65, 1, 2, 3],
+        }
+    }
+
+    /// Writes `packets` through [`create`] and returns the file's bytes.
+    fn mux(tracks: &[TrackInfo], packets: &[Packet]) -> Vec<u8> {
+        let out = SharedBuf::default();
+        let mut writer =
+            create(ContainerFormat::FragmentedMp4, Box::new(out.clone()), tracks).unwrap();
+        for packet in packets {
+            writer.write_packet(packet.view()).unwrap();
+        }
+        writer.finish().unwrap();
+        out.bytes()
+    }
+
+    fn u32_at(buf: &[u8], at: usize) -> u32 {
+        u32::from_be_bytes(buf[at..at + 4].try_into().unwrap())
+    }
+
+    fn i32_at(buf: &[u8], at: usize) -> i32 {
+        i32::from_be_bytes(buf[at..at + 4].try_into().unwrap())
+    }
+
+    fn u64_at(buf: &[u8], at: usize) -> u64 {
+        u64::from_be_bytes(buf[at..at + 8].try_into().unwrap())
+    }
+
+    /// Each fragment as (moof body, mdat body), in file order.
+    fn fragments(file: &[u8]) -> Vec<(&[u8], &[u8])> {
+        let mut found = Vec::new();
+        let mut moof = None;
+        for (kind, body) in boxes(file) {
+            match &kind {
+                b"moof" => moof = Some(body),
+                b"mdat" => found.push((moof.take().expect("an mdat follows its moof"), body)),
+                _ => {}
+            }
+        }
+        found
+    }
+
+    /// The `traf` bodies of a moof body, in order.
+    fn trafs(moof: &[u8]) -> Vec<&[u8]> {
+        boxes(moof).into_iter().filter(|(kind, _)| kind == b"traf").map(|(_, body)| body).collect()
+    }
+
+    /// The base media decode time of a traf: its `tfdt` is version 1, so the time is 8 bytes.
+    fn tfdt_base(traf: &[u8]) -> u64 {
+        u64_at(child(traf, b"tfdt"), 4)
+    }
+
+    /// (duration, size, flags) of each sample in a trun body. The entries follow the
+    /// version and flags, the sample count and the data offset.
+    fn trun_samples(trun: &[u8]) -> Vec<(u32, u32, u32)> {
+        trun[12..]
+            .chunks_exact(12)
+            .map(|entry| (u32_at(entry, 0), u32_at(entry, 4), u32_at(entry, 8)))
+            .collect()
+    }
+
+    /// The name of a track, from its `hdlr`, without the NUL terminator.
+    fn track_name(trak: &[u8]) -> String {
+        let hdlr = child(child(trak, b"mdia"), b"hdlr");
+        String::from_utf8_lossy(&hdlr[24..hdlr.len() - 1]).into_owned()
+    }
+
+    #[test]
+    fn fmp4_is_init_then_one_fragment_per_gop() {
+        // Three seconds of video, game audio and mic: keyframes at 0, 1 and 2 s.
+        let packets = SyntheticStream::new().take_secs(3);
+        let file = mux(&recording_tracks(), &packets);
+        assert_eq!(kinds(&file), ["ftyp", "moov", "moof", "mdat", "moof", "mdat", "moof", "mdat"]);
+    }
+
+    #[test]
+    fn fmp4_timestamps_start_at_zero() {
+        // A recording that starts 543 s into the session still begins at zero. Every later
+        // fragment's base time is its own true PTS.
+        let mut packets = SyntheticStream::new().take_secs(2);
+        for packet in &mut packets {
+            packet.meta.pts += Hns::from_secs(543);
+        }
+        let file = mux(&recording_tracks(), &packets);
+        let bases: Vec<u64> =
+            fragments(&file).iter().map(|(moof, _)| tfdt_base(trafs(moof)[0])).collect();
+        assert_eq!(bases, [0, 10_000_000]);
+    }
+
+    #[test]
+    fn fmp4_drops_packets_before_the_first_keyframe() {
+        // Starting at frame 10 of a 60-frame GOP, the first 50 video frames and the audio
+        // before the keyframe at 1 s are dropped.
+        let from = SyntheticStream::new().frame_pts(10);
+        let packets: Vec<Packet> = SyntheticStream::new()
+            .take_secs(2)
+            .into_iter()
+            .filter(|p| p.meta.pts >= from)
+            .collect();
+        let file = mux(&recording_tracks(), &packets);
+        let (moof, _) = fragments(&file)[0];
+        let video = trafs(moof)[0];
+        assert_eq!(u32_at(child(video, b"trun"), 4), 60, "the first GOP, frames 60 to 119");
+        assert_eq!(tfdt_base(video), 0);
+    }
+
+    #[test]
+    fn fmp4_ignores_tracks_that_were_not_declared() {
+        let packets = SyntheticStream::new().take_secs(1);
+        let tracks = [video(), audio(TrackId::GameAudio, "Game")];
+        let file = mux(&tracks, &packets);
+        let (moof, _) = fragments(&file)[0];
+        assert_eq!(trafs(moof).len(), 2, "no traf for the mic");
+    }
+
+    #[test]
+    fn fmp4_file_has_the_expected_box_tree() {
+        let packets = SyntheticStream::new().take_secs(2);
+        let file = mux(&recording_tracks(), &packets);
+
+        let moov = child(&file, b"moov");
+        assert_eq!(kinds(moov), ["mvhd", "trak", "trak", "trak", "mvex"]);
+        assert_eq!(kinds(child(moov, b"mvex")), ["trex", "trex", "trex"]);
+
+        let (moof, mdat) = fragments(&file)[0];
+        assert_eq!(kinds(moof), ["mfhd", "traf", "traf", "traf"]);
+        assert_eq!(u32_at(child(moof, b"mfhd"), 4), 1, "the first fragment is number 1");
+        let video = trafs(moof)[0];
+        assert_eq!(kinds(video), ["tfhd", "tfdt", "trun"]);
+        assert_eq!(&child(video, b"tfhd")[..4], [0, 2, 0, 0], "default-base-is-moof");
+        assert_eq!(&child(video, b"trun")[..4], [0, 0, 7, 1], "offset, duration, size, flags");
+
+        // The data offset counts from the start of the moof, and the data starts after the
+        // 8-byte mdat header.
+        let moof_len = 8 + moof.len();
+        let offset = i32::try_from(moof_len + 8).unwrap();
+        assert_eq!(i32_at(child(video, b"trun"), 8), offset);
+
+        // The sample sizes of all three tracks add up to the mdat body.
+        let total: u32 = trafs(moof)
+            .iter()
+            .flat_map(|traf| trun_samples(child(traf, b"trun")))
+            .map(|(_, size, _)| size)
+            .sum();
+        assert_eq!(usize::try_from(total).unwrap(), mdat.len());
+
+        // A keyframe is a sync sample. The next frame depends on it.
+        let samples = trun_samples(child(video, b"trun"));
+        assert_eq!(samples[0].2, 0x0200_0000);
+        assert_eq!(samples[1].2, 0x0101_0000);
+        // Each frame is one NAL unit (the synthetic 1000 bytes) behind a 4-byte length.
+        assert_eq!(samples[0].1, 1004);
+    }
+
+    #[test]
+    fn durations_run_to_the_next_pts_and_the_last_uses_the_packet_duration() {
+        // Variable frame rate (pitfall 7): the gaps are 16, 34 and 16 ms. The last frame of the
+        // fragment has no next PTS, so it keeps its own 16 ms.
+        let packets = [
+            video_packet(0, true),
+            video_packet(16, false),
+            video_packet(50, false),
+            video_packet(66, false),
+            video_packet(1000, true),
+        ];
+        let file = mux(&[video()], &packets);
+        let fragments = fragments(&file);
+        assert_eq!(fragments.len(), 2);
+
+        let samples = trun_samples(child(trafs(fragments[0].0)[0], b"trun"));
+        let durations: Vec<u32> = samples.iter().map(|sample| sample.0).collect();
+        assert_eq!(durations, [160_000, 340_000, 160_000, 160_000]);
+        assert!(samples.iter().all(|sample| sample.1 == 8), "4-byte NAL behind a 4-byte length");
+        // The second fragment starts at its keyframe's own PTS, one second in.
+        assert_eq!(tfdt_base(trafs(fragments[1].0)[0]), 10_000_000);
+    }
+
+    #[test]
+    fn video_pts_going_backwards_is_an_error() {
+        // B-frames are off (pitfall 27). A PTS that steps back must fail with a clear error,
+        // not write a broken file.
+        let mut writer =
+            create(ContainerFormat::FragmentedMp4, Box::new(SharedBuf::default()), &[video()])
+                .unwrap();
+        writer.write_packet(video_packet(0, true).view()).unwrap();
+        writer.write_packet(video_packet(20, false).view()).unwrap();
+        let error = writer.write_packet(video_packet(10, false).view()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("went backwards"), "{error}");
+    }
+
+    #[test]
+    fn init_takes_parameter_sets_from_the_first_keyframe() {
+        // An Annex-B keyframe: SPS, PPS, then an IDR slice.
+        let keyframe = Packet {
+            meta: PacketMeta {
+                track: TrackId::Video,
+                pts: Hns::ZERO,
+                duration: Hns::from_millis(16),
+                keyframe: true,
+            },
+            data: vec![
+                0, 0, 0, 1, 0x67, 0x64, 0x00, 0x28, 0xAC, // SPS
+                0, 0, 0, 1, 0x68, 0xEE, 0x3C, 0x80, // PPS
+                0, 0, 1, 0x65, 0x88, 0x84, // IDR slice
+            ],
+        };
+        let packets = [keyframe, video_packet(16, false), video_packet(1000, true)];
+        let file = mux(&[video()], &packets);
+        let avc1 = child(sample_entries(&file), b"avc1");
+        let avcc = child(&avc1[78..], b"avcC");
+        assert_eq!(avcc[..6], [1, 0x64, 0x00, 0x28, 0xFF, 0xE1], "profile and level from the SPS");
+    }
+
+    #[test]
+    fn game_audio_is_declared_before_the_mic_whatever_the_input_order() {
+        // Some players and Discord use only the first audio track (pitfall 8).
+        let tracks = [audio(TrackId::Mic, "Mic"), video(), audio(TrackId::GameAudio, "Game")];
+        let file = mux(&tracks, &SyntheticStream::new().take_secs(1));
+        let traks: Vec<&[u8]> = boxes(child(&file, b"moov"))
+            .into_iter()
+            .filter(|(kind, _)| kind == b"trak")
+            .map(|(_, body)| body)
+            .collect();
+        let names: Vec<String> = traks.iter().map(|trak| track_name(trak)).collect();
+        assert_eq!(names, ["Video", "Game", "Mic"]);
+    }
+
+    #[test]
+    fn create_refuses_track_lists_it_cannot_write() {
+        let kind_of = |tracks: &[TrackInfo]| {
+            let out = Box::new(SharedBuf::default());
+            match create(ContainerFormat::FragmentedMp4, out, tracks) {
+                Ok(_) => None,
+                Err(error) => Some(error.kind()),
+            }
+        };
+        let no_video = [audio(TrackId::GameAudio, "Game")];
+        assert_eq!(kind_of(&no_video), Some(io::ErrorKind::InvalidInput));
+        assert_eq!(kind_of(&[video(), video()]), Some(io::ErrorKind::InvalidInput));
+        let mut video_as_audio = audio(TrackId::Mic, "Mic");
+        video_as_audio.track = TrackId::Video;
+        assert_eq!(kind_of(&[video_as_audio]), Some(io::ErrorKind::InvalidInput));
+        let mut hevc = video();
+        hevc.kind = TrackKind::Video { codec: Codec::Hevc, width: 320, height: 240, fps: 60 };
+        assert_eq!(kind_of(&[hevc]), Some(io::ErrorKind::Unsupported));
+    }
+
+    #[test]
+    fn matroska_is_unsupported() {
+        let result = create(ContainerFormat::Matroska, Box::new(SharedBuf::default()), &[video()]);
+        assert_eq!(result.err().map(|error| error.kind()), Some(io::ErrorKind::Unsupported));
+    }
+
+    #[test]
+    fn flush_fragment_writes_only_what_is_pending() {
+        let out = SharedBuf::default();
+        let mut writer =
+            create(ContainerFormat::FragmentedMp4, Box::new(out.clone()), &[video()]).unwrap();
+        writer.write_packet(video_packet(0, true).view()).unwrap();
+        writer.write_packet(video_packet(16, false).view()).unwrap();
+        writer.flush_fragment().unwrap();
+        assert_eq!(kinds(&out.bytes()), ["ftyp", "moov", "moof", "mdat"]);
+        // Nothing is pending, so a second flush writes nothing, and neither does finish.
+        writer.flush_fragment().unwrap();
+        writer.finish().unwrap();
+        assert_eq!(kinds(&out.bytes()), ["ftyp", "moov", "moof", "mdat"]);
     }
 }

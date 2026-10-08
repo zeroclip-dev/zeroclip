@@ -16,10 +16,5 @@
 pub mod bitstream;
 pub mod chunked;
 pub mod container;
-// Used by `container::create` from P3.11; until then only the tests call it.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "scaffold: wired into container::create in P3.11")
-)]
 mod fmp4;
 pub mod pacing;
