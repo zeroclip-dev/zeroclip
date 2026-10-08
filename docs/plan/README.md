@@ -29,8 +29,10 @@ Start each session with:
 
 The protocol:
 
-1. **Branch:** `phase-0`, `phase-1`, … (one per phase). One commit per card, with a
-   message that names the card ID (`P1.7: WGC capture and resize`). There is no remote yet.
+1. **Branch:** work on `feat/<topic>` (or `fix/<topic>`) branched from `dev`, and merge
+   it back into `dev` when its cards are green. `master` only moves when a phase is done
+   and hardware-checked. One commit per card, with a message that names the card ID
+   (`P1.7: WGC capture and resize`).
 2. **Implement the card.** Remove the `#[ignore]` from its specs and make them pass.
    **Never weaken or delete a spec.** If a spec looks wrong, stop and ask 0xtikaa.
 3. **Green gate:** `cargo fmt --all`,
