@@ -12,6 +12,7 @@ use windows_core::HSTRING;
 use zc_core::Hns;
 use zc_core::dsp::{Compressor, CompressorParams};
 use zc_core::media::TrackId;
+use zc_core::mix::MixInput;
 use zc_core::ports::{AudioSource, AudioStart, Emit, SourceError};
 use zc_core::sink::SharedSink;
 use zc_core::watchdog::HealthEvent;
@@ -37,6 +38,8 @@ pub struct MicSource {
     compressor: bool,
     /// Endpoint id of the chosen mic; `None` is the Windows default.
     device: Option<String>,
+    /// This source's input in the Master mix (D30), if it has one.
+    mix: Option<MixInput>,
     worker: Option<Worker>,
 }
 
@@ -45,7 +48,21 @@ impl MicSource {
     /// `device` is an id from [`list_microphones`], or `None` for the default.
     #[must_use]
     pub fn new(always_on: bool, compressor: bool, device: Option<String>) -> Self {
-        Self { gate: Arc::new(AtomicBool::new(always_on)), compressor, device, worker: None }
+        Self {
+            gate: Arc::new(AtomicBool::new(always_on)),
+            compressor,
+            device,
+            mix: None,
+            worker: None,
+        }
+    }
+
+    /// Puts this source in the Master mix as `mix`. Set it before `start`. `None` keeps the
+    /// source out of the mix.
+    #[must_use]
+    pub fn with_mix(mut self, mix: Option<MixInput>) -> Self {
+        self.mix = mix;
+        self
     }
 
     /// Whether the dynamics compressor is enabled.
@@ -146,12 +163,12 @@ impl AudioSource for MicSource {
     ) -> Result<(), SourceError> {
         self.stop();
         let (config, gate, use_compressor) = (*config, Arc::clone(&self.gate), self.compressor);
-        let device = self.device.clone();
+        let (device, mix) = (self.device.clone(), self.mix.clone());
         self.worker = Some(Worker::spawn("zc-mic", move |stop, ready| {
             let setup = (|| {
                 let apartment = Apartment::multithreaded()?;
                 let mf = MediaFoundation::start()?;
-                let encode = Encode::new(TrackId::Mic, &config)?;
+                let encode = Encode::new(TrackId::Mic, &config)?.with_mix(mix);
                 // A missing mic isn't fatal: the loop below keeps trying (a dock, a USB plug).
                 let stream = open_mic(&config, device.as_deref())
                     .inspect_err(

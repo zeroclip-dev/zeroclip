@@ -1,7 +1,7 @@
 //! Hot-path code must not allocate (CLAUDE.md rule 2; DESIGN §5: "All modes share
 //! one zero-allocation encode loop"). These tests swap in a counting global
-//! allocator and check the DVR push, the packet ring, hotkey matching, the mic DSP
-//! and the audio timeline.
+//! allocator and check the DVR push, the packet ring, hotkey matching, the mic DSP,
+//! the audio timeline and the Master mix bus.
 //!
 //! It lives in its own integration-test binary because a `#[global_allocator]`
 //! applies to the whole binary.
@@ -14,6 +14,7 @@ use zc_core::dsp::{Compressor, CompressorParams};
 use zc_core::dvr::{DvrBuffer, DvrConfig};
 use zc_core::hotkey::{Binding, Chord, ChordMatcher, Key, Trigger};
 use zc_core::media::{PacketMeta, PacketRef, TrackId};
+use zc_core::mix::MixBus;
 use zc_core::ring::PacketRing;
 use zc_core::testing::SyntheticStream;
 use zc_core::time::SampleTimeline;
@@ -128,6 +129,26 @@ fn sample_timeline_place_never_allocates() {
         }
     });
     assert_eq!(allocations, 0, "SampleTimeline::place allocated {allocations} times");
+}
+
+#[test]
+fn mix_bus_write_and_mix_never_allocate() {
+    // Two sources write 10 ms blocks a little apart; the mixer takes 10 ms at a time, and one
+    // write is late, so every path runs.
+    let mut bus = MixBus::new(2, 2);
+    bus.anchor(0);
+    bus.set_gain(0, 0.5);
+    let block = [1_000i16; 480 * 2];
+    let mut out = [0i16; 480 * 2];
+    let allocations = allocations_during(|| {
+        for k in 0..500_i64 {
+            bus.write(0, k * 480, &block);
+            bus.write(1, k * 480 + 336, &block);
+            std::hint::black_box(bus.mix_until((k + 1) * 480, &mut out));
+        }
+        bus.write(0, 0, &block); // long behind the mix point: dropped
+    });
+    assert_eq!(allocations, 0, "MixBus allocated {allocations} times");
 }
 
 #[test]
