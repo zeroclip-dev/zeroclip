@@ -494,6 +494,8 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
+    use zc_core::media::TrackInfo;
+
     use super::*;
 
     /// A video source that never touches a GPU. (`SyntheticVideoSource` arrives in Phase 3.)
@@ -515,6 +517,9 @@ mod tests {
             } else {
                 Ok(Codec::Hevc)
             }
+        }
+        fn format(&self) -> Option<TrackInfo> {
+            None
         }
         fn stop(&mut self) {}
         fn request_keyframe(&mut self) {}

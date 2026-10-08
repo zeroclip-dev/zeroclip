@@ -12,45 +12,11 @@
 
 use std::io;
 
-use zc_core::media::{Codec, ContainerFormat, PacketRef, TrackId};
+use zc_core::media::{ContainerFormat, PacketRef};
 
-/// Codec-specific description of a track, taken from the encoder's output media type.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TrackKind {
-    /// A video track.
-    Video {
-        /// Codec.
-        codec: Codec,
-        /// Width, pixels.
-        width: u32,
-        /// Height, pixels.
-        height: u32,
-        /// Nominal frame rate.
-        fps: u32,
-    },
-    /// An AAC audio track.
-    Audio {
-        /// Sample rate, Hz.
-        sample_rate: u32,
-        /// Channel count.
-        channels: u16,
-    },
-}
-
-/// One track in a container.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TrackInfo {
-    /// Which track.
-    pub track: TrackId,
-    /// Human-readable name such as "Game" or "Microphone", set when the track starts.
-    pub label: String,
-    /// What it contains.
-    pub kind: TrackKind,
-    /// Decoder configuration: SPS/PPS(/VPS) for H.264/HEVC, the sequence header for
-    /// AV1, or the `AudioSpecificConfig` for AAC. Media Foundation exposes it as
-    /// `MF_MT_MPEG_SEQUENCE_HEADER` / `MF_MT_USER_DATA` on the output type.
-    pub codec_private: Vec<u8>,
-}
+// The track declarations live in zc-core so the video adapter can report them without
+// depending on this crate. Re-exported here so `container::TrackInfo` still resolves.
+pub use zc_core::media::{TrackInfo, TrackKind};
 
 /// Writes interleaved packets into a crash-survivable container.
 pub trait ContainerWriter: Send {

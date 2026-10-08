@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::hotkey::Key;
-use crate::media::{Codec, TrackId};
+use crate::media::{Codec, TrackId, TrackInfo};
 use crate::sink::SharedSink;
 use crate::time::Hns;
 use crate::watchdog::HealthEvent;
@@ -105,6 +105,11 @@ pub trait VideoSource: Send {
         sink: SharedSink,
         health: Emit<HealthEvent>,
     ) -> Result<Codec, SourceError>;
+
+    /// The video track's format: codec, encoded size and fps, and `codec_private` when
+    /// it is known up front. Available once `start` has succeeded, `None` while stopped.
+    /// The engine reads it to declare the video track of a recording.
+    fn format(&self) -> Option<TrackInfo>;
 
     /// Stops and releases GPU resources. Idempotent.
     fn stop(&mut self);
