@@ -4,7 +4,8 @@
 //! Each file is written through one stack, built and driven on an IO thread:
 //!
 //! ```text
-//! container (fMP4) → ChunkedWriter (whole chunks) → PacedWriter (HDD pacing) → File
+//! container (fMP4) → ChunkedWriter (whole chunks) → PacedWriter (HDD pacing)
+//!                  → DurableFile (fsync on flush) → File
 //! ```
 //!
 //! Nothing here runs on the capture, encode or audio threads.
@@ -21,6 +22,7 @@ use zc_core::media::{ContainerFormat, TrackInfo};
 use zc_core::settings::Settings;
 use zc_mux::chunked::ChunkedWriter;
 use zc_mux::container::{self, ContainerWriter};
+use zc_mux::durable::DurableFile;
 use zc_mux::pacing::{DriveKind, PacedWriter, WritePacer};
 
 /// What the output stack needs from the settings, resolved once per file.
@@ -103,7 +105,17 @@ fn create_file_at(
     }
 }
 
-/// Opens the container writer over `file`: fMP4 in whole chunks, paced for the drive.
+/// When a file's bytes are synced to disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Durability {
+    /// Sync at every fragment, so a crash loses about one fragment (D18). Recordings.
+    PerFragment,
+    /// Sync once, when the file is finished. DVR dumps.
+    AtFinish,
+}
+
+/// Opens the container writer over `file`: fMP4 in whole chunks, paced for the drive, and
+/// synced as `durability` says.
 ///
 /// # Errors
 /// The container's refusal of the track list, such as a list with no video track.
@@ -111,27 +123,36 @@ pub(crate) fn open_writer(
     file: File,
     tracks: &[TrackInfo],
     cfg: &OutputConfig,
+    durability: Durability,
 ) -> io::Result<Box<dyn ContainerWriter>> {
-    let paced = PacedWriter::new(file, cfg.pacer);
+    let durable = match durability {
+        Durability::PerFragment => DurableFile::recording(file),
+        Durability::AtFinish => DurableFile::dump(file),
+    };
+    let paced = PacedWriter::new(durable, cfg.pacer);
     container::create(cfg.format, Box::new(ChunkedWriter::new(paced, cfg.chunk_bytes)), tracks)
 }
 
-/// Writes a DVR clip into `file` and finishes the container. Runs on an IO thread, after the
-/// buffer's snapshot has copied the clip out.
+/// Writes a DVR clip into `file`, finishes the container and syncs the file. Runs on an IO
+/// thread, after the buffer's snapshot has copied the clip out.
 ///
 /// # Errors
-/// The writer's errors, such as a video PTS that goes backwards.
+/// The writer's errors, such as a video PTS that goes backwards, or the final sync failing.
 pub(crate) fn write_clip(
     clip: &DvrClip,
     file: File,
     tracks: &[TrackInfo],
     cfg: &OutputConfig,
 ) -> io::Result<()> {
-    let mut out = open_writer(file, tracks, cfg)?;
+    // The writer chain owns `file` and closes it inside `finish`, so sync through a second
+    // handle to the same file. `FlushFileBuffers` covers every handle to it.
+    let handle = file.try_clone()?;
+    let mut out = open_writer(file, tracks, cfg, Durability::AtFinish)?;
     for packet in &clip.packets {
         out.write_packet(packet.view())?;
     }
-    out.finish()
+    out.finish()?;
+    handle.sync_all()
 }
 
 #[cfg(test)]
@@ -217,5 +238,23 @@ mod tests {
         assert_eq!(first.file_name().unwrap(), "ZeroClip Clip 2026-10-08 14-03-27.mp4");
         assert_ne!(first, second);
         assert!(second.to_string_lossy().ends_with(" (2).mp4"), "{second:?}");
+    }
+
+    #[test]
+    fn a_recording_reaches_the_disk_before_finish() {
+        // A crash never gets to finish, so each fragment must already be on disk. Nothing else
+        // moves the bytes: the 16 MiB chunk is far from full.
+        let scratch = Scratch::new("recording");
+        let cfg = config(&scratch.0);
+        let (path, file) = create_file(&cfg.dir, "Recording", cfg.format.extension()).unwrap();
+        let mut out = open_writer(file, &tracks(), &cfg, Durability::PerFragment).unwrap();
+        for packet in SyntheticStream::new().take_secs(3) {
+            out.write_packet(packet.view()).unwrap();
+        }
+        // The keyframes at 1 s and 2 s have closed two fragments.
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.len() > 8, "nothing reached the disk before finish");
+        assert_eq!(&bytes[4..8], b"ftyp");
+        out.finish().unwrap();
     }
 }

@@ -8,6 +8,8 @@
 //!   configuration records that MP4 keeps apart from the samples.
 //! - [`chunked`]: buffered writes in 8–16 MB blocks, so an HDD's head moves as
 //!   little as possible (DESIGN §4, "Disk strategy").
+//! - [`durable`]: files whose flushes sync to disk, so a recording survives a power cut
+//!   (D18).
 //! - [`pacing`]: gentle write pacing for DVR dumps on spinning disks.
 //!
 //! Platform-independent. Drive-type detection (is this an HDD?) needs Windows and
@@ -16,5 +18,6 @@
 pub mod bitstream;
 pub mod chunked;
 pub mod container;
+pub mod durable;
 mod fmp4;
 pub mod pacing;
