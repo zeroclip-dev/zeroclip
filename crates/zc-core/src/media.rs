@@ -129,7 +129,7 @@ pub struct TrackInfo {
 }
 
 /// Most audio tracks a recording can carry. Video is always one more track (DESIGN §6).
-pub const MAX_AUDIO_TRACKS: u8 = 6;
+pub const MAX_AUDIO_TRACKS: u8 = 7;
 
 /// An audio track's slot, below [`MAX_AUDIO_TRACKS`]. The field is private, so the only
 /// ways to make one are [`TrackId::audio`] and the named constants on [`TrackId`].
@@ -143,18 +143,21 @@ pub struct AudioTrack(u8);
 pub enum TrackId {
     /// Encoded video from the GPU pipeline.
     Video,
-    /// An audio track; slot 0 and 1 are the game and mic tracks.
+    /// An audio track; slot 0 is Master, then the game and mic tracks (D30).
     Audio(AudioTrack),
 }
 
 impl TrackId {
-    /// Track 1: game/system audio (process loopback), audio slot 0.
-    // The CamelCase names are the old variant names, kept so call sites read the same.
+    /// Audio track 1: the live mix of every enabled source, audio slot 0 (D30).
+    // CamelCase, like the variants these names replaced, so call sites read the same.
     #[allow(non_upper_case_globals)]
-    pub const GameAudio: Self = Self::Audio(AudioTrack(0));
-    /// Track 2: microphone, gated by push-to-talk, audio slot 1.
+    pub const Master: Self = Self::Audio(AudioTrack(0));
+    /// Audio track 2: game/system audio (process loopback), audio slot 1.
     #[allow(non_upper_case_globals)]
-    pub const Mic: Self = Self::Audio(AudioTrack(1));
+    pub const GameAudio: Self = Self::Audio(AudioTrack(1));
+    /// Audio track 3: microphone, gated by push-to-talk, audio slot 2.
+    #[allow(non_upper_case_globals)]
+    pub const Mic: Self = Self::Audio(AudioTrack(2));
 
     /// Number of tracks: video plus every audio slot.
     pub const COUNT: usize = 1 + MAX_AUDIO_TRACKS as usize;
@@ -167,6 +170,7 @@ impl TrackId {
         Self::Audio(AudioTrack(3)),
         Self::Audio(AudioTrack(4)),
         Self::Audio(AudioTrack(5)),
+        Self::Audio(AudioTrack(6)),
     ];
 
     /// The audio track in slot `n`, or `None` if `n` is [`MAX_AUDIO_TRACKS`] or more.
@@ -275,8 +279,9 @@ mod tests {
             assert!(track.is_audio());
             assert_eq!(track.index(), 1 + usize::from(n));
         }
-        assert_eq!(TrackId::audio(0), Some(TrackId::GameAudio));
-        assert_eq!(TrackId::audio(1), Some(TrackId::Mic));
+        assert_eq!(TrackId::audio(0), Some(TrackId::Master));
+        assert_eq!(TrackId::audio(1), Some(TrackId::GameAudio));
+        assert_eq!(TrackId::audio(2), Some(TrackId::Mic));
         assert_eq!(TrackId::audio(MAX_AUDIO_TRACKS), None);
     }
 
