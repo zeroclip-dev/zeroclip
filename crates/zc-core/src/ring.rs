@@ -16,8 +16,8 @@ use crate::media::{PacketMeta, PacketRef};
 #[derive(Clone, Copy)]
 struct Entry {
     meta: PacketMeta,
-    /// Offset of the packet's first byte in the ring.
-    start: usize,
+    /// Absolute position of the packet's first byte: the bytes written before it.
+    abs: u64,
     /// Payload length in bytes.
     len: usize,
 }
@@ -26,6 +26,10 @@ struct Entry {
 ///
 /// Both limits are hard. A push that would exceed the byte capacity or the packet
 /// count is refused and nothing is evicted, so the caller decides what to drop.
+///
+/// Every byte ever pushed has an absolute position, counted from 0. Byte `p` is stored
+/// at offset `p % capacity`, so a popped packet's bytes stay put until the writer laps
+/// them. [`copy_if_intact`](Self::copy_if_intact) uses that to detect overwritten data.
 pub struct PacketRing {
     /// The byte ring. Fixed size, zeroed on creation, never reallocated.
     bytes: Box<[u8]>,
@@ -33,10 +37,10 @@ pub struct PacketRing {
     entries: VecDeque<Entry>,
     /// Limit on `entries`. Kept here because `VecDeque` may reserve more than asked.
     max_packets: usize,
-    /// Offset of the oldest packet. Equals `entries[0].start` when non-empty.
-    head: usize,
     /// Payload bytes stored, across all packets.
     used: usize,
+    /// Payload bytes ever pushed. Never reset, not even by `clear`.
+    written: u64,
 }
 
 impl PacketRing {
@@ -51,8 +55,8 @@ impl PacketRing {
             bytes: vec![0; capacity_bytes].into_boxed_slice(),
             entries: VecDeque::with_capacity(max_packets),
             max_packets,
-            head: 0,
             used: 0,
+            written: 0,
         }
     }
 
@@ -111,15 +115,16 @@ impl PacketRing {
         if !self.has_room_for(len) {
             return false;
         }
-        // `has_room_for` guarantees capacity > 0, so this `%` can't divide by zero.
+        // `has_room_for` guarantees capacity > 0, so `offset` can't divide by zero.
         let capacity = self.capacity();
-        let tail = (self.head + self.used) % capacity;
+        let tail = Self::offset(self.written, capacity);
         // The packet may wrap: `first` bytes fit before the end, the rest go at the start.
         let first = len.min(capacity - tail);
         self.bytes[tail..tail + first].copy_from_slice(&p.data[..first]);
         self.bytes[..len - first].copy_from_slice(&p.data[first..]);
-        self.entries.push_back(Entry { meta: p.meta, start: tail, len });
+        self.entries.push_back(Entry { meta: p.meta, abs: self.written, len });
         self.used += len;
+        self.written += len as u64;
         true
     }
 
@@ -129,11 +134,6 @@ impl PacketRing {
     pub fn pop_front(&mut self) -> Option<PacketMeta> {
         let entry = self.entries.pop_front()?;
         self.used -= entry.len;
-        // An entry exists, so capacity > 0 and the `%` is safe.
-        self.head = (entry.start + entry.len) % self.capacity();
-        if self.entries.is_empty() {
-            self.head = 0;
-        }
         Some(entry.meta)
     }
 
@@ -156,17 +156,55 @@ impl PacketRing {
         self.entries.iter().map(move |entry| (entry.meta, self.pieces(*entry)))
     }
 
-    /// Drops every packet. The bytes are left as they are.
+    /// Oldest-first `(metadata, absolute position, length)` of each packet, without touching
+    /// the bytes. Pass a position to [`copy_if_intact`](Self::copy_if_intact) to copy it.
+    pub fn positions(&self) -> impl DoubleEndedIterator<Item = (PacketMeta, u64, usize)> + '_ {
+        self.entries.iter().map(|entry| (entry.meta, entry.abs, entry.len))
+    }
+
+    /// Copies the `len` bytes written at absolute position `abs` into `out`. Returns `false`,
+    /// and leaves `out` alone, if any of them has been overwritten, was never written, or if
+    /// `out` isn't `len` bytes long.
+    ///
+    /// The writer reuses byte `p` only after `capacity` more bytes have been written, so the
+    /// bytes are intact while `abs + capacity >= written`. Call this under the same lock as
+    /// [`push`](Self::push), so the check and the copy see the same bytes.
+    #[must_use]
+    pub fn copy_if_intact(&self, abs: u64, len: usize, out: &mut [u8]) -> bool {
+        let capacity = self.capacity();
+        let intact = capacity > 0
+            && len <= capacity
+            && out.len() == len
+            && abs.saturating_add(len as u64) <= self.written
+            && self.written <= abs.saturating_add(capacity as u64);
+        if !intact {
+            return false;
+        }
+        let start = Self::offset(abs, capacity);
+        let first = len.min(capacity - start);
+        out[..first].copy_from_slice(&self.bytes[start..start + first]);
+        out[first..].copy_from_slice(&self.bytes[..len - first]);
+        true
+    }
+
+    /// Drops every packet. The bytes are left as they are, and `written` keeps counting.
     pub fn clear(&mut self) {
         self.entries.clear();
-        self.head = 0;
         self.used = 0;
     }
 
     /// The one or two slices that hold `entry`'s payload, in order.
     fn pieces(&self, entry: Entry) -> [&[u8]; 2] {
-        let first = entry.len.min(self.capacity() - entry.start);
-        [&self.bytes[entry.start..entry.start + first], &self.bytes[..entry.len - first]]
+        let capacity = self.capacity();
+        let start = Self::offset(entry.abs, capacity);
+        let first = entry.len.min(capacity - start);
+        [&self.bytes[start..start + first], &self.bytes[..entry.len - first]]
+    }
+
+    /// Offset in the ring of the byte at absolute position `abs`. Needs `capacity > 0`.
+    fn offset(abs: u64, capacity: usize) -> usize {
+        // The remainder is below `capacity`, so it fits in a `usize`.
+        (abs % capacity as u64) as usize
     }
 }
 
@@ -245,5 +283,25 @@ mod tests {
         assert!(!none.push(PacketRef { meta: meta(0), data: b"" }));
         assert!(none.is_empty());
         assert_eq!(none.used(), 0);
+    }
+
+    #[test]
+    fn ring_copy_if_intact_detects_overwritten_bytes() {
+        let mut ring = PacketRing::new(10, 8);
+        assert!(ring.push(PacketRef { meta: meta(0), data: b"aaaa" }));
+        assert!(ring.push(PacketRef { meta: meta(1), data: b"bbbbbb" }));
+        // Popping leaves "aaaa" in the ring, so it can still be copied.
+        assert!(ring.pop_front().is_some());
+        let mut out = [0; 4];
+        assert!(ring.copy_if_intact(0, 4, &mut out));
+        assert_eq!(&out, b"aaaa");
+        // "cccc" lands on the bytes "aaaa" used. "bbbbbb" sits clear of them.
+        assert!(ring.push(PacketRef { meta: meta(2), data: b"cccc" }));
+        assert!(!ring.copy_if_intact(0, 4, &mut out), "overwritten");
+        let mut b = [0; 6];
+        assert!(ring.copy_if_intact(4, 6, &mut b));
+        assert_eq!(&b, b"bbbbbb");
+        // A buffer of the wrong length is refused, not truncated.
+        assert!(!ring.copy_if_intact(4, 6, &mut out));
     }
 }
