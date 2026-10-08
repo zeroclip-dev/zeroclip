@@ -23,6 +23,7 @@
 
 mod actor;
 pub mod recorder;
+pub mod spool;
 pub mod synthetic;
 
 pub use actor::{Engine, EngineConfig, EngineError, EngineHandle, Ports};
