@@ -39,6 +39,9 @@ pub struct Ports {
     pub game_audio: Option<Box<dyn AudioSource>>,
     /// Microphone (`zc-audio`, Phase 2).
     pub mic: Option<Box<dyn AudioSource>>,
+    /// The Master mix, track 1 (`zc-audio`, D30). Starts after the sources above, and only if
+    /// one of them started.
+    pub master_audio: Option<Box<dyn AudioSource>>,
     /// Raw Input hotkeys + foreground tracking (`zc-input`, Phase 2).
     pub input: Option<Box<dyn InputSource>>,
     /// Drive-type probe for the output folder (`zc-win`, P3.23). Without it the drive is
@@ -54,6 +57,7 @@ impl fmt::Debug for Ports {
             .field("video", &self.video.is_some())
             .field("game_audio", &self.game_audio.is_some())
             .field("mic", &self.mic.is_some())
+            .field("master_audio", &self.master_audio.is_some())
             .field("input", &self.input.is_some())
             .field("seek_penalty", &self.seek_penalty.is_some())
             .field("lock_memory", &self.lock_memory.is_some())
@@ -210,6 +214,11 @@ impl Drop for EngineHandle {
 /// gameplay can't postpone it.
 const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long a save waits before it copies the buffer, when the Master mix runs. The mix trails
+/// real time by 200 ms (D30). Waiting this long lets it reach the press, where the clip ends,
+/// and the extra 100 ms covers a late wake-up of the mixer thread.
+const MASTER_CATCH_UP: Duration = Duration::from_millis(300);
+
 /// State owned by the engine thread.
 struct Actor {
     settings: Settings,
@@ -224,7 +233,8 @@ struct Actor {
     recorder: Arc<Recorder>,
     /// The recorder's counters at the last tick, so a rise is reported once.
     stats_seen: RecorderStats,
-    /// Audio tracks that started, game audio first. The containers take them (P3.19).
+    /// Audio tracks that started: Master first when it runs, then the sources. The containers
+    /// take them (P3.19).
     audio_tracks: Vec<TrackInfo>,
     hotkeys: ChordMatcher<HotkeyAction>,
     /// The one recording in progress, if any (D20).
@@ -342,15 +352,17 @@ fn file_stamp(t: OffsetDateTime) -> String {
     t.format(format).unwrap_or_else(|_| t.unix_timestamp().to_string())
 }
 
-/// Snapshots the DVR window and writes it to a new clip file. Runs on the clip's IO thread, so
-/// the snapshot's short lock holds and the paced disk write both stay off the actor (D29).
+/// Snapshots the DVR window that ends at `end` and writes it to a new clip file. Runs on the
+/// clip's IO thread, so the snapshot's short lock holds and the paced disk write both stay off
+/// the actor (D29).
 fn save_clip_file(
     recorder: &Recorder,
     window: Hns,
+    end: Hns,
     cfg: &OutputConfig,
     tracks: &[TrackInfo],
 ) -> Result<(PathBuf, Hns), ClipError> {
-    let clip = recorder.snapshot(window).map_err(|e| match e {
+    let clip = recorder.snapshot_until(window, end).map_err(|e| match e {
         DvrError::Empty => ClipError::NothingBuffered,
         other => ClipError::Failed(other.to_string()),
     })?;
@@ -468,7 +480,7 @@ impl Actor {
             return;
         }
         let video = self.ports.video.is_some().then_some(TrackId::Video);
-        let audio = [&self.ports.game_audio, &self.ports.mic]
+        let audio = [&self.ports.game_audio, &self.ports.mic, &self.ports.master_audio]
             .into_iter()
             .filter_map(|source| source.as_ref().map(|source| source.track()));
         let tracks: Vec<TrackId> = video.into_iter().chain(audio).collect();
@@ -516,8 +528,9 @@ impl Actor {
         }
     }
 
-    /// Both audio tracks: 48 kHz stereo AAC at the configured bitrate. Game audio starts
-    /// first, so it is the first audio track (browsers and Discord play only that one).
+    /// The audio tracks: 48 kHz stereo AAC at the configured bitrate. The sources start first,
+    /// then the Master mix, which runs only if one of them did (D30). Master leads
+    /// `audio_tracks`, so it is the first audio track: browsers and Discord play only that one.
     fn start_audio(&mut self) {
         let config = AudioStart {
             sample_rate: 48_000,
@@ -528,21 +541,33 @@ impl Actor {
         let sink: SharedSink = self.recorder.clone();
         let gate_open = self.settings.audio.mic == MicMode::AlwaysOn;
         let mut errors = Vec::new();
+        let mut tracks = Vec::new();
         if let Some(game) = self.ports.game_audio.as_mut() {
             match game.start(&config, Arc::clone(&sink), Arc::clone(&health)) {
-                Ok(()) => self.audio_tracks.push(audio_track(game.track(), "Game", &config)),
+                Ok(()) => tracks.push(audio_track(game.track(), "Game", &config)),
                 Err(e) => errors.push(format!("Game audio unavailable: {e}")),
             }
         }
         if let Some(mic) = self.ports.mic.as_mut() {
-            match mic.start(&config, sink, health) {
+            match mic.start(&config, Arc::clone(&sink), Arc::clone(&health)) {
                 Ok(()) => {
                     mic.set_gate(gate_open);
-                    self.audio_tracks.push(audio_track(mic.track(), "Microphone", &config));
+                    tracks.push(audio_track(mic.track(), "Microphone", &config));
                 }
                 Err(e) => errors.push(format!("Microphone unavailable: {e}")),
             }
         }
+        // Only when a source runs, so Master is never a track of silence alone. It starts after
+        // them, so its mix point is set before any source writes (D30).
+        if !tracks.is_empty()
+            && let Some(master) = self.ports.master_audio.as_mut()
+        {
+            match master.start(&config, sink, health) {
+                Ok(()) => tracks.insert(0, audio_track(master.track(), "Master", &config)),
+                Err(e) => errors.push(format!("Master mix unavailable: {e}")),
+            }
+        }
+        self.audio_tracks = tracks;
         for error in errors {
             self.emit(EngineEvent::Error(error));
         }
@@ -566,11 +591,12 @@ impl Actor {
     }
 
     fn stop_sources(&mut self) {
-        let Ports { video, game_audio, mic, input, .. } = &mut self.ports;
+        let Ports { video, game_audio, mic, master_audio, input, .. } = &mut self.ports;
         if let Some(input) = input {
             input.stop();
         }
-        for audio in [game_audio, mic].into_iter().flatten() {
+        // Master last: it still mixes what the sources wrote before they stopped.
+        for audio in [game_audio, mic, master_audio].into_iter().flatten() {
             audio.stop();
         }
         if let Some(video) = video {
@@ -784,12 +810,23 @@ impl Actor {
             std::iter::once(video).chain(self.audio_tracks.iter().cloned()).collect();
         let cfg = OutputConfig::from_settings(&self.settings, self.output_dir.clone(), self.drive);
         let window = self.status.buffer_window;
+        // The clip ends at the press. The Master mix trails real time (D30), so when it runs the
+        // copy waits until the mix has reached that point.
+        let end = self.recorder.video_end();
+        let catch_up = if self.audio_tracks.iter().any(|t| t.track == TrackId::Master) {
+            MASTER_CATCH_UP
+        } else {
+            Duration::ZERO
+        };
         let recorder = Arc::clone(&self.recorder);
         let inbox = self.inbox.clone();
         let spawned = thread::Builder::new().name("zc-io-clip".into()).spawn(move || {
             // A panic must still report back, or `saving` stays set and refuses every later save.
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                save_clip_file(&recorder, window, &cfg, &tracks)
+                if !catch_up.is_zero() {
+                    thread::sleep(catch_up);
+                }
+                save_clip_file(&recorder, window, end, &cfg, &tracks)
             }))
             .unwrap_or_else(|_| Err(ClipError::Failed("the clip thread panicked".into())));
             // Fails only while the engine is shutting down, when nobody needs the result.
@@ -1069,7 +1106,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("zeroclip-clip-empty-{}", std::process::id()));
         let cfg = OutputConfig::from_settings(&Settings::default(), dir.clone(), DriveKind::Ssd);
         let recorder = Recorder::new(DvrConfig { video_bytes: 10_000_000, audio_bytes: 1_000_000 });
-        let result = save_clip_file(&recorder, Hns::from_secs(60), &cfg, &[]);
+        let result = save_clip_file(&recorder, Hns::from_secs(60), Hns::from_secs(60), &cfg, &[]);
         assert!(matches!(result, Err(ClipError::NothingBuffered)));
         assert!(!dir.exists(), "the file is only created once there is a clip to write");
     }
@@ -1220,6 +1257,85 @@ mod tests {
         let state = game.0.lock().unwrap();
         assert_eq!(state.0, 1, "started once");
         assert_eq!(state.1, [Some(42)]);
+    }
+
+    /// An audio source that pushes a 20 ms synthetic packet of its track about every 20 ms, from
+    /// its own thread, until stopped. Real time, so the packets line up with the synthetic video.
+    struct FeedAudio {
+        track: zc_core::TrackId,
+        halt: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl FeedAudio {
+        fn new(track: zc_core::TrackId) -> Self {
+            Self { track, halt: Arc::new(AtomicBool::new(false)), thread: None }
+        }
+    }
+
+    impl AudioSource for FeedAudio {
+        fn track(&self) -> zc_core::TrackId {
+            self.track
+        }
+        fn start(
+            &mut self,
+            _: &AudioStart,
+            sink: SharedSink,
+            _: Emit<HealthEvent>,
+        ) -> Result<(), SourceError> {
+            let halt = Arc::new(AtomicBool::new(false));
+            self.halt = Arc::clone(&halt);
+            let track = self.track;
+            self.thread = Some(thread::spawn(move || {
+                let mut stream = zc_core::testing::SyntheticStream::new();
+                while !halt.load(Ordering::Relaxed) {
+                    sink.push(stream.next_audio(track).view());
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }));
+            Ok(())
+        }
+        fn stop(&mut self) {
+            self.halt.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    #[test]
+    fn master_leads_the_audio_tracks_of_a_saved_clip() {
+        let dir = std::env::temp_dir().join(format!("zeroclip-master-{}", std::process::id()));
+        let mut settings = Settings::default();
+        settings.recording.output_dir = Some(dir.clone());
+        let config = EngineConfig { settings, default_output_dir: dir.clone() };
+        let ports = Ports {
+            video: Some(Box::new(SyntheticVideoSource::new().realtime(true))),
+            game_audio: Some(Box::new(FeedAudio::new(zc_core::TrackId::GameAudio))),
+            master_audio: Some(Box::new(FeedAudio::new(zc_core::TrackId::Master))),
+            ..Ports::default()
+        };
+        let engine = Engine::spawn(config, ports, Arc::new(|()| {})).expect("spawn");
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Status(s) if s.buffered >= zc_core::Hns::from_secs(1)),
+        );
+        engine.send(Command::SaveClip).unwrap();
+        let event = wait_for(&engine, |e| matches!(e, EngineEvent::ClipSaved { .. }));
+        let EngineEvent::ClipSaved { path, .. } = event else { unreachable!() };
+        engine.shutdown();
+
+        // A track's name is in its handler box, in declaration order, so the first mention of
+        // each name says where that track is declared.
+        let file = std::fs::read(&path).expect("the clip is readable");
+        let first = |name: &[u8]| {
+            file.windows(name.len())
+                .position(|w| w == name)
+                .unwrap_or_else(|| panic!("{} is not in the clip", String::from_utf8_lossy(name)))
+        };
+        assert!(first(b"Video") < first(b"Master"), "video is track 0");
+        assert!(first(b"Master") < first(b"Game"), "Master is the first audio track");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

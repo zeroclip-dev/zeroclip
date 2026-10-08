@@ -3,11 +3,11 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Button, ComboBox, DragValue, Grid, TextEdit};
+use eframe::egui::{self, Button, ComboBox, DragValue, Grid, Slider, TextEdit};
 use zc_audio::MicDevice;
 use zc_core::hotkey::Chord;
 use zc_core::media::{Codec, ContainerFormat};
-use zc_core::settings::{AAC_BITRATES_KBPS, MicMode, Settings};
+use zc_core::settings::{AAC_BITRATES_KBPS, MIX_GAIN_DB, MicMode, Settings};
 
 use super::{dvr_megabytes, human_duration};
 use crate::app::ZeroClipApp;
@@ -257,7 +257,24 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
                         }
                     });
             });
-            ui.weak("Turning game audio or the microphone on or off, or changing the microphone, takes effect the next time ZeroClip starts.");
+            ui.add_space(4.0);
+            ui.strong("Master track (track 1)");
+            ui.weak("The live mix players and Discord play. Each level sets how loud that source is in it.");
+            ui.horizontal(|ui| {
+                ui.label("Game level");
+                ui.add_enabled(
+                    audio.game_audio,
+                    Slider::new(&mut audio.mix_gain_db.game, MIX_GAIN_DB).suffix(" dB"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Microphone level");
+                ui.add_enabled(
+                    audio.mic != MicMode::Off,
+                    Slider::new(&mut audio.mix_gain_db.mic, MIX_GAIN_DB).suffix(" dB"),
+                );
+            });
+            ui.weak("Turning game audio or the microphone on or off, changing the microphone, or changing a Master level takes effect the next time ZeroClip starts.");
         });
 
         section(ui, "Hotkeys", |ui| {

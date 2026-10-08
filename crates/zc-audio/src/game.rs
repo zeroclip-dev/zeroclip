@@ -22,6 +22,7 @@ use windows::Win32::System::Variant::VT_BLOB;
 use windows::core::{IUnknown, Interface, Ref, implement};
 use zc_core::Hns;
 use zc_core::media::TrackId;
+use zc_core::mix::MixInput;
 use zc_core::ports::{AudioSource, AudioStart, Emit, SourceError};
 use zc_core::sink::SharedSink;
 use zc_core::watchdog::HealthEvent;
@@ -45,6 +46,8 @@ use crate::capture::{Encode, Mmcss, Stream, Worker, pcm16_format};
 pub struct GameAudioSource {
     /// The target pid; 0 means none (pid 0 is the Idle process, never a game).
     target: Arc<AtomicU32>,
+    /// This source's input in the Master mix (D30), if it has one.
+    mix: Option<MixInput>,
     worker: Option<Worker>,
 }
 
@@ -53,6 +56,14 @@ impl GameAudioSource {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Puts this source in the Master mix as `mix`. Set it before `start`. `None` keeps the
+    /// source out of the mix.
+    #[must_use]
+    pub fn with_mix(mut self, mix: Option<MixInput>) -> Self {
+        self.mix = mix;
+        self
     }
 
     /// The process tree being captured.
@@ -179,12 +190,12 @@ impl AudioSource for GameAudioSource {
         _health: Emit<HealthEvent>,
     ) -> Result<(), SourceError> {
         self.stop();
-        let (config, target) = (*config, Arc::clone(&self.target));
+        let (config, target, mix) = (*config, Arc::clone(&self.target), self.mix.clone());
         self.worker = Some(Worker::spawn("zc-game-audio", move |stop, ready| {
             let setup = (|| {
                 let apartment = Apartment::multithreaded()?;
                 let mf = MediaFoundation::start()?;
-                let encode = Encode::new(TrackId::GameAudio, &config)?;
+                let encode = Encode::new(TrackId::GameAudio, &config)?.with_mix(mix);
                 Ok((apartment, mf, encode))
             })();
             let (_apartment, _mf, mut encode) = match setup {
