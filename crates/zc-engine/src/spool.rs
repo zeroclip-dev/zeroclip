@@ -140,12 +140,17 @@ pub fn spool_with_capacity(bytes: usize) -> (SpoolWriter, SpoolReader) {
 /// drops that suffix. If anything fails, the `.partial` file is left in place for the
 /// startup repair (P3.22a).
 ///
+/// The rename replaces whatever is at the final name (`std::fs::rename` does on Windows),
+/// so `drain` refuses to rename over a file that has data in it. `output::create_recording`
+/// reserves the final name with an empty placeholder, so the file this replaces is normally
+/// that placeholder.
+///
 /// Returns the final path and the recording's duration, from the first video packet to
 /// the end of the last one.
 ///
 /// # Errors
 /// I/O errors from `out`, from `finish` or from the rename. `InvalidInput` if `partial`
-/// doesn't end in `.partial`.
+/// doesn't end in `.partial`. `AlreadyExists` if the final name holds a non-empty file.
 pub fn drain(
     reader: SpoolReader,
     mut out: Box<dyn ContainerWriter>,
@@ -169,9 +174,21 @@ pub fn drain(
     }
     out.finish()?;
     let duration = first_video.map_or(Hns::ZERO, |first| last_video_end - first);
-    let final_path = partial.with_extension("");
-    std::fs::rename(partial, &final_path)?;
-    Ok((final_path, duration))
+    let destination = final_path(partial);
+    if std::fs::metadata(&destination).is_ok_and(|meta| meta.len() > 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} already exists", destination.display()),
+        ));
+    }
+    std::fs::rename(partial, &destination)?;
+    Ok((destination, duration))
+}
+
+/// The name a recording gets once it is finished: `partial` without its `.partial` suffix.
+#[must_use]
+pub(crate) fn final_path(partial: &Path) -> PathBuf {
+    partial.with_extension("")
 }
 
 #[cfg(test)]
@@ -314,6 +331,44 @@ mod tests {
         assert!(partial.exists(), "the partial file stays for the startup repair");
         assert!(!dir.join("clip.mp4").exists());
         assert!(!seen.lock().expect("test lock").finished);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drain_never_replaces_a_file_with_data() {
+        let (writer, reader) = spool();
+        drop(writer);
+
+        let dir = scratch_dir("no-replace");
+        let partial = dir.join("clip.mp4.partial");
+        std::fs::write(&partial, b"recording").expect("partial file");
+        let finished = dir.join("clip.mp4");
+        std::fs::write(&finished, b"an earlier clip").expect("finished clip");
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let container = FakeContainer { seen: Arc::clone(&seen), fail_after: None };
+
+        let err = drain(reader, Box::new(container), &partial).expect_err("refused");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&finished).expect("finished clip"), b"an earlier clip");
+        assert_eq!(std::fs::read(&partial).expect("partial file"), b"recording");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drain_replaces_an_empty_placeholder() {
+        let (writer, reader) = spool();
+        drop(writer);
+
+        let dir = scratch_dir("placeholder");
+        let partial = dir.join("clip.mp4.partial");
+        std::fs::write(&partial, b"").expect("partial file");
+        std::fs::write(dir.join("clip.mp4"), b"").expect("placeholder");
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let container = FakeContainer { seen, fail_after: None };
+
+        let (path, _) = drain(reader, Box::new(container), &partial).expect("drain");
+        assert_eq!(path, dir.join("clip.mp4"));
+        assert!(!partial.exists(), "renamed over the placeholder");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
