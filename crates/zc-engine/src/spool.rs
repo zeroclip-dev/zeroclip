@@ -173,6 +173,10 @@ pub fn drain(
         }
     }
     out.finish()?;
+    // The recording still plays without its length in the mehd, so a failure is only logged.
+    if let Err(error) = zc_mux::repair::set_fragment_duration(partial) {
+        tracing::warn!(error = %error, "could not set a recording's length");
+    }
     let duration = first_video.map_or(Hns::ZERO, |first| last_video_end - first);
     let destination = final_path(partial);
     if std::fs::metadata(&destination).is_ok_and(|meta| meta.len() > 0) {
