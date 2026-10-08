@@ -5,14 +5,14 @@
 //! when they're real video: every synthetic payload starts with its sequence
 //! number, so a test can assert exactly which frames survived eviction.
 
-use crate::media::{Packet, PacketMeta, TrackId};
+use crate::media::{MAX_AUDIO_TRACKS, Packet, PacketMeta, TrackId};
 use crate::time::Hns;
 
 /// A synthetic A/V stream: numbered video frames with a fixed GOP length, plus
-/// two audio tracks of fixed-size packets.
+/// fixed-size audio packets on up to [`MAX_AUDIO_TRACKS`] audio tracks.
 ///
 /// Defaults: 60 fps, 60-frame (1 s) GOPs, 1,000-byte frames; audio packets of
-/// 20 ms and 480 bytes (192 kbps) on both [`TrackId::GameAudio`] and [`TrackId::Mic`].
+/// 20 ms and 480 bytes (192 kbps) on two tracks, [`TrackId::GameAudio`] and [`TrackId::Mic`].
 ///
 /// Payload layout: bytes 0..4 hold the sequence number (little-endian `u32`, the
 /// frame number for video), byte 4 the track index, the rest is filler.
@@ -23,8 +23,9 @@ pub struct SyntheticStream {
     frame_bytes: usize,
     audio_packet: Hns,
     audio_bytes: usize,
+    audio_tracks: u8,
     next_frame: u32,
-    next_audio: [u32; 2],
+    next_audio: [u32; MAX_AUDIO_TRACKS as usize],
 }
 
 impl Default for SyntheticStream {
@@ -43,8 +44,9 @@ impl SyntheticStream {
             frame_bytes: 1_000,
             audio_packet: Hns::from_millis(20),
             audio_bytes: 480,
+            audio_tracks: 2,
             next_frame: 0,
-            next_audio: [0; 2],
+            next_audio: [0; MAX_AUDIO_TRACKS as usize],
         }
     }
 
@@ -68,6 +70,18 @@ impl SyntheticStream {
     #[must_use]
     pub fn frame_bytes(mut self, bytes: usize) -> Self {
         self.frame_bytes = bytes.max(5);
+        self
+    }
+
+    /// Sets how many audio tracks to produce, from [`TrackId::GameAudio`] up
+    /// (`0..=MAX_AUDIO_TRACKS`). Defaults to 2.
+    ///
+    /// # Panics
+    /// If `n` is more than [`MAX_AUDIO_TRACKS`].
+    #[must_use]
+    pub fn audio_tracks(mut self, n: u8) -> Self {
+        assert!(n <= MAX_AUDIO_TRACKS, "at most {MAX_AUDIO_TRACKS} audio tracks");
+        self.audio_tracks = n;
         self
     }
 
@@ -106,7 +120,7 @@ impl SyntheticStream {
         }
     }
 
-    /// The next audio packet of `track` (`GameAudio` or `Mic`).
+    /// The next audio packet of `track`.
     ///
     /// # Panics
     /// If `track` is [`TrackId::Video`].
@@ -132,24 +146,28 @@ impl SyntheticStream {
     pub fn until(&mut self, until: Hns) -> Vec<Packet> {
         let mut out = Vec::new();
         loop {
-            let video_pts = self.now();
-            let audio_pts =
-                [0, 1].map(|i| Hns(self.audio_packet.ticks() * i64::from(self.next_audio[i])));
-            let next = [video_pts, audio_pts[0], audio_pts[1]];
-            let (which, pts) = next
+            // `ALL` lists video first, and `min_by_key` keeps the first minimum: video wins ties.
+            let active = &TrackId::ALL[..=usize::from(self.audio_tracks)];
+            let (track, pts) = active
                 .iter()
-                .copied()
-                .enumerate()
-                .min_by_key(|&(i, pts)| (pts, i))
-                .unwrap_or((0, until));
+                .map(|&t| (t, self.next_pts(t)))
+                .min_by_key(|&(_, pts)| pts)
+                .unwrap_or((TrackId::Video, until));
             if pts >= until {
                 return out;
             }
-            out.push(match which {
-                0 => self.next_video(),
-                1 => self.next_audio(TrackId::GameAudio),
-                _ => self.next_audio(TrackId::Mic),
+            out.push(match track {
+                TrackId::Video => self.next_video(),
+                _ => self.next_audio(track),
             });
+        }
+    }
+
+    /// PTS of the next packet on `track`.
+    fn next_pts(&self, track: TrackId) -> Hns {
+        match track {
+            TrackId::Video => self.now(),
+            _ => Hns(self.audio_packet.ticks() * i64::from(self.next_audio[track.index() - 1])),
         }
     }
 
@@ -173,7 +191,7 @@ impl SyntheticStream {
 fn payload(seq: u32, track: TrackId, len: usize) -> Vec<u8> {
     let mut data = vec![0xAB; len.max(5)];
     data[..4].copy_from_slice(&seq.to_le_bytes());
-    #[expect(clippy::cast_possible_truncation, reason = "track index is 0..3")]
+    #[expect(clippy::cast_possible_truncation, reason = "track index is 0..=6")]
     let track_byte = track.index() as u8;
     data[4] = track_byte;
     data
@@ -215,5 +233,18 @@ mod tests {
         // Continues where it stopped.
         let more = s.take_secs(1);
         assert_eq!(SyntheticStream::sequence_number(&more[0].data), 120);
+    }
+
+    #[test]
+    fn audio_track_count_is_configurable() {
+        let packets = SyntheticStream::new().audio_tracks(4).take_secs(1);
+        let count = |n| {
+            let track = TrackId::audio(n).expect("in range");
+            packets.iter().filter(|p| p.meta.track == track).count()
+        };
+        assert_eq!(count(3), 50, "20 ms packets, fourth audio track");
+        assert_eq!(count(4), 0, "no fifth audio track");
+        let video_only = SyntheticStream::new().audio_tracks(0).take_secs(1);
+        assert!(video_only.iter().all(|p| p.meta.track == TrackId::Video));
     }
 }

@@ -107,7 +107,7 @@ by pulling the network cable resumes and completes with no local file deleted be
 Spread over the phases above; the cards are P2.24, P3.0a (do it before P3.1), P4.18
 and P5.14.
 
-- [ ] Generalise `TrackId` (P3.0a)
+- [x] Generalise `TrackId` (P3.0a)
 - [ ] `AppAudioSource`: one track per chosen app (P2.24)
 - [ ] Audio tracks tab in Settings (P4.18)
 - [ ] Track mixer in the editor: volume, mute, solo, mixed export (P5.14)

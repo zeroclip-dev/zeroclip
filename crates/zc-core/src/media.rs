@@ -84,30 +84,59 @@ impl ContainerFormat {
     }
 }
 
-/// The three tracks every recording carries (DESIGN §6).
+/// Most audio tracks a recording can carry. Video is always one more track (DESIGN §6).
+pub const MAX_AUDIO_TRACKS: u8 = 6;
+
+/// An audio track's slot, below [`MAX_AUDIO_TRACKS`]. The field is private, so the only
+/// ways to make one are [`TrackId::audio`] and the named constants on [`TrackId`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AudioTrack(u8);
+
+/// The tracks of a recording: one video track and up to [`MAX_AUDIO_TRACKS`] audio
+/// tracks (DESIGN §6). Labels such as "Game" live in `zc_mux::TrackInfo`, not here,
+/// so this type stays `Copy` and allocation-free.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TrackId {
     /// Encoded video from the GPU pipeline.
     Video,
-    /// Track 1: game/system audio (process loopback).
-    GameAudio,
-    /// Track 2: microphone, gated by push-to-talk.
-    Mic,
+    /// An audio track; slot 0 and 1 are the game and mic tracks.
+    Audio(AudioTrack),
 }
 
 impl TrackId {
-    /// Number of tracks.
-    pub const COUNT: usize = 3;
-    /// All tracks, in index order.
-    pub const ALL: [Self; Self::COUNT] = [Self::Video, Self::GameAudio, Self::Mic];
+    /// Track 1: game/system audio (process loopback), audio slot 0.
+    // The CamelCase names are the old variant names, kept so call sites read the same.
+    #[allow(non_upper_case_globals)]
+    pub const GameAudio: Self = Self::Audio(AudioTrack(0));
+    /// Track 2: microphone, gated by push-to-talk, audio slot 1.
+    #[allow(non_upper_case_globals)]
+    pub const Mic: Self = Self::Audio(AudioTrack(1));
+
+    /// Number of tracks: video plus every audio slot.
+    pub const COUNT: usize = 1 + MAX_AUDIO_TRACKS as usize;
+    /// All tracks, in index order: video, then audio slots 0 and up.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Video,
+        Self::Audio(AudioTrack(0)),
+        Self::Audio(AudioTrack(1)),
+        Self::Audio(AudioTrack(2)),
+        Self::Audio(AudioTrack(3)),
+        Self::Audio(AudioTrack(4)),
+        Self::Audio(AudioTrack(5)),
+    ];
+
+    /// The audio track in slot `n`, or `None` if `n` is [`MAX_AUDIO_TRACKS`] or more.
+    #[must_use]
+    pub const fn audio(n: u8) -> Option<Self> {
+        if n < MAX_AUDIO_TRACKS { Some(Self::Audio(AudioTrack(n))) } else { None }
+    }
 
     /// Dense index, for per-track arrays.
     #[must_use]
     pub const fn index(self) -> usize {
         match self {
             Self::Video => 0,
-            Self::GameAudio => 1,
-            Self::Mic => 2,
+            Self::Audio(AudioTrack(n)) => 1 + n as usize,
         }
     }
 
@@ -190,6 +219,21 @@ mod tests {
         }
         assert!(!TrackId::Video.is_audio());
         assert!(TrackId::Mic.is_audio());
+    }
+
+    #[test]
+    fn track_indices_are_dense_for_all_audio_tracks() {
+        for (i, t) in TrackId::ALL.iter().enumerate() {
+            assert_eq!(t.index(), i);
+        }
+        for n in 0..MAX_AUDIO_TRACKS {
+            let track = TrackId::audio(n).expect("slot below the maximum");
+            assert!(track.is_audio());
+            assert_eq!(track.index(), 1 + usize::from(n));
+        }
+        assert_eq!(TrackId::audio(0), Some(TrackId::GameAudio));
+        assert_eq!(TrackId::audio(1), Some(TrackId::Mic));
+        assert_eq!(TrackId::audio(MAX_AUDIO_TRACKS), None);
     }
 
     #[test]
