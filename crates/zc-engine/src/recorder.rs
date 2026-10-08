@@ -14,12 +14,16 @@
 //! thread does the actual writes).
 
 use std::sync::{Mutex, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use zc_core::dvr::{DvrBuffer, DvrClip, DvrConfig, DvrError};
+use zc_core::dvr::{DvrBuffer, DvrClip, DvrConfig, DvrError, SnapshotCopy};
 use zc_core::media::{PacketMeta, PacketRef, TrackId};
 use zc_core::sink::{PacketSink, PacketWriter, SinkId, Tee};
 use zc_core::time::{Hns, MasterClock};
+
+/// Payload copied per lock hold by [`Recorder::snapshot`]. Each hold stays well under the
+/// 5 ms target from D29, so encoder and audio threads never wait long for the lock.
+const SNAPSHOT_CHUNK_BYTES: usize = 4 << 20;
 
 /// Counters for things that went wrong on the hot path. Read by the engine and
 /// turned into health events / UI warnings off the hot path.
@@ -67,21 +71,34 @@ impl Recorder {
 
     /// Copies out the last `window` of the DVR buffer (see [`DvrBuffer::snapshot`]).
     ///
-    /// The copy runs under the recorder lock, so every source waits for it. Its
-    /// duration is logged at debug level (D19 asks for this measurement).
+    /// The lock is held only to plan the copy and then for each chunk of at most
+    /// `SNAPSHOT_CHUNK_BYTES`, so sources keep pushing in between. A packet the writer
+    /// laps during the copy is left out, and the clip starts at the next keyframe (D29).
+    /// The longest hold and the total time are logged at debug level.
     ///
     /// # Errors
-    /// [`DvrError::Empty`] if nothing has been recorded yet.
+    /// [`DvrError::Empty`] if nothing has been recorded yet, and [`DvrError::Changed`] if
+    /// the buffer was cleared or resized during the copy.
     pub fn snapshot(&self, window: Hns) -> Result<DvrClip, DvrError> {
         let started = Instant::now();
-        let result = self.lock().dvr.snapshot(window);
-        // The guard was a temporary of the statement above, so the lock is free by now.
+        let (plan, held) = self.held(|state| state.dvr.plan_snapshot(window));
+        let mut longest_hold = held;
+        // Allocating (and pre-faulting) the clip's buffers happens outside the lock.
+        let mut copy = SnapshotCopy::new(plan?);
+        while !copy.is_done() {
+            let (result, held) =
+                self.held(|state| copy.copy_chunk(&state.dvr, SNAPSHOT_CHUNK_BYTES));
+            longest_hold = longest_hold.max(held);
+            result?;
+        }
+        let clip = copy.finish();
         tracing::debug!(
-            elapsed_ms = started.elapsed().as_millis(),
-            packets = result.as_ref().map_or(0, |clip| clip.packets.len()),
-            "DVR snapshot copied (recorder lock held)"
+            total = ?started.elapsed(),
+            longest_hold = ?longest_hold,
+            packets = clip.packets.len(),
+            "DVR snapshot copied in short lock holds"
         );
-        result
+        Ok(clip)
     }
 
     /// Span of video the DVR buffer holds, for the status bar (see [`DvrBuffer::buffered`]).
@@ -111,6 +128,14 @@ impl Recorder {
         // half-written packet in a ring), so recover instead of cascading the panic.
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// Runs `f` on the state under the lock. Returns its result and how long the lock was held.
+    fn held<T>(&self, f: impl FnOnce(&mut State) -> T) -> (T, Duration) {
+        let mut state = self.lock();
+        let since = Instant::now();
+        let result = f(&mut state);
+        (result, since.elapsed())
+    }
 }
 
 impl PacketSink for Recorder {
@@ -137,9 +162,81 @@ impl PacketSink for Recorder {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    use zc_core::media::Packet;
     use zc_core::testing::SyntheticStream;
 
     use super::*;
+
+    /// Checks a clip the way a player would: it starts on a keyframe, its video runs on
+    /// without a gap, and every packet is the one the stream made, unchanged.
+    fn assert_clip_is_intact(clip: &DvrClip) {
+        let stream = SyntheticStream::new();
+        let video: Vec<&Packet> = clip.video().collect();
+        assert!(video.first().is_some_and(|p| p.meta.keyframe), "a clip starts on a keyframe");
+        for pair in video.windows(2) {
+            let (before, after) = (&pair[0].data, &pair[1].data);
+            assert_eq!(
+                SyntheticStream::sequence_number(after),
+                SyntheticStream::sequence_number(before) + 1,
+                "no video frame may be missing"
+            );
+        }
+        for packet in &clip.packets {
+            let n = SyntheticStream::sequence_number(&packet.data);
+            let expected = match packet.meta.track {
+                TrackId::Video => stream.frame_pts(n),
+                _ => Hns(Hns::from_millis(20).ticks() * i64::from(n)),
+            };
+            assert_eq!(
+                packet.meta.pts, expected,
+                "{:?} packet {n} is misplaced",
+                packet.meta.track
+            );
+            // Payload layout: sequence number, track index, then filler that must survive.
+            assert_eq!(packet.data[4], packet.meta.track.index() as u8, "packet {n}: track byte");
+            assert!(packet.data[5..].iter().all(|&b| b == 0xAB), "packet {n} was overwritten");
+        }
+        assert!(clip.packets.windows(2).all(|w| w[0].meta.pts <= w[1].meta.pts));
+    }
+
+    #[test]
+    fn snapshot_clip_stays_intact_while_another_thread_pushes() {
+        // Tight rings, so the writer laps the oldest packets of a snapshot now and then.
+        let recorder = Recorder::new(DvrConfig { video_bytes: 200_000, audio_bytes: 50_000 });
+        let mut stream = SyntheticStream::new();
+        for p in stream.take_secs(4) {
+            recorder.push(p.view());
+        }
+        let stop = AtomicBool::new(false);
+        let mut clips = 0;
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    for p in stream.take_secs(1) {
+                        recorder.push(p.view());
+                        // Pacing: a writer that never sleeps can starve the snapshot of the lock.
+                        thread::sleep(Duration::from_micros(200));
+                    }
+                }
+            });
+            for _ in 0..30 {
+                match recorder.snapshot(Hns::from_secs(1)) {
+                    Ok(clip) => {
+                        assert_clip_is_intact(&clip);
+                        clips += 1;
+                    }
+                    // The writer lapped every keyframe in the plan. Nothing to start from.
+                    Err(DvrError::Empty) => {}
+                    Err(other) => panic!("snapshot failed: {other}"),
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        assert!(clips > 0, "no snapshot succeeded, so nothing was checked");
+    }
 
     #[test]
     fn recorder_maps_capture_time_onto_the_session_timeline() {
