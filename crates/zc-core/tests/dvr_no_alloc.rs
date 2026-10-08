@@ -1,7 +1,7 @@
 //! Hot-path code must not allocate (CLAUDE.md rule 2; DESIGN §5: "All modes share
 //! one zero-allocation encode loop"). These tests swap in a counting global
-//! allocator and check the DVR push, hotkey matching, the mic DSP and the audio
-//! timeline.
+//! allocator and check the DVR push, the packet ring, hotkey matching, the mic DSP
+//! and the audio timeline.
 //!
 //! It lives in its own integration-test binary because a `#[global_allocator]`
 //! applies to the whole binary.
@@ -13,6 +13,8 @@ use zc_core::Hns;
 use zc_core::dsp::{Compressor, CompressorParams};
 use zc_core::dvr::{DvrBuffer, DvrConfig};
 use zc_core::hotkey::{Binding, Chord, ChordMatcher, Key, Trigger};
+use zc_core::media::{PacketMeta, PacketRef, TrackId};
+use zc_core::ring::PacketRing;
 use zc_core::testing::SyntheticStream;
 use zc_core::time::SampleTimeline;
 
@@ -127,6 +129,26 @@ fn sample_timeline_place_never_allocates() {
         }
     });
     assert_eq!(allocations, 0, "SampleTimeline::place allocated {allocations} times");
+}
+
+#[test]
+fn ring_push_and_pop_never_allocate() {
+    // 3-byte packets in a 10-byte ring: most pushes wrap, and some are refused.
+    let mut ring = PacketRing::new(10, 4);
+    let payload = [7_u8; 3];
+    // Reserved up front, as the spool does; `pop_front_into` must not grow it.
+    let mut out = Vec::with_capacity(payload.len());
+    let allocations = allocations_during(|| {
+        for i in 0..1_000_i64 {
+            let meta =
+                PacketMeta { track: TrackId::Video, pts: Hns(i), duration: Hns(1), keyframe: true };
+            std::hint::black_box(ring.push(PacketRef { meta, data: &payload }));
+            if i % 2 == 1 {
+                std::hint::black_box(ring.pop_front_into(&mut out));
+            }
+        }
+    });
+    assert_eq!(allocations, 0, "PacketRing push or pop allocated {allocations} times");
 }
 
 #[test]
