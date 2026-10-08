@@ -22,8 +22,6 @@
 //! modes get tested deterministically (DESIGN §12, "synthetic-load test harness").
 
 mod actor;
-// Scaffolding: `write_clip` has no caller until P3.20 (DVR save).
-#[cfg_attr(not(test), expect(dead_code, reason = "scaffold: P3.20 writes DVR clips"))]
 mod output;
 pub mod recorder;
 pub mod spool;

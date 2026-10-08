@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 use time::macros::format_description;
 
 use zc_core::control::{Command, EngineEvent, EngineStatus};
-use zc_core::dvr::DvrConfig;
+use zc_core::dvr::{DvrConfig, DvrError};
 use zc_core::hotkey::{Binding, ChordMatcher, HotkeyEvent, Trigger};
 use zc_core::media::{TrackId, TrackInfo, TrackKind};
 use zc_core::ports::{
@@ -113,6 +113,8 @@ impl Engine {
             stats_seen: RecorderStats::default(),
             audio_tracks: Vec::new(),
             recording: None,
+            saving: None,
+            drive: DriveKind::default(),
         };
         let thread =
             thread::Builder::new().name("zc-engine".into()).spawn(move || actor.run(&rx))?;
@@ -127,6 +129,8 @@ enum Msg {
     Health(HealthEvent),
     /// The recording's IO thread has finished: the saved file and its duration, or why it failed.
     RecordingEnded(io::Result<(PathBuf, Hns)>),
+    /// The clip's IO thread has finished: the saved file and its duration, or why there isn't one.
+    ClipWritten(Result<(PathBuf, Hns), ClipError>),
 }
 
 /// A handle to a running engine. Dropping it shuts the engine down.
@@ -147,6 +151,7 @@ impl fmt::Debug for Msg {
             Self::Os(e) => write!(f, "Os({e:?})"),
             Self::Health(e) => write!(f, "Health({e:?})"),
             Self::RecordingEnded(result) => write!(f, "RecordingEnded({result:?})"),
+            Self::ClipWritten(result) => write!(f, "ClipWritten({result:?})"),
         }
     }
 }
@@ -217,6 +222,12 @@ struct Actor {
     hotkeys: ChordMatcher<HotkeyAction>,
     /// The one recording in progress, if any (D20).
     recording: Option<ActiveRecording>,
+    /// The IO thread of the clip being snapshotted and written. One at a time, so a dump's copy
+    /// of the window never exists twice at once (D29). Joined at shutdown, so a clip the user
+    /// asked for is never cut short by quitting.
+    saving: Option<thread::JoinHandle<()>>,
+    /// What kind of drive the output folder is on, which sets the write pacing for dumps.
+    drive: DriveKind,
 }
 
 /// A manual recording, from its start until its IO thread has finished the file.
@@ -228,6 +239,15 @@ struct ActiveRecording {
     path: PathBuf,
     /// The IO thread that drains the spool into the file.
     thread: JoinHandle<()>,
+}
+
+/// Why a DVR save produced no clip, as its IO thread reports it.
+#[derive(Debug)]
+enum ClipError {
+    /// The DVR buffer holds no video yet.
+    NothingBuffered,
+    /// The snapshot or the file write failed. The text says why.
+    Failed(String),
 }
 
 /// What a hotkey does. Engine-local: only the matcher's bindings use it.
@@ -315,6 +335,24 @@ fn file_stamp(t: OffsetDateTime) -> String {
     t.format(format).unwrap_or_else(|_| t.unix_timestamp().to_string())
 }
 
+/// Snapshots the DVR window and writes it to a new clip file. Runs on the clip's IO thread, so
+/// the snapshot's short lock holds and the paced disk write both stay off the actor (D29).
+fn save_clip_file(
+    recorder: &Recorder,
+    window: Hns,
+    cfg: &OutputConfig,
+    tracks: &[TrackInfo],
+) -> Result<(PathBuf, Hns), ClipError> {
+    let clip = recorder.snapshot(window).map_err(|e| match e {
+        DvrError::Empty => ClipError::NothingBuffered,
+        other => ClipError::Failed(other.to_string()),
+    })?;
+    let (path, file) = output::create_file(&cfg.dir, "clip", cfg.format.extension())
+        .map_err(|e| ClipError::Failed(e.to_string()))?;
+    output::write_clip(&clip, file, tracks, cfg).map_err(|e| ClipError::Failed(e.to_string()))?;
+    Ok((path, clip.duration()))
+}
+
 impl Actor {
     fn run(mut self, rx: &Receiver<Msg>) {
         tracing::info!(output_dir = %self.output_dir.display(), "engine started");
@@ -340,10 +378,18 @@ impl Actor {
                 Msg::Os(event) => self.on_os_event(event),
                 Msg::Health(event) => self.on_health(event),
                 Msg::RecordingEnded(result) => self.on_recording_ended(result),
+                Msg::ClipWritten(result) => self.on_clip_written(result),
             }
         }
         self.stop_sources();
         self.finish_recording();
+        // A clip being saved finishes first: quitting right after Alt+F10 must not cut it short.
+        if let Some(thread) = self.saving.take() {
+            tracing::info!("finishing the clip being saved before exiting");
+            if thread.join().is_err() {
+                tracing::error!("clip thread panicked");
+            }
+        }
         tracing::info!("engine stopped");
     }
 
@@ -351,11 +397,6 @@ impl Actor {
         if self.events.send(event).is_ok() {
             (self.wake)(());
         }
-    }
-
-    fn not_implemented(&self, feature: &'static str, phase: u8) {
-        tracing::info!(feature, phase, "requested a feature that isn't built yet");
-        self.emit(EngineEvent::NotImplemented { feature, phase });
     }
 
     /// Works out the DVR window the settings ask for after the RAM ceiling, and warns if
@@ -443,7 +484,7 @@ impl Actor {
             }
             Some(Err(e)) => self.emit(EngineEvent::Error(format!("Capture couldn't start: {e}"))),
             None => self.emit(EngineEvent::Warning(
-                "No capture source yet: the GPU video pipeline arrives in Phase 1.".into(),
+                "No capture source is attached, so nothing is captured or buffered.".into(),
             )),
         }
     }
@@ -465,7 +506,7 @@ impl Actor {
 
     fn on_command(&mut self, command: Command) {
         match command {
-            Command::SaveClip => self.not_implemented("Saving a DVR clip", 3),
+            Command::SaveClip => self.save_clip(),
             Command::ToggleRecording => self.toggle_recording(),
             Command::Screenshot => self.take_screenshot(),
             Command::PushToTalk(down) => {
@@ -548,11 +589,7 @@ impl Actor {
         // Recordings stream at the encode bitrate. Pacing is for DVR dumps, which come in bursts.
         let cfg = OutputConfig {
             pacer: WritePacer::unlimited(),
-            ..OutputConfig::from_settings(
-                &self.settings,
-                self.output_dir.clone(),
-                DriveKind::Unknown,
-            )
+            ..OutputConfig::from_settings(&self.settings, self.output_dir.clone(), self.drive)
         };
         let (partial, container) = match output::create_recording(&cfg, &tracks, label) {
             Ok(created) => created,
@@ -643,6 +680,69 @@ impl Actor {
             tracing::error!("recording thread panicked");
         }
         tracing::info!(path = %recording.path.display(), "recording closed at shutdown");
+    }
+
+    /// Saves the DVR's last `buffer_window` to a new clip file. The actor only checks the state
+    /// and starts the IO thread. The snapshot and the disk write happen there, and the result
+    /// comes back as `Msg::ClipWritten` (D19, D29).
+    fn save_clip(&mut self) {
+        if !self.settings.dvr.enabled {
+            self.emit(EngineEvent::Warning("The DVR buffer is off (Settings, DVR buffer).".into()));
+            return;
+        }
+        // A press during a save is refused, not queued: two copies of the window at once would
+        // double the RAM a dump takes.
+        if self.saving.is_some() {
+            self.emit(EngineEvent::Warning("Still saving the previous clip.".into()));
+            return;
+        }
+        let Some(video) = self.ports.video.as_ref().and_then(|video| video.format()) else {
+            self.emit(EngineEvent::Warning("Nothing to save yet: capture hasn't started.".into()));
+            return;
+        };
+        let tracks: Vec<TrackInfo> =
+            std::iter::once(video).chain(self.audio_tracks.iter().cloned()).collect();
+        let cfg = OutputConfig::from_settings(&self.settings, self.output_dir.clone(), self.drive);
+        let window = self.status.buffer_window;
+        let recorder = Arc::clone(&self.recorder);
+        let inbox = self.inbox.clone();
+        let spawned = thread::Builder::new().name("zc-io-clip".into()).spawn(move || {
+            // A panic must still report back, or `saving` stays set and refuses every later save.
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                save_clip_file(&recorder, window, &cfg, &tracks)
+            }))
+            .unwrap_or_else(|_| Err(ClipError::Failed("the clip thread panicked".into())));
+            // Fails only while the engine is shutting down, when nobody needs the result.
+            let _ = inbox.send(Msg::ClipWritten(result));
+        });
+        match spawned {
+            // The result comes back through the inbox; the handle is joined then, or at shutdown.
+            Ok(thread) => self.saving = Some(thread),
+            Err(e) => self.emit(EngineEvent::Error(format!("Couldn't save the clip: {e}"))),
+        }
+    }
+
+    /// The clip's IO thread has finished, or given up. Clears `saving`, so the next press is taken.
+    fn on_clip_written(&mut self, result: Result<(PathBuf, Hns), ClipError>) {
+        // The thread sends this just before it exits, so the join returns at once.
+        if let Some(thread) = self.saving.take()
+            && thread.join().is_err()
+        {
+            tracing::error!("clip thread panicked");
+        }
+        match result {
+            Ok((path, duration)) => {
+                tracing::info!(path = %path.display(), "clip saved");
+                self.emit(EngineEvent::ClipSaved { path, duration });
+            }
+            Err(ClipError::NothingBuffered) => {
+                self.emit(EngineEvent::Warning("Nothing to save yet.".into()));
+            }
+            Err(ClipError::Failed(reason)) => {
+                tracing::error!(error = %reason, "clip save failed");
+                self.emit(EngineEvent::Error(format!("Couldn't save the clip: {reason}")));
+            }
+        }
     }
 
     fn on_os_event(&mut self, event: OsEvent) {
@@ -826,14 +926,6 @@ mod tests {
     }
 
     #[test]
-    fn unbuilt_features_say_which_phase_delivers_them() {
-        let (engine, _) = spawn(Ports::default());
-        engine.send(Command::SaveClip).unwrap();
-        let event = wait_for(&engine, |e| matches!(e, EngineEvent::NotImplemented { .. }));
-        assert_eq!(event, EngineEvent::NotImplemented { feature: "Saving a DVR clip", phase: 3 });
-    }
-
-    #[test]
     fn applying_settings_publishes_a_new_status() {
         let (engine, _) = spawn(Ports::default());
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
@@ -893,6 +985,16 @@ mod tests {
     }
 
     #[test]
+    fn saving_with_nothing_buffered_writes_no_file() {
+        let dir = std::env::temp_dir().join(format!("zeroclip-clip-empty-{}", std::process::id()));
+        let cfg = OutputConfig::from_settings(&Settings::default(), dir.clone(), DriveKind::Ssd);
+        let recorder = Recorder::new(DvrConfig { video_bytes: 10_000_000, audio_bytes: 1_000_000 });
+        let result = save_clip_file(&recorder, Hns::from_secs(60), &cfg, &[]);
+        assert!(matches!(result, Err(ClipError::NothingBuffered)));
+        assert!(!dir.exists(), "the file is only created once there is a clip to write");
+    }
+
+    #[test]
     fn screenshot_without_capture_is_an_error() {
         let (engine, _) = spawn(Ports::default());
         engine.send(Command::Screenshot).unwrap();
@@ -948,10 +1050,11 @@ mod tests {
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
         input.key(Key::ALT, true);
         input.key(Key::f(10), true);
-        // Phase 3: expect ClipSaved instead.
-        wait_for(&engine, |e| {
-            matches!(e, EngineEvent::NotImplemented { feature: "Saving a DVR clip", .. })
-        });
+        // No capture runs here, so the save is refused. That still shows the hotkey reached it.
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Warning(m) if m.starts_with("Nothing to save yet")),
+        );
     }
 
     #[test]
@@ -980,7 +1083,10 @@ mod tests {
         input.key(Key::MOUSE5, false);
         // A barrier: once this is answered, the key events before it were handled.
         engine.send(Command::SaveClip).unwrap();
-        wait_for(&engine, |e| matches!(e, EngineEvent::NotImplemented { .. }));
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Warning(m) if m.starts_with("Nothing to save")),
+        );
         assert!(mic.0.lock().unwrap().ends_with(&[true, false]));
     }
 
