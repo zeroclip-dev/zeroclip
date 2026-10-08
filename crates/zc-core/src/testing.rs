@@ -24,6 +24,7 @@ pub struct SyntheticStream {
     audio_packet: Hns,
     audio_bytes: usize,
     audio_tracks: u8,
+    master: bool,
     next_frame: u32,
     next_audio: [u32; MAX_AUDIO_TRACKS as usize],
 }
@@ -45,6 +46,7 @@ impl SyntheticStream {
             audio_packet: Hns::from_millis(20),
             audio_bytes: 480,
             audio_tracks: 2,
+            master: false,
             next_frame: 0,
             next_audio: [0; MAX_AUDIO_TRACKS as usize],
         }
@@ -73,15 +75,27 @@ impl SyntheticStream {
         self
     }
 
-    /// Sets how many audio tracks to produce, from [`TrackId::GameAudio`] up
-    /// (`0..=MAX_AUDIO_TRACKS`). Defaults to 2.
+    /// Sets how many audio tracks to produce, from [`TrackId::GameAudio`] up, not counting
+    /// Master (`0..MAX_AUDIO_TRACKS`). Defaults to 2.
     ///
     /// # Panics
-    /// If `n` is more than [`MAX_AUDIO_TRACKS`].
+    /// If `n` leaves no slot for Master, i.e. `n >= MAX_AUDIO_TRACKS`.
     #[must_use]
     pub fn audio_tracks(mut self, n: u8) -> Self {
-        assert!(n <= MAX_AUDIO_TRACKS, "at most {MAX_AUDIO_TRACKS} audio tracks");
+        assert!(
+            n < MAX_AUDIO_TRACKS,
+            "at most {} audio tracks besides Master",
+            MAX_AUDIO_TRACKS - 1
+        );
         self.audio_tracks = n;
+        self
+    }
+
+    /// Adds the Master track (audio slot 0, D30) to the output, ahead of the other audio
+    /// tracks. Off by default, so existing output doesn't change.
+    #[must_use]
+    pub fn with_master(mut self) -> Self {
+        self.master = true;
         self
     }
 
@@ -145,9 +159,9 @@ impl SyntheticStream {
     /// the previous call stopped.
     pub fn until(&mut self, until: Hns) -> Vec<Packet> {
         let mut out = Vec::new();
+        let active = self.active_tracks();
         loop {
-            // `ALL` lists video first, and `min_by_key` keeps the first minimum: video wins ties.
-            let active = &TrackId::ALL[..=usize::from(self.audio_tracks)];
+            // `active` starts with video; `min_by_key` keeps the first minimum, so video wins ties.
             let (track, pts) = active
                 .iter()
                 .map(|&t| (t, self.next_pts(t)))
@@ -161,6 +175,17 @@ impl SyntheticStream {
                 _ => self.next_audio(track),
             });
         }
+    }
+
+    /// The tracks this stream produces, in index order: video, then Master if on, then the
+    /// first `audio_tracks` slots after Master.
+    fn active_tracks(&self) -> Vec<TrackId> {
+        let mut tracks = vec![TrackId::Video];
+        if self.master {
+            tracks.push(TrackId::Master);
+        }
+        tracks.extend((1..=self.audio_tracks).filter_map(TrackId::audio));
+        tracks
     }
 
     /// PTS of the next packet on `track`.
@@ -191,7 +216,7 @@ impl SyntheticStream {
 fn payload(seq: u32, track: TrackId, len: usize) -> Vec<u8> {
     let mut data = vec![0xAB; len.max(5)];
     data[..4].copy_from_slice(&seq.to_le_bytes());
-    #[expect(clippy::cast_possible_truncation, reason = "track index is 0..=6")]
+    #[expect(clippy::cast_possible_truncation, reason = "track index is 0..=7")]
     let track_byte = track.index() as u8;
     data[4] = track_byte;
     data
@@ -242,9 +267,23 @@ mod tests {
             let track = TrackId::audio(n).expect("in range");
             packets.iter().filter(|p| p.meta.track == track).count()
         };
-        assert_eq!(count(3), 50, "20 ms packets, fourth audio track");
-        assert_eq!(count(4), 0, "no fifth audio track");
+        // Slots 1 to 4 are the four tracks after Master (slot 0).
+        assert_eq!(count(4), 50, "20 ms packets, fourth audio track");
+        assert_eq!(count(5), 0, "no fifth audio track");
         let video_only = SyntheticStream::new().audio_tracks(0).take_secs(1);
         assert!(video_only.iter().all(|p| p.meta.track == TrackId::Video));
+    }
+
+    #[test]
+    fn master_is_opt_in_and_comes_first() {
+        let without = SyntheticStream::new().take_secs(1);
+        assert!(without.iter().all(|p| p.meta.track != TrackId::Master));
+        let packets = SyntheticStream::new().with_master().take_secs(1);
+        let count = |t| packets.iter().filter(|p| p.meta.track == t).count();
+        assert_eq!(count(TrackId::Master), 50, "20 ms packets on Master");
+        assert_eq!(count(TrackId::GameAudio), 50);
+        assert_eq!(count(TrackId::Mic), 50);
+        assert_eq!(packets[0].meta.track, TrackId::Video, "video first on ties");
+        assert_eq!(packets[1].meta.track, TrackId::Master, "Master before the other audio");
     }
 }

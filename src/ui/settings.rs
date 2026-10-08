@@ -205,13 +205,13 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
         section(ui, "Audio", |ui| {
             let audio = &mut draft.settings.audio;
             let (mics, listed) = (&mut draft.mics, &mut draft.mics_listed);
-            ui.checkbox(&mut audio.game_audio, "Record the game's audio (track 1)");
+            ui.checkbox(&mut audio.game_audio, "Record the game's audio (track 2)");
             ui.weak(
                 "Only the game in focus is captured: Discord, music and notifications stay \
                  out of your clips. Needs Windows 11; older Windows records all system audio.",
             );
             ui.horizontal(|ui| {
-                ui.label("Microphone (track 2)");
+                ui.label("Microphone (track 3)");
                 ComboBox::from_id_salt("mic").selected_text(mic_label(audio.mic)).show_ui(ui, |ui| {
                     for option in [MicMode::Off, MicMode::AlwaysOn, MicMode::PushToTalk] {
                         ui.selectable_value(&mut audio.mic, option, mic_label(option));
