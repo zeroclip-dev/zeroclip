@@ -66,6 +66,13 @@ impl PacketRing {
         self.bytes.len()
     }
 
+    /// The whole byte ring. Its address and length stay fixed for the ring's life, so the
+    /// engine can page-lock it (DESIGN §4).
+    #[must_use]
+    pub fn memory(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// Payload bytes currently stored.
     #[must_use]
     pub fn used(&self) -> usize {

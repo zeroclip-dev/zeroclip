@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use zc_core::dvr::{DvrBuffer, DvrClip, DvrConfig, DvrError, SnapshotCopy};
 use zc_core::media::{PacketMeta, PacketRef, TrackId};
+use zc_core::ports::{LockMemory, SourceError};
 use zc_core::sink::{PacketSink, PacketWriter, SinkId, Tee};
 use zc_core::time::{Hns, MasterClock};
 
@@ -38,6 +39,9 @@ pub struct RecorderStats {
 }
 
 struct State {
+    /// Page locks on the DVR rings. Declared before `dvr`, so they drop first: fields drop in
+    /// declaration order, and a ring must be unpinned before its memory is freed.
+    locks: Vec<Box<dyn Send>>,
     clock: MasterClock,
     dvr: DvrBuffer,
     tee: Tee,
@@ -61,6 +65,7 @@ impl Recorder {
     pub fn new(config: DvrConfig) -> Self {
         Self {
             state: Mutex::new(State {
+                locks: Vec::new(),
                 clock: MasterClock::new(),
                 dvr: DvrBuffer::new(config),
                 tee: Tee::new(),
@@ -113,6 +118,32 @@ impl Recorder {
         self.lock().dvr.clear();
     }
 
+    /// Pins the DVR rings of `tracks` in RAM with `lock` (P3.25, DESIGN §4). Replaces any pins
+    /// taken before.
+    ///
+    /// Only the tracks named are pinned, so pass the video track and the audio tracks that are
+    /// running. An unused ring stays unpinned and uncommitted. The call is all or nothing: if
+    /// one ring can't be pinned, the rings pinned so far are released too. The state lock is
+    /// held while the pages are pinned, so pushes wait for it. The engine calls this at start
+    /// and after a video restart, not per packet.
+    ///
+    /// # Errors
+    /// The first region `lock` refuses. Recording goes on, just unpinned.
+    pub fn lock_memory(&self, lock: LockMemory, tracks: &[TrackId]) -> Result<usize, SourceError> {
+        let mut state = self.lock();
+        // Release the old pins before taking new ones, so the same pages are never pinned twice.
+        state.locks.clear();
+        let mut guards = Vec::with_capacity(tracks.len());
+        let mut bytes = 0;
+        for &track in tracks {
+            let region = state.dvr.memory(track);
+            guards.push(lock(region)?);
+            bytes += region.len();
+        }
+        state.locks = guards;
+        Ok(bytes)
+    }
+
     /// Starts feeding a disk writer (manual or session recording).
     pub fn attach(&self, writer: Box<dyn PacketWriter>) -> SinkId {
         self.lock().tee.attach(writer)
@@ -147,7 +178,7 @@ impl Recorder {
 impl PacketSink for Recorder {
     fn push(&self, packet: PacketRef<'_>) {
         let mut guard = self.lock();
-        let State { clock, dvr, tee, stats } = &mut *guard;
+        let State { clock, dvr, tee, stats, .. } = &mut *guard;
 
         let meta = packet.meta;
         if meta.track == TrackId::Video && meta.keyframe && !clock.is_anchored() {
@@ -258,5 +289,42 @@ mod tests {
         assert_eq!(clip.video().next().unwrap().meta.pts, Hns::ZERO);
         assert_eq!(clip.duration(), Hns::from_secs(3));
         assert_eq!(recorder.stats(), RecorderStats::default());
+    }
+
+    /// A page lock that pins nothing. Tests must not pin real memory.
+    fn pin(_: &[u8]) -> Result<Box<dyn Send>, SourceError> {
+        Ok(Box::new(()))
+    }
+
+    /// Refuses the audio rings (1 MB each in the test below) and pins everything else.
+    fn refuse_audio(region: &[u8]) -> Result<Box<dyn Send>, SourceError> {
+        if region.len() == 1_000_000 {
+            Err(SourceError::Other("refused".into()))
+        } else {
+            Ok(Box::new(()))
+        }
+    }
+
+    #[test]
+    fn lock_memory_pins_only_the_named_tracks() {
+        let recorder = Recorder::new(DvrConfig { video_bytes: 10_000_000, audio_bytes: 1_000_000 });
+        // The DVR reserves six audio rings, but only the named ones are pinned.
+        let video = recorder.lock_memory(pin, &[TrackId::Video]).expect("video pins");
+        assert_eq!(video, 10_000_000);
+        let all = [TrackId::Video, TrackId::GameAudio, TrackId::Mic];
+        assert_eq!(recorder.lock_memory(pin, &all).expect("three rings pin"), 12_000_000);
+        assert_eq!(recorder.lock().locks.len(), 3);
+        // A new call replaces the earlier pins rather than adding to them.
+        assert_eq!(recorder.lock_memory(pin, &[]).expect("nothing to pin"), 0);
+        assert!(recorder.lock().locks.is_empty());
+    }
+
+    #[test]
+    fn a_refused_ring_releases_the_rings_pinned_before_it() {
+        let recorder = Recorder::new(DvrConfig { video_bytes: 10_000_000, audio_bytes: 1_000_000 });
+        let tracks = [TrackId::Video, TrackId::GameAudio];
+        assert!(recorder.lock_memory(refuse_audio, &tracks).is_err());
+        // Video was pinned first. It must be unpinned again, so nothing is half locked.
+        assert!(recorder.lock().locks.is_empty());
     }
 }
