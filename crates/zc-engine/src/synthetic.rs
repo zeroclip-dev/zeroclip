@@ -8,8 +8,9 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::thread::JoinHandle;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use zc_core::media::{Codec, TrackId, TrackInfo, TrackKind};
 use zc_core::ports::{Emit, SourceError, VideoSource, VideoStart};
@@ -30,14 +31,16 @@ pub struct FaultPlan {
 /// A fake GPU pipeline producing [`SyntheticStream`] video packets.
 #[derive(Debug)]
 pub struct SyntheticVideoSource {
-    #[expect(dead_code, reason = "scaffold: used once the synthetic source is implemented")]
+    /// The next frame to produce. While running, the worker owns it; `stop` gets it back,
+    /// so a restart continues the frame numbers and PTS (as a real QPC clock does).
     stream: SyntheticStream,
     faults: FaultPlan,
     /// Pace packets in real time (for manual testing); otherwise as fast as possible.
     realtime: bool,
-    #[expect(dead_code, reason = "scaffold: used once the synthetic source is implemented")]
+    /// Tells the worker to exit. Replaced on every `start`.
     stop: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
+    /// The worker thread, which returns the stream when joined.
+    worker: Option<JoinHandle<SyntheticStream>>,
 }
 
 impl Default for SyntheticVideoSource {
@@ -74,17 +77,69 @@ impl SyntheticVideoSource {
     }
 }
 
+/// The worker's loop: pushes frames into `sink` until `stop` is set or an encoder fault
+/// is injected. Returns the stream, so the next `start` carries on from where this one stopped.
+fn run(
+    mut stream: SyntheticStream,
+    faults: &FaultPlan,
+    realtime: bool,
+    stop: &AtomicBool,
+    sink: &SharedSink,
+    health: &Emit<HealthEvent>,
+) -> SyntheticStream {
+    let started = Instant::now();
+    let first = stream.now();
+    let mut dropping = false;
+    while !stop.load(Ordering::Relaxed) {
+        let packet = stream.next_video();
+        let n = SyntheticStream::sequence_number(&packet.data);
+        if faults.encoder_fault_at == Some(n) {
+            health(HealthEvent::EncoderFault { hresult: 0x8000_4005_u32.cast_signed() });
+            break;
+        }
+        if realtime {
+            // Sleep until this frame's PTS comes round on the wall clock.
+            let due = (packet.meta.pts - first).to_duration().unwrap_or_default();
+            if let Some(wait) = due.checked_sub(started.elapsed()) {
+                thread::sleep(wait);
+            }
+        }
+        if faults.dropped_frames.iter().any(|&(f, c)| (f..f.saturating_add(c)).contains(&n)) {
+            health(HealthEvent::FrameDropped);
+            dropping = true;
+            continue;
+        }
+        sink.push(packet.view());
+        if dropping {
+            // One event when delivery resumes, not one per frame (the actor's inbox must not flood).
+            health(HealthEvent::FrameDelivered { interval: packet.meta.duration });
+            dropping = false;
+        }
+    }
+    stream
+}
+
 impl VideoSource for SyntheticVideoSource {
     fn start(
         &mut self,
-        config: &VideoStart,
+        _config: &VideoStart,
         sink: SharedSink,
         health: Emit<HealthEvent>,
     ) -> Result<Codec, SourceError> {
-        let _ = (config, sink, health);
-        todo!(
-            "Phase 3: spawn a thread pushing `self.stream` packets into `sink`, honouring `self.faults`"
-        )
+        if self.worker.is_some() {
+            return Err(SourceError::Other("already started".into()));
+        }
+        self.stop = Arc::new(AtomicBool::new(false));
+        let stream = std::mem::take(&mut self.stream);
+        let faults = self.faults.clone();
+        let realtime = self.realtime;
+        let stop = Arc::clone(&self.stop);
+        let worker = thread::Builder::new()
+            .name("zc-synthetic-video".into())
+            .spawn(move || run(stream, &faults, realtime, &stop, &sink, &health))
+            .map_err(|e| SourceError::Other(e.to_string()))?;
+        self.worker = Some(worker);
+        Ok(Codec::H264)
     }
 
     /// Always `Some`: the synthetic format never changes, so there is nothing to wait for.
@@ -99,8 +154,11 @@ impl VideoSource for SyntheticVideoSource {
 
     fn stop(&mut self) {
         if let Some(worker) = self.worker.take() {
-            let _ = worker;
-            todo!("Phase 3: signal `self.stop`, then join the worker")
+            self.stop.store(true, Ordering::Relaxed);
+            match worker.join() {
+                Ok(stream) => self.stream = stream,
+                Err(_) => tracing::error!("synthetic video thread panicked"),
+            }
         }
     }
 
@@ -115,6 +173,15 @@ impl VideoSource for SyntheticVideoSource {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU32;
+    use std::sync::{Mutex, PoisonError};
+    use std::time::Duration;
+
+    use zc_core::media::PacketRef;
+    use zc_core::ports::CaptureTarget;
+    use zc_core::sink::PacketSink;
+    use zc_core::time::Hns;
+
     use super::*;
 
     #[test]
@@ -126,5 +193,51 @@ mod tests {
             TrackKind::Video { codec: Codec::H264, width: 1920, height: 1080, fps: 60 }
         );
         assert!(format.codec_private.is_empty());
+    }
+
+    /// Records the sequence number of every frame it receives.
+    #[derive(Default)]
+    struct Collect(Mutex<Vec<u32>>);
+
+    impl PacketSink for Collect {
+        fn push(&self, packet: PacketRef<'_>) {
+            let mut seen = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            seen.push(SyntheticStream::sequence_number(packet.data));
+        }
+    }
+
+    #[test]
+    fn synthetic_source_drops_the_planned_frames() {
+        let sink = Arc::new(Collect::default());
+        let drops = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&drops);
+        let health: Emit<HealthEvent> = Arc::new(move |event| {
+            if matches!(event, HealthEvent::FrameDropped) {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let faults = FaultPlan { dropped_frames: vec![(5, 3)], ..FaultPlan::default() };
+        let mut source = SyntheticVideoSource::new().with_faults(faults).realtime(true);
+        let config = VideoStart {
+            target: CaptureTarget::PrimaryMonitor,
+            codec: Codec::H264,
+            fps: 60,
+            min_bitrate_bps: 0,
+            max_bitrate_bps: 0,
+            keyframe_interval: Hns::from_secs(1),
+            capture_cursor: false,
+        };
+
+        source.start(&config, sink.clone(), health).expect("the synthetic source starts");
+        std::thread::sleep(Duration::from_millis(300));
+        source.stop();
+
+        let seen = sink.0.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let last = *seen.last().expect("300 ms of frames were delivered");
+        assert!(last >= 8, "the run should pass the dropped frames, but stopped at {last}");
+        // Frames 5, 6 and 7 are never delivered; every other frame arrives in order, from 0.
+        let expected: Vec<u32> = (0..=last).filter(|n| !(5..8).contains(n)).collect();
+        assert_eq!(seen, expected);
+        assert_eq!(drops.load(Ordering::Relaxed), 3);
     }
 }
