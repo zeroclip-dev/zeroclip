@@ -77,7 +77,7 @@ is attempted in parallel. (DESIGN §10)
 Deletion requires a returned id plus a status check, never just HTTP 200. Platforms
 re-encode, can block clips after upload, and change visibility rules. (DESIGN §10)
 
-### D16 · GPL-3.0-or-later
+### D16 · GPL-3.0-or-later (superseded by D28)
 Open source for the portfolio; copyleft so nobody can resell it closed. As sole copyright
 holder, dual-licensing stays possible later. The project name is separate from the
 license: forks can't ship under the ZeroClip name.
@@ -178,3 +178,15 @@ focused-game track on, and Discord and Spotify pre-listed and on, with the mic o
 An app that isn't running yet records silence until it starts. Costs: up to 6 audio
 tracks (D26), and audio from a process outside every listed tree (a launcher's helper
 process, a UWP game hosted by `ApplicationFrameHost.exe`) is missed.
+
+### D28 · PolyForm Noncommercial 1.0.0, plus permission to make money with clips (supersedes D16)
+Anyone may download, use, study, change and share ZeroClip for free, but nobody may sell
+it or software built from its code. One added permission lets anyone use it for paid
+content (monetized streams and videos, client work), which PolyForm's "personal use"
+wording might otherwise leave in doubt. Copyright notices name the handle `0xtikaa`, not
+a real name. All dependencies are permissive (MIT, Apache-2.0, Zlib, Unicode) or offer a
+permissive option; `option-ext` is MPL-2.0, which only covers its own files. ffmpeg stays
+a separate `ffmpeg.exe` process (D3), so its LGPL/GPL build never mixes with this
+license. Costs: ZeroClip is source-available, not "open source" by the OSI definition,
+and GitHub lists the license as "Other". Copies taken while the repo was public under
+GPL (2026-10-08, about two hours) keep their GPL rights for that version.
