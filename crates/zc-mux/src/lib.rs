@@ -11,6 +11,7 @@
 //! - [`durable`]: files whose flushes sync to disk, so a recording survives a power cut
 //!   (D18).
 //! - [`pacing`]: gentle write pacing for DVR dumps on spinning disks.
+//! - [`repair`]: startup repair of a recording that a crash left unfinished (D18).
 //!
 //! Platform-independent. Drive-type detection (is this an HDD?) needs Windows and
 //! lives in `zc-win`; its answer is a [`pacing::DriveKind`].
@@ -21,3 +22,4 @@ pub mod container;
 pub mod durable;
 mod fmp4;
 pub mod pacing;
+pub mod repair;

@@ -15,7 +15,7 @@ state machine; editing never re-encodes; nothing is ever deleted unverified.
 
 | Crate | Owns | Depends on | OS |
 |---|---|---|---|
-| `zeroclip` (repo root) | egui UI, settings file, logging, **wiring** (composition root) | `zc-engine`, `zc-core`, `zc-video`; more adapters as phases land | Windows |
+| `zeroclip` (repo root) | egui UI, settings file, logging, **wiring** (composition root) | `zc-engine`, `zc-core`, `zc-mux`, `zc-video`; more adapters as phases land | Windows |
 | `zc-engine` | the engine actor, recording modes, the `Recorder`, synthetic sources | `zc-core`, `zc-mux` | any |
 | `zc-core` | `Hns` time, packets, codecs, DVR buffer, watchdog FSM, profiles, hotkeys, DSP, settings, **ports** | — | any |
 | `zc-mux` | container writers (fMP4/MKV), chunked writes, HDD pacing | `zc-core` | any |
@@ -136,6 +136,8 @@ stateDiagram-v2
 | Session | game profile | `Tee` → session writer, for the life of the game | fMP4/MKV |
 | Screenshot | hotkey | one texture → staging → PNG | PNG |
 | Crash rescue | game died unexpectedly | `DvrBuffer` → `recovery.tmp` → prompt | fMP4/MKV |
+| Recording file | while a recording runs | spool → IO thread → `<name>.mp4.partial`, synced per fragment | fMP4, renamed to `<name>.mp4` when finished |
+| Startup repair | app start, for each `*.partial` left behind | cut to the last complete fragment → `<name>.mp4`; never overwrites | fMP4 |
 
 ## Errors and logging
 
