@@ -4,6 +4,8 @@
 //!
 //! `cargo run -p zc-video --example mf_read -- "<clip.mp4>"`
 
+#![allow(clippy::print_stdout, reason = "a command-line check that reports on stdout")]
+
 use windows::Win32::Media::MediaFoundation::{
     IMFMediaType, IMFSample, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION,
     MF_SOURCE_READER_ANY_STREAM, MF_SOURCE_READER_MEDIASOURCE, MF_SOURCE_READERF_ENDOFSTREAM,
