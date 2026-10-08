@@ -15,8 +15,8 @@ use zc_core::dvr::{DvrConfig, DvrError};
 use zc_core::hotkey::{Binding, ChordMatcher, HotkeyEvent, Trigger};
 use zc_core::media::{TrackId, TrackInfo, TrackKind};
 use zc_core::ports::{
-    AudioSource, AudioStart, CaptureTarget, Emit, InputSource, OsEvent, SourceError, VideoSource,
-    VideoStart,
+    AudioSource, AudioStart, CaptureTarget, Emit, InputSource, OsEvent, SeekPenalty, SourceError,
+    VideoSource, VideoStart,
 };
 use zc_core::profile::{WindowClamp, clamp_window};
 use zc_core::settings::{MicMode, Settings};
@@ -41,6 +41,9 @@ pub struct Ports {
     pub mic: Option<Box<dyn AudioSource>>,
     /// Raw Input hotkeys + foreground tracking (`zc-input`, Phase 2).
     pub input: Option<Box<dyn InputSource>>,
+    /// Drive-type probe for the output folder (`zc-win`, P3.23). Without it the drive is
+    /// unknown, and DVR dumps are not paced.
+    pub seek_penalty: Option<SeekPenalty>,
 }
 
 impl fmt::Debug for Ports {
@@ -50,6 +53,7 @@ impl fmt::Debug for Ports {
             .field("game_audio", &self.game_audio.is_some())
             .field("mic", &self.mic.is_some())
             .field("input", &self.input.is_some())
+            .field("seek_penalty", &self.seek_penalty.is_some())
             .finish()
     }
 }
@@ -357,6 +361,7 @@ impl Actor {
     fn run(mut self, rx: &Receiver<Msg>) {
         tracing::info!(output_dir = %self.output_dir.display(), "engine started");
         self.update_window();
+        self.detect_drive();
         self.start_sources();
         self.publish_status();
         let mut next_tick = Instant::now() + STATUS_INTERVAL;
@@ -409,6 +414,36 @@ impl Actor {
                 "The {} MiB DVR memory limit cuts the buffer to {:.0} s.",
                 self.settings.dvr.ram_ceiling_mib,
                 clamp.window.as_secs_f64(),
+            )));
+        }
+    }
+
+    /// Asks the drive probe whether the output folder is on a spinning disk, which sets the
+    /// pacing for DVR dumps (P3.24, DESIGN §4). Runs on the engine thread: it makes a few quick
+    /// device calls, at startup and when the output folder changes. An unknown or failed answer
+    /// leaves the writes unpaced.
+    fn detect_drive(&mut self) {
+        // Create the folder now, as the first recording will, so the probe sees its volume.
+        let _ = std::fs::create_dir_all(&self.output_dir);
+        self.drive = match self.ports.seek_penalty {
+            Some(probe) => match probe(&self.output_dir) {
+                Ok(answer) => DriveKind::from_seek_penalty(answer),
+                Err(e) => {
+                    tracing::warn!(error = %e, "drive probe failed");
+                    DriveKind::Unknown
+                }
+            },
+            None => DriveKind::Unknown,
+        };
+        tracing::info!(
+            drive = ?self.drive,
+            output_dir = %self.output_dir.display(),
+            "output drive detected",
+        );
+        if self.drive == DriveKind::Hdd && self.settings.storage.pace_hdd_writes {
+            self.emit(EngineEvent::Warning(format!(
+                "Clips go to a hard disk, so they're written at {} MB/s to keep games smooth.",
+                self.settings.storage.hdd_write_mb_per_sec,
             )));
         }
     }
@@ -490,7 +525,7 @@ impl Actor {
     }
 
     fn stop_sources(&mut self) {
-        let Ports { video, game_audio, mic, input } = &mut self.ports;
+        let Ports { video, game_audio, mic, input, .. } = &mut self.ports;
         if let Some(input) = input {
             input.stop();
         }
@@ -539,8 +574,11 @@ impl Actor {
                     self.status.capturing = false;
                     self.start_video();
                 }
-                if let Some(dir) = &self.settings.recording.output_dir {
+                if let Some(dir) = &self.settings.recording.output_dir
+                    && *dir != self.output_dir
+                {
                     self.output_dir.clone_from(dir);
+                    self.detect_drive();
                 }
                 tracing::info!("settings applied");
                 self.publish_status();
@@ -1282,6 +1320,50 @@ mod tests {
         );
         engine.shutdown();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A drive probe that answers the way a spinning disk does.
+    fn spinning_disk(_: &Path) -> Result<Option<bool>, SourceError> {
+        Ok(Some(true))
+    }
+
+    #[test]
+    fn a_hard_disk_output_folder_is_announced_at_start_and_on_change() {
+        let ports = Ports { seek_penalty: Some(spinning_disk), ..Ports::default() };
+        let (engine, _) = spawn(ports);
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Warning(m) if m.starts_with("Clips go to a hard disk")),
+        );
+        // A new output folder is probed again, so the notice comes again.
+        let other = std::env::temp_dir().join(format!("zeroclip-drive-{}", std::process::id()));
+        let mut settings = Settings::default();
+        settings.recording.output_dir = Some(other.clone());
+        engine.send(Command::ApplySettings(Box::new(settings))).unwrap();
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Warning(m) if m.starts_with("Clips go to a hard disk")),
+        );
+        engine.shutdown();
+        let _ = std::fs::remove_dir(other);
+    }
+
+    #[test]
+    fn a_failed_drive_probe_is_silent_and_leaves_writes_unpaced() {
+        fn probe_fails(_: &Path) -> Result<Option<bool>, SourceError> {
+            Err(SourceError::Other("no volume".into()))
+        }
+        let ports = Ports { seek_penalty: Some(probe_fails), ..Ports::default() };
+        let (engine, _) = spawn(ports);
+        // The drive notice is sent before the first status, so reading up to it sees every one.
+        loop {
+            match engine.wait_event(TIMEOUT).expect("status") {
+                EngineEvent::Status(_) => break,
+                EngineEvent::Warning(m) => assert!(!m.contains("hard disk"), "unexpected: {m}"),
+                _ => {}
+            }
+        }
+        engine.shutdown();
     }
 
     #[test]

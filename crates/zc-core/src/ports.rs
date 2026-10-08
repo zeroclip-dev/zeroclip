@@ -186,3 +186,8 @@ pub trait InputSource: Send {
     /// Stops the input thread. Idempotent.
     fn stop(&mut self);
 }
+
+/// The drive-type probe the app injects: whether the drive holding a path has a seek penalty,
+/// which means a spinning disk. `Ok(None)` means the drive doesn't say. The engine can't call
+/// Windows itself, so the app passes `zc_win::drive::seek_penalty` (P3.24).
+pub type SeekPenalty = fn(&Path) -> Result<Option<bool>, SourceError>;
