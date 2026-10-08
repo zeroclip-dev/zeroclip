@@ -190,16 +190,55 @@ impl DvrBuffer {
     /// # Errors
     /// [`DvrError::Empty`] if there's no video yet.
     pub fn snapshot(&self, window: Hns) -> Result<DvrClip, DvrError> {
-        let _ = window;
-        todo!("Phase 3: snapshot from the covering GOP (see the `dvr_snapshot_*` specs)")
+        let oldest = self.oldest_pts().ok_or(DvrError::Empty)?;
+        let target = self.newest_video_end.saturating_sub(window);
+        // The newest GOP that starts at or before `target` covers the window. If none does,
+        // the buffer holds less than `window`, so start at the oldest GOP.
+        let start = self.rings[VIDEO_RING]
+            .iter()
+            .rev()
+            .find(|(meta, _)| meta.keyframe && meta.pts <= target)
+            .map_or(oldest, |(meta, _)| meta.pts);
+
+        // ponytail: copies under the caller's lock (Q4). Share segments by reference instead
+        // if the lock time measured in P3.17 is too long.
+        let mut packets = Vec::new();
+        for ring in &self.rings {
+            for (meta, [first, second]) in ring.iter() {
+                if meta.pts >= start {
+                    let mut data = Vec::with_capacity(first.len() + second.len());
+                    data.extend_from_slice(first);
+                    data.extend_from_slice(second);
+                    packets.push(Packet { meta, data });
+                }
+            }
+        }
+        // Stable sort, and TrackId orders video first, so equal PTS keep video ahead of audio.
+        packets.sort_by_key(|p| (p.meta.pts, p.meta.track));
+        Ok(DvrClip { packets })
     }
 
     /// Changes capacity when a game profile asks for a different window (DESIGN §7).
     /// Growing keeps everything; shrinking evicts the oldest GOPs first. The engine
     /// pauses the writer around this call, so it may allocate.
+    ///
+    /// It copies the buffer out, rebuilds it at the new size and pushes everything back,
+    /// so it needs about twice the window's memory for a moment.
     pub fn resize(&mut self, config: DvrConfig) {
-        let _ = config;
-        todo!("Phase 3: resize (see the `dvr_resize_*` spec)")
+        let was_skipping = self.skip_until_keyframe;
+        // `Hns(i64::MAX)` reaches back past the oldest GOP, so this copies everything.
+        let clip = self.snapshot(Hns(i64::MAX)).unwrap_or_default();
+        // Free the old rings before allocating the new ones, so the peak is the copy plus
+        // one buffer, not three.
+        *self = Self::new(DvrConfig { video_bytes: 0, audio_bytes: 0 });
+        *self = Self::new(config);
+        for packet in &clip.packets {
+            // Whatever the new size can't hold is evicted or refused, as on any push.
+            let _ = self.push(packet.view());
+        }
+        // A refused GOP must stay refused until its keyframe, or the rest of it would be stored
+        // after a gap.
+        self.skip_until_keyframe |= was_skipping;
     }
 
     /// Drops everything. The next stored packet must again be a keyframe.
@@ -413,7 +452,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: DvrBuffer::snapshot (Phase 3)"]
     fn dvr_snapshot_starts_at_the_keyframe_covering_the_window() {
         let mut dvr = DvrBuffer::new(roomy());
         let mut s = SyntheticStream::new();
@@ -432,7 +470,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: DvrBuffer::snapshot (Phase 3)"]
     fn dvr_snapshot_has_every_frame_in_order() {
         let mut dvr = DvrBuffer::new(roomy());
         let mut s = SyntheticStream::new();
@@ -444,7 +481,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: DvrBuffer::snapshot (Phase 3)"]
     fn dvr_snapshot_audio_is_time_aligned_with_video() {
         let mut dvr = DvrBuffer::new(roomy());
         let mut s = SyntheticStream::new();
@@ -461,7 +497,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: DvrBuffer::snapshot (Phase 3)"]
     fn dvr_snapshot_longer_than_the_buffer_returns_everything() {
         let mut dvr = DvrBuffer::new(roomy());
         let mut s = SyntheticStream::new();
@@ -473,7 +508,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: DvrBuffer::snapshot (Phase 3)"]
     fn dvr_snapshot_of_an_empty_buffer_is_an_error() {
         let mut dvr = DvrBuffer::new(roomy());
         assert_eq!(dvr.snapshot(Hns::from_secs(1)), Err(DvrError::Empty));
@@ -487,7 +521,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: DvrBuffer::resize (Phase 3)"]
     fn dvr_resize_shrinks_from_the_oldest_end_and_grows_losslessly() {
         let mut dvr = DvrBuffer::new(roomy());
         let mut s = SyntheticStream::new();
