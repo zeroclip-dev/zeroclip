@@ -16,7 +16,7 @@
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use zc_core::dvr::{DvrBuffer, DvrClip, DvrConfig, DvrError, SnapshotCopy};
+use zc_core::dvr::{DvrBuffer, DvrClip, DvrConfig, DvrError, SnapshotCopy, SnapshotPlan};
 use zc_core::media::{PacketMeta, PacketRef, TrackId};
 use zc_core::ports::{LockMemory, SourceError};
 use zc_core::sink::{PacketSink, PacketWriter, SinkId, Tee};
@@ -85,8 +85,32 @@ impl Recorder {
     /// [`DvrError::Empty`] if nothing has been recorded yet, and [`DvrError::Changed`] if
     /// the buffer was cleared or resized during the copy.
     pub fn snapshot(&self, window: Hns) -> Result<DvrClip, DvrError> {
+        self.copy_out(|dvr| dvr.plan_snapshot(window))
+    }
+
+    /// [`snapshot`](Self::snapshot) for a clip that ends at `end`, cut on every track (see
+    /// [`DvrBuffer::plan_snapshot_until`]).
+    ///
+    /// # Errors
+    /// As for [`snapshot`](Self::snapshot).
+    pub fn snapshot_until(&self, window: Hns, end: Hns) -> Result<DvrClip, DvrError> {
+        self.copy_out(|dvr| dvr.plan_snapshot_until(window, end))
+    }
+
+    /// Where a clip cut now would end: the end of the newest video frame. Zero when the buffer
+    /// holds no video. A save takes this at the press, so the clip ends there (D30).
+    #[must_use]
+    pub fn video_end(&self) -> Hns {
+        self.lock().dvr.newest_video_end()
+    }
+
+    /// Plans a clip under the lock and copies it out in short holds.
+    fn copy_out(
+        &self,
+        make_plan: impl FnOnce(&DvrBuffer) -> Result<SnapshotPlan, DvrError>,
+    ) -> Result<DvrClip, DvrError> {
         let started = Instant::now();
-        let (plan, held) = self.held(|state| state.dvr.plan_snapshot(window));
+        let (plan, held) = self.held(|state| make_plan(&state.dvr));
         let mut longest_hold = held;
         // Allocating (and pre-faulting) the clip's buffers happens outside the lock.
         let mut copy = SnapshotCopy::new(plan?);

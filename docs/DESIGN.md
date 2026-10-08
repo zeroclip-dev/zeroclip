@@ -123,7 +123,11 @@ Tracks are dynamic: a recording carries one video track and up to seven audio tr
 
 ### Audio track 1 — Master (D30)
 
-A live mix of every enabled source, encoded once more as AAC. Players, browsers and Discord play only the first audio track, so the mix goes there and the per-source tracks follow it unchanged, for the editor (D26). The mixer is built in P3.32; the layout reserves its slot now.
+A live mix of every enabled source, encoded once more as AAC. Players, browsers and Discord play only the first audio track, so the mix goes there and the per-source tracks follow it unchanged, for the editor (D26).
+
+One mixer thread (`zc_audio::MasterMix`, MMCSS "Pro Audio") does the work. Each source writes its PCM, at the sample its own track gets, into a shared `zc_core::mix::MixBus`: one two-second ring per source on a 48 kHz timeline. Every 20 ms the thread mixes everything up to 200 ms behind real time, soft-clips the sum and encodes it. A sample no source wrote is silence. A block that arrives after its samples were mixed is dropped and counted. Each source's level in the mix is a setting, −60 to +12 dB, read when the sources start.
+
+Master trails real time, so a DVR save ends at the press and waits 300 ms (the lag plus a margin) before it copies, which lets Master cover the clip's end. A recording's Master ends about 200 ms before its video: stopping a recording doesn't wait, since the video keeps arriving during a wait and would only lengthen the file.
 
 ### Parallel audio ring buffers (the v1 gap)
 

@@ -11,7 +11,7 @@ use crate::time::Hns;
 use crate::watchdog::WatchdogState;
 
 /// Requests to the engine.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     /// Write the last N seconds of the DVR buffer (N from the active profile) to a clip file.
     SaveClip,

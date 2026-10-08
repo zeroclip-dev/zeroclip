@@ -214,6 +214,9 @@ Layout: `Audio(0)` Master, `Audio(1)` Game, `Audio(2)` Microphone, `Audio(3..)` 
 48 kHz sample timeline taken from each source's QPC-aligned PTS, mixes 200 ms behind real
 time so a late source still lands in place, treats a missing source as silence, and
 soft-clips the sum. Each source's mix gain is a setting (default 0 dB). Costs: one more
-AAC encode (about 1% of a core); Master trails the side tracks by 200 ms in the DVR, so a
-save and a recording stop wait 250 ms before they snapshot or close; a source's volume in
-Master is fixed at record time (rebalance from the side tracks in the editor, P5.14).
+AAC encode (about 1% of a core); Master trails the side tracks by 200 ms. A DVR save cuts
+every track at the moment of the press and waits 300 ms before copying, so the clip ends at
+the press with Master complete. A recording's Master ends about 200 ms before its video
+(cutting per track at stop isn't built). Mix gains apply at the next start, and a source's
+volume in Master is fixed at record time (rebalance from the side tracks in the editor,
+P5.14).

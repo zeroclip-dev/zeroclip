@@ -23,6 +23,7 @@ use windows::Win32::System::Threading::{
 use windows::core::w;
 use zc_core::Hns;
 use zc_core::media::TrackId;
+use zc_core::mix::{MixInput, sample_index};
 use zc_core::ports::{AudioStart, SourceError};
 use zc_core::sink::PacketSink;
 use zc_core::time::SampleTimeline;
@@ -179,12 +180,15 @@ impl Drop for Stream {
 /// lands after the padding, instead of overlapping it and being skipped by the timeline.
 pub(crate) const SILENCE_MARGIN: Hns = Hns::from_millis(100);
 
-/// Timestamps (via [`SampleTimeline`]) and encodes one track.
+/// Timestamps (via [`SampleTimeline`]) and encodes one track. The PCM also goes to the Master
+/// mix, when there is one (D30).
 pub(crate) struct Encode {
     timeline: SampleTimeline,
     encoder: AacEncoder,
     channels: usize,
     rate: u32,
+    /// This source's input in the Master mix, `None` when it isn't in one.
+    mix: Option<MixInput>,
 }
 
 impl Encode {
@@ -199,7 +203,14 @@ impl Encode {
             )?,
             channels: usize::from(config.channels),
             rate: config.sample_rate,
+            mix: None,
         })
+    }
+
+    /// Also writes every captured block into `mix`, at the sample this track's PTS names.
+    pub(crate) fn with_mix(mut self, mix: Option<MixInput>) -> Self {
+        self.mix = mix;
+        self
     }
 
     /// One captured buffer: `None` PCM means silence; `None` QPC means WASAPI had no
@@ -222,7 +233,14 @@ impl Encode {
         let start = p.pts + Hns(i64::from(p.silence) * Hns::PER_SECOND / i64::from(self.rate));
         let kept = frames - p.skip;
         match pcm {
-            Some(pcm) => self.encoder.encode(&pcm[p.skip as usize * self.channels..], start, sink),
+            Some(pcm) => {
+                let pcm = &pcm[p.skip as usize * self.channels..];
+                // Silence needs no write: a sample nothing wrote is silent in the mix.
+                if let Some(mix) = &self.mix {
+                    mix.write(sample_index(start), pcm);
+                }
+                self.encoder.encode(pcm, start, sink)
+            }
             None => self.encoder.encode_silence(kept, start, sink),
         }
     }
