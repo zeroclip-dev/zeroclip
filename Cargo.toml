@@ -99,6 +99,7 @@ zc-mux.workspace = true
 zc-video.workspace = true
 zc-input.workspace = true
 zc-audio.workspace = true
+zc-win.workspace = true
 anyhow.workspace = true
 directories.workspace = true
 eframe.workspace = true

@@ -189,6 +189,13 @@ impl DvrBuffer {
         self.rings[track.index()].used()
     }
 
+    /// The bytes reserved for `track`, for page-locking (DESIGN §4). The address stays put until
+    /// [`resize`](Self::resize) frees the rings, so release any page lock on them first.
+    #[must_use]
+    pub fn memory(&self, track: TrackId) -> &[u8] {
+        self.rings[track.index()].memory()
+    }
+
     /// Copies out the last `window` of footage: video from the IDR of the newest GOP
     /// that covers the window, plus all audio from that point on.
     ///
@@ -263,6 +270,8 @@ impl DvrBuffer {
     ///
     /// It copies the buffer out, rebuilds it at the new size and pushes everything back,
     /// so it needs about twice the window's memory for a moment.
+    ///
+    /// The old rings are freed here, so release any page lock on them before calling this.
     pub fn resize(&mut self, config: DvrConfig) {
         let was_skipping = self.skip_until_keyframe;
         let generation = self.generation + 1;
