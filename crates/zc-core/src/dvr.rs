@@ -6,8 +6,8 @@
 //!    [`DvrBuffer::new`]. After that, [`push`](DvrBuffer::push) only copies bytes
 //!    into existing memory; it runs on encoder threads during gameplay.
 //! 2. **GOP-aware eviction.** A clip must start at an IDR frame or it won't decode.
-//!    The video ring keeps an index of GOPs (start PTS, byte offset, length) and
-//!    evicts whole GOPs from the front — never individual frames.
+//!    The video ring's per-frame index *is* the GOP index: keyframe entries mark the
+//!    GOP starts, and eviction removes whole GOPs from the front, never single frames.
 //! 3. **Audio follows video.** Each audio track has its own ring. When a GOP is
 //!    evicted, audio older than the new oldest GOP's start PTS goes with it, so a
 //!    snapshot never contains audio without matching video (and DVR clips are
@@ -21,6 +21,7 @@
 //! [`DvrConfig::for_window`] against the *maximum* bitrate.
 
 use crate::media::{Packet, PacketRef, TrackId};
+use crate::ring::PacketRing;
 use crate::time::Hns;
 
 /// How much memory the buffer reserves.
@@ -83,20 +84,56 @@ pub enum DvrError {
     Empty,
 }
 
+/// Index of the video ring in [`DvrBuffer::rings`]. Audio rings follow it.
+const VIDEO_RING: usize = TrackId::Video.index();
+/// Bytes of video ring per index entry. Frames average at least 1 KiB at 2 Mbps and 240 fps.
+// ponytail: a fixed entry size, not a computed one. Tiny frames fill the index before the
+// bytes, so eviction starts early. Upgrade: size the index from the bitrate.
+const VIDEO_BYTES_PER_ENTRY: usize = 1024;
+/// Bytes of audio ring per index entry. MF's AAC encoder is CBR, so frames are at least 170 B.
+// ponytail: same fixed-entry shortcut as video. CBR audio never fills its index first.
+const AUDIO_BYTES_PER_ENTRY: usize = 128;
+/// Smallest index, so a small ring still holds a 1 s GOP at 240 fps with room to spare.
+// ponytail: a floor, not derived from the frame rate. A GOP with more frames than this is
+// refused with GopTooLarge. Upgrade: derive it from the GOP length.
+const MIN_ENTRIES: usize = 1024;
+
 /// The retrospective ring buffer. See the [module docs](self) for the rules it follows.
 #[derive(Debug)]
 pub struct DvrBuffer {
     config: DvrConfig,
-    // Phase 3: your storage goes here — pre-allocated byte rings (one per track)
-    // plus the GOP index. `VecDeque<Packet>` would allocate on every push; don't.
+    /// One ring per track, indexed by [`TrackId::index`]: video first, then the audio tracks.
+    rings: [PacketRing; TrackId::COUNT],
+    /// Video GOPs held. Each stored keyframe starts one.
+    gops: usize,
+    /// Video bytes in the GOP being written, so an oversized GOP is refused early.
+    current_gop_bytes: usize,
+    /// End of the newest stored video frame. [`buffered`](Self::buffered) measures to here.
+    newest_video_end: Hns,
+    /// Set at creation, after a refused GOP and after `clear`: drop video until a keyframe.
+    skip_until_keyframe: bool,
 }
 
 impl DvrBuffer {
     /// Allocates all storage up front. After this returns, `push` must not allocate.
     #[must_use]
     pub fn new(config: DvrConfig) -> Self {
-        let _ = config;
-        todo!("Phase 3: pre-allocate the rings and the GOP index")
+        let rings = TrackId::ALL.map(|track| {
+            let (bytes, bytes_per_entry) = if track.is_audio() {
+                (config.audio_bytes, AUDIO_BYTES_PER_ENTRY)
+            } else {
+                (config.video_bytes, VIDEO_BYTES_PER_ENTRY)
+            };
+            PacketRing::new(bytes, (bytes / bytes_per_entry).max(MIN_ENTRIES))
+        });
+        Self {
+            config,
+            rings,
+            gops: 0,
+            current_gop_bytes: 0,
+            newest_video_end: Hns::ZERO,
+            skip_until_keyframe: true,
+        }
     }
 
     /// The configuration the buffer was allocated with.
@@ -111,33 +148,38 @@ impl DvrBuffer {
     /// # Errors
     /// [`DvrError::GopTooLarge`] if the current GOP alone exceeds the video ring.
     pub fn push(&mut self, packet: PacketRef<'_>) -> Result<PushOutcome, DvrError> {
-        let _ = packet;
-        todo!("Phase 3: GOP-aware push (see the `dvr_*` specs)")
+        // A zero-sized video ring means DVR is off in settings, so nothing is kept.
+        if self.rings[VIDEO_RING].capacity() == 0 {
+            return Ok(PushOutcome::Discarded);
+        }
+        match packet.meta.track {
+            TrackId::Video => self.push_video(packet),
+            TrackId::Audio(_) => Ok(self.push_audio(packet)),
+        }
     }
 
     /// Number of GOPs held, including the one currently being written.
     #[must_use]
     pub fn gop_count(&self) -> usize {
-        todo!("Phase 3")
+        self.gops
     }
 
     /// Start PTS of the oldest retained GOP, or `None` if empty.
     #[must_use]
     pub fn oldest_pts(&self) -> Option<Hns> {
-        todo!("Phase 3")
+        self.rings[VIDEO_RING].front().map(|meta| meta.pts)
     }
 
     /// Span of video currently held: from the oldest GOP's start to the end of the newest frame.
     #[must_use]
     pub fn buffered(&self) -> Hns {
-        todo!("Phase 3")
+        self.oldest_pts().map_or(Hns::ZERO, |oldest| self.newest_video_end.saturating_sub(oldest))
     }
 
     /// Bytes currently used by `track`.
     #[must_use]
     pub fn used_bytes(&self, track: TrackId) -> usize {
-        let _ = track;
-        todo!("Phase 3")
+        self.rings[track.index()].used()
     }
 
     /// Copies out the last `window` of footage: video from the IDR of the newest GOP
@@ -163,7 +205,96 @@ impl DvrBuffer {
     /// Drops everything. The next stored packet must again be a keyframe.
     /// Used after a watchdog re-init (DESIGN §8: "buffer restarts from empty").
     pub fn clear(&mut self) {
-        todo!("Phase 3")
+        for ring in &mut self.rings {
+            ring.clear();
+        }
+        self.gops = 0;
+        self.current_gop_bytes = 0;
+        self.newest_video_end = Hns::ZERO;
+        self.skip_until_keyframe = true;
+    }
+
+    /// The video half of [`push`](Self::push). Keeps GOPs whole and starts at a keyframe.
+    fn push_video(&mut self, packet: PacketRef<'_>) -> Result<PushOutcome, DvrError> {
+        let meta = packet.meta;
+        let len = packet.data.len();
+        if meta.keyframe {
+            self.skip_until_keyframe = false;
+            self.current_gop_bytes = 0;
+        } else if self.skip_until_keyframe {
+            return Ok(PushOutcome::Discarded);
+        }
+
+        let capacity = self.rings[VIDEO_RING].capacity();
+        let gop_bytes = self.current_gop_bytes + len;
+        if gop_bytes > capacity {
+            // This GOP can never fit. Drop the rest of it; the next keyframe starts afresh.
+            self.skip_until_keyframe = true;
+            return Err(DvrError::GopTooLarge { bytes: gop_bytes, capacity });
+        }
+
+        while !self.rings[VIDEO_RING].has_room_for(len) {
+            // A keyframe may evict every older GOP. Any other frame must leave the GOP
+            // being written alone, so it can only evict down to one GOP.
+            let evictable = if meta.keyframe { self.gops } else { self.gops.saturating_sub(1) };
+            if evictable == 0 {
+                // The index is full inside one GOP: too many frames, not too many bytes.
+                self.skip_until_keyframe = true;
+                return Err(DvrError::GopTooLarge { bytes: gop_bytes, capacity });
+            }
+            self.evict_oldest_gop();
+        }
+
+        let stored = self.rings[VIDEO_RING].push(packet);
+        debug_assert!(stored, "the eviction loop made room for the packet");
+        if meta.keyframe {
+            self.gops += 1;
+        }
+        self.current_gop_bytes = gop_bytes;
+        self.newest_video_end = meta.end();
+        self.trim_audio();
+        Ok(PushOutcome::Stored)
+    }
+
+    /// The audio half of [`push`](Self::push). Audio is kept only if it starts at or after
+    /// the oldest retained video frame. When its own ring is full, its oldest packets go.
+    fn push_audio(&mut self, packet: PacketRef<'_>) -> PushOutcome {
+        let oldest = self.oldest_pts();
+        let len = packet.data.len();
+        let ring = &mut self.rings[packet.meta.track.index()];
+        // A packet bigger than the whole ring is refused up front, rather than emptying the ring.
+        if oldest.is_none_or(|start| packet.meta.pts < start) || len > ring.capacity() {
+            return PushOutcome::Discarded;
+        }
+        while !ring.has_room_for(len) {
+            if ring.pop_front().is_none() {
+                return PushOutcome::Discarded;
+            }
+        }
+        let stored = ring.push(packet);
+        debug_assert!(stored, "the eviction loop made room for the packet");
+        PushOutcome::Stored
+    }
+
+    /// Drops the oldest GOP: its keyframe, then every frame up to the next keyframe.
+    fn evict_oldest_gop(&mut self) {
+        let ring = &mut self.rings[VIDEO_RING];
+        ring.pop_front();
+        while ring.front().is_some_and(|meta| !meta.keyframe) {
+            ring.pop_front();
+        }
+        self.gops -= 1;
+    }
+
+    /// Drops audio that starts before the oldest retained video frame, so every kept audio
+    /// packet has video to play against. With no video retained, all audio goes.
+    fn trim_audio(&mut self) {
+        let oldest = self.oldest_pts();
+        for ring in &mut self.rings[VIDEO_RING + 1..] {
+            while ring.front().is_some_and(|meta| oldest.is_none_or(|o| meta.pts < o)) {
+                ring.pop_front();
+            }
+        }
     }
 }
 
@@ -225,7 +356,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: DvrBuffer::push (Phase 3)"]
     fn dvr_discards_video_until_the_first_keyframe() {
         let mut dvr = DvrBuffer::new(roomy());
         let mut s = SyntheticStream::new();
@@ -240,7 +370,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: DvrBuffer::push (Phase 3)"]
     fn dvr_discards_audio_that_has_no_video_to_align_to() {
         let mut dvr = DvrBuffer::new(roomy());
         let mut s = SyntheticStream::new();
@@ -250,7 +379,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: DvrBuffer::push eviction (Phase 3)"]
     fn dvr_evicts_whole_gops_and_only_as_many_as_needed() {
         // 60 KB GOPs into a 200 KB ring: exactly three whole GOPs fit.
         let mut dvr = DvrBuffer::new(DvrConfig { video_bytes: 200_000, audio_bytes: 1_000_000 });
@@ -262,7 +390,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: DvrBuffer::push eviction (Phase 3)"]
     fn dvr_evicts_audio_in_step_with_video() {
         // Video keeps 7 s..10 s; audio older than 7 s must go with the evicted GOPs,
         // even though the audio ring itself has plenty of room.
@@ -275,7 +402,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: DvrBuffer::push (Phase 3)"]
     fn dvr_rejects_a_gop_larger_than_the_ring() {
         let mut dvr = DvrBuffer::new(DvrConfig { video_bytes: 50_000, audio_bytes: 10_000 });
         let mut s = SyntheticStream::new();
@@ -377,7 +503,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: DvrBuffer::clear (Phase 3)"]
     fn dvr_clear_requires_a_new_keyframe() {
         let mut dvr = DvrBuffer::new(roomy());
         let mut s = SyntheticStream::new();

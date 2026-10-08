@@ -65,7 +65,6 @@ fn allocations_during(f: impl FnOnce()) -> usize {
 }
 
 #[test]
-#[ignore = "spec: DvrBuffer::push must not allocate (Phase 3)"]
 fn dvr_push_never_allocates() {
     // Small rings so that pushing 30 s forces plenty of eviction.
     let mut dvr = DvrBuffer::new(DvrConfig { video_bytes: 300_000, audio_bytes: 100_000 });
