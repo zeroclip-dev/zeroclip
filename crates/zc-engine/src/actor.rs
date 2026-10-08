@@ -1,4 +1,6 @@
 use std::fmt;
+use std::io;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -8,7 +10,6 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use time::macros::format_description;
 
-use zc_core::Codec;
 use zc_core::control::{Command, EngineEvent, EngineStatus};
 use zc_core::dvr::DvrConfig;
 use zc_core::hotkey::{Binding, ChordMatcher, HotkeyEvent, Trigger};
@@ -19,10 +20,14 @@ use zc_core::ports::{
 };
 use zc_core::profile::{WindowClamp, clamp_window};
 use zc_core::settings::{MicMode, Settings};
-use zc_core::sink::SharedSink;
+use zc_core::sink::{SharedSink, SinkId};
 use zc_core::watchdog::HealthEvent;
+use zc_core::{Codec, Hns};
+use zc_mux::pacing::{DriveKind, WritePacer};
 
+use crate::output::{self, OutputConfig};
 use crate::recorder::{Recorder, RecorderStats};
+use crate::spool;
 
 /// The platform adapters the engine drives. Every one is optional: the app runs,
 /// and the UI works, before the phase that delivers a given adapter lands.
@@ -107,6 +112,7 @@ impl Engine {
             recorder: Arc::new(Recorder::new(dvr)),
             stats_seen: RecorderStats::default(),
             audio_tracks: Vec::new(),
+            recording: None,
         };
         let thread =
             thread::Builder::new().name("zc-engine".into()).spawn(move || actor.run(&rx))?;
@@ -119,6 +125,8 @@ enum Msg {
     Command(Command),
     Os(OsEvent),
     Health(HealthEvent),
+    /// The recording's IO thread has finished: the saved file and its duration, or why it failed.
+    RecordingEnded(io::Result<(PathBuf, Hns)>),
 }
 
 /// A handle to a running engine. Dropping it shuts the engine down.
@@ -138,6 +146,7 @@ impl fmt::Debug for Msg {
             Self::Os(OsEvent::Key { .. }) => write!(f, "Os(Key)"),
             Self::Os(e) => write!(f, "Os({e:?})"),
             Self::Health(e) => write!(f, "Health({e:?})"),
+            Self::RecordingEnded(result) => write!(f, "RecordingEnded({result:?})"),
         }
     }
 }
@@ -206,6 +215,19 @@ struct Actor {
     /// Audio tracks that started, game audio first. The containers take them (P3.19).
     audio_tracks: Vec<TrackInfo>,
     hotkeys: ChordMatcher<HotkeyAction>,
+    /// The one recording in progress, if any (D20).
+    recording: Option<ActiveRecording>,
+}
+
+/// A manual recording, from its start until its IO thread has finished the file.
+struct ActiveRecording {
+    /// The recorder's tee slot. `None` once the recording has been stopped: the spool is
+    /// closed and the IO thread is finishing the file.
+    id: Option<SinkId>,
+    /// The file the recording ends up as.
+    path: PathBuf,
+    /// The IO thread that drains the spool into the file.
+    thread: JoinHandle<()>,
 }
 
 /// What a hotkey does. Engine-local: only the matcher's bindings use it.
@@ -317,9 +339,11 @@ impl Actor {
                 Msg::Command(command) => self.on_command(command),
                 Msg::Os(event) => self.on_os_event(event),
                 Msg::Health(event) => self.on_health(event),
+                Msg::RecordingEnded(result) => self.on_recording_ended(result),
             }
         }
         self.stop_sources();
+        self.finish_recording();
         tracing::info!("engine stopped");
     }
 
@@ -442,7 +466,7 @@ impl Actor {
     fn on_command(&mut self, command: Command) {
         match command {
             Command::SaveClip => self.not_implemented("Saving a DVR clip", 3),
-            Command::ToggleRecording => self.not_implemented("Manual recording", 3),
+            Command::ToggleRecording => self.toggle_recording(),
             Command::Screenshot => self.take_screenshot(),
             Command::PushToTalk(down) => {
                 if let Some(mic) = self.ports.mic.as_mut() {
@@ -462,6 +486,15 @@ impl Actor {
                 if video_changed && let Some(video) = self.ports.video.as_mut() {
                     tracing::info!("video settings changed; restarting capture");
                     video.stop();
+                    // A new codec, size or frame rate can't continue the same file or share
+                    // DVR clips with the old encoder's GOPs.
+                    if self.recording.as_ref().is_some_and(|r| r.id.is_some()) {
+                        self.stop_recording();
+                        self.emit(EngineEvent::Warning(
+                            "Video settings changed, so the recording was stopped.".into(),
+                        ));
+                    }
+                    self.recorder.clear();
                     self.status.capturing = false;
                     self.start_video();
                 }
@@ -489,6 +522,127 @@ impl Actor {
             Ok(()) => self.emit(EngineEvent::ScreenshotSaved { path }),
             Err(e) => self.emit(EngineEvent::Error(format!("Screenshot failed: {e}"))),
         }
+    }
+
+    /// Starts a manual recording, or stops it. One recording at a time (D20).
+    fn toggle_recording(&mut self) {
+        match &self.recording {
+            None => self.start_recording("recording"),
+            Some(ActiveRecording { id: Some(_), .. }) => self.stop_recording(),
+            // The last recording is still being finished, so its file isn't free yet.
+            Some(ActiveRecording { id: None, .. }) => {
+                self.emit(EngineEvent::Warning("Still finishing the last recording.".into()));
+            }
+        }
+    }
+
+    /// Starts a recording into a new file in the output folder. Packets reach it through the
+    /// spool, which an IO thread drains into the file (P3.21). The DVR keeps buffering.
+    fn start_recording(&mut self, label: &str) {
+        let Some(video) = self.ports.video.as_ref().and_then(|video| video.format()) else {
+            self.emit(EngineEvent::Warning("Nothing to record yet.".into()));
+            return;
+        };
+        let tracks: Vec<TrackInfo> =
+            std::iter::once(video).chain(self.audio_tracks.iter().cloned()).collect();
+        // Recordings stream at the encode bitrate. Pacing is for DVR dumps, which come in bursts.
+        let cfg = OutputConfig {
+            pacer: WritePacer::unlimited(),
+            ..OutputConfig::from_settings(
+                &self.settings,
+                self.output_dir.clone(),
+                DriveKind::Unknown,
+            )
+        };
+        let (partial, container) = match output::create_recording(&cfg, &tracks, label) {
+            Ok(created) => created,
+            Err(e) => {
+                self.emit(EngineEvent::Error(format!("Couldn't start the recording: {e}")));
+                return;
+            }
+        };
+
+        let (tee_writer, reader) = spool::spool();
+        let path = spool::final_path(&partial);
+        let inbox = self.inbox.clone();
+        let io_partial = partial.clone();
+        let spawned = thread::Builder::new().name("zc-io-recording".into()).spawn(move || {
+            // A panic must still end the recording, or the actor would wait for it forever.
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                spool::drain(reader, container, &io_partial)
+            }))
+            .unwrap_or_else(|_| Err(io::Error::other("the recording thread panicked")));
+            // Fails only while the engine is shutting down, when nobody needs the result.
+            let _ = inbox.send(Msg::RecordingEnded(result));
+        });
+        let io_thread = match spawned {
+            Ok(io_thread) => io_thread,
+            Err(e) => {
+                output::discard_recording(&partial);
+                self.emit(EngineEvent::Error(format!("Couldn't start the recording: {e}")));
+                return;
+            }
+        };
+        // Attached only once the IO thread exists, so a failed spawn never leaves a writer
+        // feeding a spool that nothing reads.
+        let id = self.recorder.attach(Box::new(tee_writer));
+        self.recording =
+            Some(ActiveRecording { id: Some(id), path: path.clone(), thread: io_thread });
+        self.status.recording = true;
+        self.publish_status();
+        tracing::info!(path = %path.display(), "recording started");
+        self.emit(EngineEvent::RecordingStarted { path });
+    }
+
+    /// Stops the recording. Closing the spool lets the IO thread drain what is left, finish the
+    /// file, and report back with `Msg::RecordingEnded`. The actor doesn't wait for that.
+    fn stop_recording(&mut self) {
+        let Some(recording) = self.recording.as_mut() else { return };
+        let Some(id) = recording.id.take() else { return };
+        drop(self.recorder.detach(id));
+        tracing::info!(path = %recording.path.display(), "recording stopped");
+    }
+
+    /// The IO thread has finished the file, or has given up on it. The thread sends this just
+    /// before it exits, so the join returns at once.
+    fn on_recording_ended(&mut self, result: io::Result<(PathBuf, Hns)>) {
+        let Some(recording) = self.recording.take() else {
+            tracing::warn!("a recording ended that the engine wasn't tracking");
+            return;
+        };
+        if recording.thread.join().is_err() {
+            tracing::error!("recording thread panicked");
+        }
+        // Still attached only if the IO thread gave up on a disk error. Detach it, so the
+        // recorder stops feeding a spool that nothing reads.
+        if let Some(id) = recording.id {
+            drop(self.recorder.detach(id));
+        }
+        self.status.recording = false;
+        self.publish_status();
+        match result {
+            Ok((path, duration)) => {
+                tracing::info!(path = %path.display(), "recording saved");
+                self.emit(EngineEvent::RecordingStopped { path, duration });
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "recording failed");
+                self.emit(EngineEvent::Error(format!("Recording failed: {e}")));
+            }
+        }
+    }
+
+    /// At shutdown, stops the recording and waits for its IO thread, so the file is finished
+    /// before the engine exits. The engine is exiting anyway, so this is the one wait on a drain.
+    fn finish_recording(&mut self) {
+        let Some(mut recording) = self.recording.take() else { return };
+        if let Some(id) = recording.id.take() {
+            drop(self.recorder.detach(id));
+        }
+        if recording.thread.join().is_err() {
+            tracing::error!("recording thread panicked");
+        }
+        tracing::info!(path = %recording.path.display(), "recording closed at shutdown");
     }
 
     fn on_os_event(&mut self, event: OsEvent) {
@@ -547,6 +701,15 @@ impl Actor {
             self.emit(EngineEvent::Warning(
                 "A keyframe interval's worth of video didn't fit in the DVR buffer; \
                  raise the memory limit or lower the bitrate."
+                    .into(),
+            ));
+        }
+        // Only a recording still attached can overflow its spool. After a stop, or after its
+        // IO thread gave up, a rise in the count is from a spool nobody reads, so it isn't news.
+        let attached = self.recording.as_ref().is_some_and(|recording| recording.id.is_some());
+        if stats.writer_errors > self.stats_seen.writer_errors && attached {
+            self.emit(EngineEvent::Warning(
+                "The disk couldn't keep up; the recording skipped ahead to the next keyframe."
                     .into(),
             ));
         }
@@ -947,6 +1110,72 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         flood.join().expect("flood thread");
         engine.shutdown();
+    }
+
+    #[test]
+    fn toggling_a_recording_before_capture_says_so() {
+        let (engine, _) = spawn(Ports::default());
+        engine.send(Command::ToggleRecording).unwrap();
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Warning(m) if m == "Nothing to record yet."),
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_recording_that_cannot_create_its_file_is_an_error() {
+        // The output folder is a plain file, so no recording file can be created in it.
+        let blocker = std::env::temp_dir().join(format!("zeroclip-blocker-{}", std::process::id()));
+        std::fs::write(&blocker, b"").unwrap();
+        let mut settings = Settings::default();
+        settings.recording.output_dir = Some(blocker.clone());
+        let config = EngineConfig { settings, default_output_dir: blocker.clone() };
+        let video = SyntheticVideoSource::new().realtime(true);
+        let ports = Ports { video: Some(Box::new(video)), ..Ports::default() };
+        let engine = Engine::spawn(config, ports, Arc::new(|()| {})).expect("spawn");
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.capturing));
+
+        engine.send(Command::ToggleRecording).unwrap();
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Error(m) if m.starts_with("Couldn't start")),
+        );
+        engine.shutdown();
+        let _ = std::fs::remove_file(blocker);
+    }
+
+    #[test]
+    fn changing_video_settings_ends_the_recording_and_empties_the_dvr() {
+        let dir = std::env::temp_dir().join(format!("zeroclip-restart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut settings = Settings::default();
+        settings.recording.output_dir = Some(dir.clone());
+        let config = EngineConfig { settings: settings.clone(), default_output_dir: dir.clone() };
+        let video = SyntheticVideoSource::new().realtime(true);
+        let ports = Ports { video: Some(Box::new(video)), ..Ports::default() };
+        let engine = Engine::spawn(config, ports, Arc::new(|()| {})).expect("spawn");
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Status(s) if s.buffered >= zc_core::Hns::from_secs(1)),
+        );
+        engine.send(Command::ToggleRecording).unwrap();
+        wait_for(&engine, |e| matches!(e, EngineEvent::RecordingStarted { .. }));
+
+        // A new frame rate means a new encoder: the old file and the old GOPs end here.
+        settings.video.fps = 30;
+        engine.send(Command::ApplySettings(Box::new(settings))).unwrap();
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Warning(m) if m.contains("recording was stopped")),
+        );
+        wait_for(&engine, |e| matches!(e, EngineEvent::RecordingStopped { .. }));
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Status(s) if s.buffered < zc_core::Hns::from_secs(1)),
+        );
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

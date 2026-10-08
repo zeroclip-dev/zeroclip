@@ -107,6 +107,12 @@ impl Recorder {
         self.lock().dvr.buffered()
     }
 
+    /// Empties the DVR buffer, for when the video format changes: GOPs from the old encoder
+    /// can't share a clip with the new one (DESIGN §8, "buffer restarts from empty").
+    pub fn clear(&self) {
+        self.lock().dvr.clear();
+    }
+
     /// Starts feeding a disk writer (manual or session recording).
     pub fn attach(&self, writer: Box<dyn PacketWriter>) -> SinkId {
         self.lock().tee.attach(writer)
