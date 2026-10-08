@@ -2,8 +2,8 @@
 //!
 //! Everything between "here are encoded packets" and "bytes on disk":
 //!
-//! - [`container`]: crash-survivable container writers (fragmented MP4 or MKV,
-//!   DESIGN §1). Which format becomes the default is an open question.
+//! - [`container`]: crash-survivable container writers. ZeroClip writes fragmented MP4
+//!   (D18, DESIGN §1); the MP4 boxes live in the private `fmp4` module.
 //! - [`bitstream`]: Annex-B NAL units, length prefixes, and the `avcC` and AAC
 //!   configuration records that MP4 keeps apart from the samples.
 //! - [`chunked`]: buffered writes in 8–16 MB blocks, so an HDD's head moves as
@@ -16,4 +16,10 @@
 pub mod bitstream;
 pub mod chunked;
 pub mod container;
+// Used by `container::create` from P3.11; until then only the tests call it.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "scaffold: wired into container::create in P3.11")
+)]
+mod fmp4;
 pub mod pacing;

@@ -3964,6 +3964,7 @@ dependencies = [
 name = "zc-mux"
 version = "0.1.0"
 dependencies = [
+ "tracing",
  "zc-core",
 ]
 
