@@ -17,7 +17,7 @@ type Totals = (u64, usize, Option<Hns>, Hns);
 
 /// Per-track totals.
 #[derive(Default)]
-struct Count(Mutex<[Totals; 3]>);
+struct Count(Mutex<[Totals; TrackId::COUNT]>);
 
 impl PacketSink for Count {
     fn push(&self, p: PacketRef<'_>) {

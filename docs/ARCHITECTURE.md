@@ -50,7 +50,7 @@ state machine; editing never re-encodes; nothing is ever deleted unverified.
 | `zc-engine` | engine actor | owns settings, profile, watchdog, modes; starts/stops sources | touch the hot path |
 | WGC frame pool | `zc-video` | pace to the target fps, convert to NV12, hand the ring slot to the encoder thread | allocate, block |
 | Encoder (`zc-video` thread) | `zc-video` | NeedInput → `ProcessInput`; HaveOutput → `ProcessOutput` → `PacketSink::push`; repeat the last frame while the screen is static | allocate, block on I/O |
-| `zc-game-audio`, `zc-mic` | `zc-audio` | WASAPI event loop → `SampleTimeline` → AAC → `PacketSink::push` (MMCSS "Pro Audio"); the mic applies the PTT gate and compressor; both reopen a lost device | allocate, block on I/O |
+| `zc-game-audio`, `zc-mic`, one per app track (up to 6 audio tracks) | `zc-audio` | WASAPI event loop → `SampleTimeline` → AAC → `PacketSink::push` (MMCSS "Pro Audio"); the mic applies the PTT gate and compressor; both reopen a lost device | allocate, block on I/O |
 | `zc-input` (message thread) | `zc-input` | Raw Input + WinEvent hook → `OsEvent`s; never logs keystrokes | do real work in callbacks |
 | IO | engine (Phase 3) | chunked, paced disk writes; clip dumps | hold the recorder lock |
 | tokio pool | app (Phase 5–6) | uploads, waveform extraction, ffmpeg jobs | — |

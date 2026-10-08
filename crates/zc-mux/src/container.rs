@@ -42,6 +42,8 @@ pub enum TrackKind {
 pub struct TrackInfo {
     /// Which track.
     pub track: TrackId,
+    /// Human-readable name such as "Game" or "Microphone", set when the track starts.
+    pub label: String,
     /// What it contains.
     pub kind: TrackKind,
     /// Decoder configuration: SPS/PPS(/VPS) for H.264/HEVC, the sequence header for

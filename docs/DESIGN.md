@@ -119,13 +119,15 @@ All modes share one zero-allocation encode loop. Memory is pre-allocated at laun
 
 ## 6. Audio Pipeline
 
+Tracks are dynamic: a recording carries one video track and up to six audio tracks (`TrackId`, D26). The game and mic tracks are the first two audio slots, and per-app tracks take the rest.
+
 ### Parallel audio ring buffers (the v1 gap)
 
 v1 described the ring buffer for video only. Retrospective DVR needs the last X minutes of **both** audio tracks held in matching time-windowed buffers, evicted in step with the video GOPs. Without this, every DVR clip comes out silent. Audio is cheap — two tracks of AAC at 192 kbps is about 48 KB/s, so five minutes is roughly 14 MB against the video's 750 MB. Eviction is driven by the video GOP index: when a GOP is dropped, audio older than that GOP's start PTS is dropped with it.
 
 ### Master clock and PTS
 
-The pipeline extracts `SystemRelativeTime` from the WGC `Direct3D11CaptureFrame` and maps it to the muxer's presentation timestamps. This is the anchor for everything; both audio tracks are aligned against it rather than against each other.
+The pipeline extracts `SystemRelativeTime` from the WGC `Direct3D11CaptureFrame` and maps it to the muxer's presentation timestamps. This is the anchor for everything; every audio track is aligned against it rather than against each other.
 
 The sound card's sample clock and QPC disagree by 10–100 ppm, which is up to 180 ms over a 30-minute session. Audio timestamps therefore count samples (exact and contiguous, which AAC needs) but are re-aligned to the buffer's QPC time by `zc_core::time::SampleTimeline` whenever they drift more than 20 ms: a gap is filled with silence, a fast device has frames dropped, and a gap over 1 s restarts the timeline. Corrections stay under the ~45 ms where viewers notice lip-sync errors.
 
