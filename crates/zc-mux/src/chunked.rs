@@ -8,6 +8,9 @@ use std::io::{self, Write};
 /// A [`Write`] adapter that forwards data to `inner` only in whole `chunk_size`
 /// blocks, except when explicitly flushed.
 ///
+/// Dropping it without calling [`flush`](Write::flush) or [`into_inner`](Self::into_inner)
+/// loses the pending partial chunk. There is no `Drop` impl that flushes for you.
+///
 /// The chunk buffer is allocated once, in [`new`](Self::new).
 #[derive(Debug)]
 pub struct ChunkedWriter<W: Write> {
@@ -43,19 +46,40 @@ impl<W: Write> ChunkedWriter<W> {
     ///
     /// # Errors
     /// Any error from the inner writer.
-    pub fn into_inner(self) -> io::Result<W> {
-        todo!("Phase 3: flush the partial chunk, return inner (see the `chunked_*` specs)")
+    pub fn into_inner(mut self) -> io::Result<W> {
+        self.flush()?;
+        Ok(self.inner)
     }
 }
 
 impl<W: Write> Write for ChunkedWriter<W> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        let _ = (data, &mut self.inner);
-        todo!("Phase 3: fill the chunk, forward full chunks (see the `chunked_*` specs)")
+        if data.is_empty() {
+            return Ok(0);
+        }
+        // The chunk is forwarded as soon as it fills, so there is always room for
+        // at least one byte here. Extending within the capacity from `new` never allocates.
+        let room = self.chunk_size - self.chunk.len();
+        let n = data.len().min(room);
+        let before = self.chunk.len();
+        self.chunk.extend_from_slice(&data[..n]);
+        if self.chunk.len() == self.chunk_size {
+            if let Err(e) = self.inner.write_all(&self.chunk) {
+                // Drop this call's bytes so the caller's retry cannot send them twice.
+                self.chunk.truncate(before);
+                return Err(e);
+            }
+            self.chunk.clear();
+        }
+        Ok(n)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        todo!("Phase 3: forward the partial chunk, then flush inner")
+        if !self.chunk.is_empty() {
+            self.inner.write_all(&self.chunk)?;
+            self.chunk.clear();
+        }
+        self.inner.flush()
     }
 }
 
@@ -85,7 +109,6 @@ mod tests {
     const MIB: usize = 1024 * 1024;
 
     #[test]
-    #[ignore = "spec: ChunkedWriter::write (Phase 3)"]
     fn chunked_forwards_only_whole_chunks() {
         let mut w = ChunkedWriter::new(Recorder::default(), 8 * MIB);
         let frame = vec![7u8; 3 * MIB];
@@ -100,7 +123,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: ChunkedWriter::write (Phase 3)"]
     fn chunked_holds_small_writes_until_a_chunk_fills() {
         let mut w = ChunkedWriter::new(Recorder::default(), 1_000);
         for _ in 0..9 {
@@ -112,7 +134,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: ChunkedWriter::flush (Phase 3)"]
     fn chunked_flush_forwards_the_partial_chunk_in_order() {
         let mut w = ChunkedWriter::new(Recorder::default(), 4);
         w.write_all(b"abcdef").unwrap();
