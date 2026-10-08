@@ -95,7 +95,7 @@ making the spec pass. Phases, and what "done" means for each, are in
 
 ## License
 
-Copyright © 2026 0xtikaa. ZeroClip is free software under the
-[GNU General Public License v3.0 or later](LICENSE): use it, study it, change it and share
-it, but any distributed version — including a modified or paid one — must ship its
-source under the same license.
+Copyright © 2026 0xtikaa. ZeroClip is free to use under the
+[PolyForm Noncommercial License 1.0.0](LICENSE), plus one extra permission: download it,
+use it, study it, change it and share it for free, and use it to make videos that earn
+money. What you may not do is sell ZeroClip, or software built from its code.
