@@ -22,6 +22,9 @@
 //! modes get tested deterministically (DESIGN §12, "synthetic-load test harness").
 
 mod actor;
+// Scaffolding: P3.20 (DVR save) and P3.22 (recording) are the first callers.
+#[cfg_attr(not(test), expect(dead_code, reason = "scaffold: P3.20 and P3.22 use the output stack"))]
+mod output;
 pub mod recorder;
 pub mod spool;
 pub mod synthetic;
