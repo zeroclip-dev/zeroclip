@@ -33,6 +33,10 @@ pub struct DvrConfig {
 }
 
 impl DvrConfig {
+    /// Extra footage reserved on top of the window. At most 2 s, so a full window still
+    /// covers its oldest whole GOP after eviction (GOPs are 1 s by default).
+    const HEADROOM: Hns = Hns::from_secs(2);
+
     /// Sizes the buffer to hold `window` of footage at the worst-case bitrates.
     ///
     /// The ring must fit the *maximum* VBR bitrate (DESIGN §4): 20 Mbps is 2.5 MB/s,
@@ -40,8 +44,15 @@ impl DvrConfig {
     /// a full window survive whole-GOP eviction.
     #[must_use]
     pub fn for_window(window: Hns, max_video_bitrate_bps: u64, audio_bitrate_bps: u64) -> Self {
-        let _ = (window, max_video_bitrate_bps, audio_bitrate_bps);
-        todo!("Phase 3: size the rings (see the `dvr_config_*` spec)")
+        let ticks = u128::try_from(window.ticks().max(0).saturating_add(Self::HEADROOM.ticks()))
+            .unwrap_or(0);
+        let ticks_per_second = u128::from(Hns::PER_SECOND.unsigned_abs());
+        // Bits per second × seconds, then ÷ 8 for bytes. Widened to u128, so it can't overflow.
+        let bytes = |bits_per_second: u64| {
+            usize::try_from(ticks * u128::from(bits_per_second) / 8 / ticks_per_second)
+                .unwrap_or(usize::MAX)
+        };
+        Self { video_bytes: bytes(max_video_bitrate_bps), audio_bytes: bytes(audio_bitrate_bps) }
     }
 }
 
@@ -205,7 +216,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: DvrConfig::for_window (Phase 3)"]
     fn dvr_config_sizes_for_the_worst_case_bitrate() {
         let cfg = DvrConfig::for_window(Hns::from_secs(60), 20_000_000, 192_000);
         // 20 Mbps = 2.5 MB/s → 150 MB for one minute (DESIGN §4 table), plus ≤ 2 s headroom.
