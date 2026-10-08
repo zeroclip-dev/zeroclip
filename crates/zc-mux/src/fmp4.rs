@@ -3,8 +3,10 @@
 //! is written in (D18).
 //!
 //! A file is an init segment, `ftyp` and `moov`, which declares the tracks. Its `mvex` says
-//! that fragments follow. Then there is one `moof` and `mdat` pair per GOP. Every number is
-//! big-endian, and every box size counts the 8-byte header.
+//! that fragments follow, and its `mehd` holds the file's length, which is filled in once the
+//! file is finished. Then there is one `moof` and `mdat` pair per GOP, and at the end an `mfra`
+//! index of those fragments. Every number is big-endian, and every box size counts the 8-byte
+//! header.
 
 use std::io::{self, Write};
 
@@ -42,7 +44,11 @@ fn init_segment(tracks: &[TrackInfo], video_config: Option<&[u8]>) -> io::Result
         moov.extend(trak(track_id, track, video_config)?);
     }
     let trexes = (1..=track_count).map(trex).collect::<io::Result<Vec<_>>>()?;
-    moov.extend(boxed(b"mvex", &trexes.concat())?);
+    // The length is 0 until the file is finished. The writer cannot seek back to set it, so
+    // `repair::set_fragment_duration` fills it in. Media Foundation reads 0 as no length.
+    let mut mvex = mehd(0)?;
+    mvex.extend(trexes.concat());
+    moov.extend(boxed(b"mvex", &mvex)?);
 
     let mut file = ftyp()?;
     file.extend(boxed(b"moov", &moov)?);
@@ -196,6 +202,53 @@ fn stbl(sample_entry: Vec<u8>) -> io::Result<Vec<u8>> {
 /// these are all zero, except that the description index is 1.
 fn trex(track_id: u32) -> io::Result<Vec<u8>> {
     full_box(b"trex", 0, 0, &u32s(&[track_id, 1, 0, 0, 0]))
+}
+
+/// `mehd` (version 1): the length of the whole fragmented presentation, in the movie timescale.
+/// Players use it as the duration. Without it they measure the fragments, which misses the end.
+fn mehd(fragment_duration: u64) -> io::Result<Vec<u8>> {
+    full_box(b"mehd", 1, 0, &fragment_duration.to_be_bytes())
+}
+
+/// One `tfra` entry: a fragment in which a track has samples, and where that fragment starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RandomAccessEntry {
+    /// The track's base media decode time in the fragment, which is its `tfdt`.
+    pub(crate) time: u64,
+    /// The offset of the fragment's `moof` from the start of the file.
+    pub(crate) moof_offset: u64,
+    /// The one-based position of the track's `traf` inside that `moof`.
+    pub(crate) traf_number: u8,
+}
+
+/// `mfra`, the movie fragment random access box (ISO/IEC 14496-12 §8.8.9): one `tfra` per track,
+/// which pairs each track ID with its entries, then an `mfro`. Without an index, Media Foundation
+/// reports no duration for a fragmented file, so the Windows player has no timeline. The reader is
+/// Media Foundation's [MPEG-4 file source](https://learn.microsoft.com/en-us/windows/win32/medfound/mpeg-4-file-source).
+pub(crate) fn mfra(tracks: &[(u32, &[RandomAccessEntry])]) -> io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    for &(track_id, entries) in tracks {
+        body.extend(tfra(track_id, entries)?);
+    }
+    // The size in mfro counts the whole mfra: its 8-byte header, the tfras, and the 16-byte mfro.
+    let size = u32::try_from(body.len() + 8 + 16).map_err(invalid_data)?;
+    body.extend(full_box(b"mfro", 0, 0, &size.to_be_bytes())?);
+    boxed(b"mfra", &body)
+}
+
+/// `tfra` (version 1, so times and offsets are 64-bit). Its length fields are zero, so the traf,
+/// trun and sample numbers each take one byte. A fragment starts on its sync sample, which is the
+/// first sample of the first trun, so the trun and sample numbers are always 1.
+fn tfra(track_id: u32, entries: &[RandomAccessEntry]) -> io::Result<Vec<u8>> {
+    let count = u32::try_from(entries.len()).map_err(invalid_data)?;
+    // The word after track_ID is 26 reserved bits, then three 2-bit length fields (size minus one).
+    let mut body = u32s(&[track_id, 0, count]);
+    for entry in entries {
+        body.extend_from_slice(&entry.time.to_be_bytes());
+        body.extend_from_slice(&entry.moof_offset.to_be_bytes());
+        body.extend_from_slice(&[entry.traf_number, 1, 1]);
+    }
+    full_box(b"tfra", 1, 0, &body)
 }
 
 /// A `VisualSampleEntry` (ISO/IEC 14496-12 §12.1.3) of type `kind`, followed by its
@@ -359,6 +412,10 @@ pub(crate) struct Fmp4Writer {
     samples: Vec<Vec<Sample>>,
     /// Their encoded bytes, per track position.
     data: Vec<Vec<u8>>,
+    /// Bytes written to the output so far, which is where the next box starts.
+    written: u64,
+    /// Each track's fragments, per track position, for the `mfra` written at finish.
+    index: Vec<Vec<RandomAccessEntry>>,
 }
 
 /// One sample waiting in a fragment.
@@ -422,6 +479,8 @@ impl Fmp4Writer {
             sequence: 0,
             samples: (0..count).map(|_| Vec::new()).collect(),
             data: (0..count).map(|_| Vec::new()).collect(),
+            written: 0,
+            index: (0..count).map(|_| Vec::new()).collect(),
         })
     }
 
@@ -439,6 +498,7 @@ impl Fmp4Writer {
     fn write_init(&mut self) -> io::Result<()> {
         let init = init_segment(&self.tracks, self.video_config.as_deref())?;
         self.out.write_all(&init)?;
+        self.written += u64::try_from(init.len()).map_err(invalid_data)?;
         self.init_written = true;
         self.video_config = None;
         Ok(())
@@ -574,10 +634,23 @@ impl ContainerWriter for Fmp4Writer {
         let moof = self.moof(&active, &offsets)?;
 
         let payload: usize = active.iter().map(|&position| self.data[position].len()).sum();
+        let mdat = box_header(b"mdat", payload)?;
+        let moof_offset = self.written;
         self.out.write_all(&moof)?;
-        self.out.write_all(&box_header(b"mdat", payload)?)?;
+        self.out.write_all(&mdat)?;
         for &position in &active {
             self.out.write_all(&self.data[position])?;
+        }
+        self.written += u64::try_from(moof.len() + mdat.len() + payload).map_err(invalid_data)?;
+        // Each track's traf starts with its first sample, which is a sync sample.
+        for (index, &position) in active.iter().enumerate() {
+            if let Some(first) = self.samples[position].first() {
+                self.index[position].push(RandomAccessEntry {
+                    time: u64::try_from(first.pts.ticks()).map_err(invalid_data)?,
+                    moof_offset,
+                    traf_number: u8::try_from(index + 1).map_err(invalid_data)?,
+                });
+            }
         }
         for &position in &active {
             self.samples[position].clear();
@@ -591,6 +664,16 @@ impl ContainerWriter for Fmp4Writer {
         if !self.init_written {
             self.write_init()?;
         }
+        // The index goes after the last fragment, where Media Foundation looks for it.
+        let mut tracks = Vec::new();
+        for (position, entries) in self.index.iter().enumerate() {
+            if !entries.is_empty() {
+                let track_id = u32::try_from(position + 1).map_err(invalid_data)?;
+                tracks.push((track_id, entries.as_slice()));
+            }
+        }
+        let trailer = mfra(&tracks)?;
+        self.out.write_all(&trailer)?;
         self.out.flush()
     }
 }
@@ -707,6 +790,17 @@ mod tests {
     }
 
     #[test]
+    fn mehd_is_version_1_with_a_64_bit_length() {
+        #[rustfmt::skip]
+        let expected = [
+            0, 0, 0, 20, b'm', b'e', b'h', b'd',
+            1, 0, 0, 0, // version 1, flags 0
+            0, 0, 0, 0, 0, 0, 1, 2, // fragment_duration
+        ];
+        assert_eq!(mehd(0x0102).unwrap(), expected);
+    }
+
+    #[test]
     fn mdhd_uses_the_timescale_and_und_language() {
         #[rustfmt::skip]
         let expected = [
@@ -816,7 +910,7 @@ mod tests {
             .map(|trak| u32::from_be_bytes(child(trak, b"tkhd")[12..16].try_into().unwrap()))
             .collect();
         assert_eq!(track_ids, [1, 2, 3]);
-        assert_eq!(kinds(child(moov, b"mvex")), ["trex", "trex", "trex"]);
+        assert_eq!(kinds(child(moov, b"mvex")), ["mehd", "trex", "trex", "trex"]);
     }
 
     #[test]
@@ -988,7 +1082,10 @@ mod tests {
         // Three seconds of video, game audio and mic: keyframes at 0, 1 and 2 s.
         let packets = SyntheticStream::new().take_secs(3);
         let file = mux(&recording_tracks(), &packets);
-        assert_eq!(kinds(&file), ["ftyp", "moov", "moof", "mdat", "moof", "mdat", "moof", "mdat"]);
+        assert_eq!(
+            kinds(&file),
+            ["ftyp", "moov", "moof", "mdat", "moof", "mdat", "moof", "mdat", "mfra"]
+        );
     }
 
     #[test]
@@ -1038,7 +1135,7 @@ mod tests {
 
         let moov = child(&file, b"moov");
         assert_eq!(kinds(moov), ["mvhd", "trak", "trak", "trak", "mvex"]);
-        assert_eq!(kinds(child(moov, b"mvex")), ["trex", "trex", "trex"]);
+        assert_eq!(kinds(child(moov, b"mvex")), ["mehd", "trex", "trex", "trex"]);
 
         let (moof, mdat) = fragments(&file)[0];
         assert_eq!(kinds(moof), ["mfhd", "traf", "traf", "traf"]);
@@ -1179,9 +1276,70 @@ mod tests {
         writer.write_packet(video_packet(16, false).view()).unwrap();
         writer.flush_fragment().unwrap();
         assert_eq!(kinds(&out.bytes()), ["ftyp", "moov", "moof", "mdat"]);
-        // Nothing is pending, so a second flush writes nothing, and neither does finish.
+        // Nothing is pending, so a second flush writes nothing. Finish adds only the index.
         writer.flush_fragment().unwrap();
         writer.finish().unwrap();
-        assert_eq!(kinds(&out.bytes()), ["ftyp", "moov", "moof", "mdat"]);
+        assert_eq!(kinds(&out.bytes()), ["ftyp", "moov", "moof", "mdat", "mfra"]);
+    }
+
+    /// The start offset of each top-level box of `file`, in order.
+    fn box_starts(file: &[u8]) -> Vec<usize> {
+        let mut starts = Vec::new();
+        let mut at = 0;
+        while at < file.len() {
+            starts.push(at);
+            at += u32_at(file, at) as usize;
+        }
+        starts
+    }
+
+    #[test]
+    fn mfra_holds_a_tfra_per_track_and_an_mfro_with_its_size() {
+        // One track with one fragment: time 0x0102, the moof at offset 0x30, the first traf.
+        let entry = RandomAccessEntry { time: 0x0102, moof_offset: 0x30, traf_number: 1 };
+        let tracks = [(2, &[entry][..])];
+        #[rustfmt::skip]
+        let expected = [
+            0, 0, 0, 67, b'm', b'f', b'r', b'a', // mfra: 8 + 43 + 16 bytes
+            0, 0, 0, 43, b't', b'f', b'r', b'a', // tfra: 12 + 12 + 19 bytes
+            1, 0, 0, 0, // version 1, flags 0
+            0, 0, 0, 2, // track_ID
+            0, 0, 0, 0, // reserved, then three length fields of 0: one byte each
+            0, 0, 0, 1, // number_of_entry
+            0, 0, 0, 0, 0, 0, 1, 2, // time
+            0, 0, 0, 0, 0, 0, 0, 0x30, // moof_offset
+            1, 1, 1, // traf_number, trun_number, sample_number
+            0, 0, 0, 16, b'm', b'f', b'r', b'o', // mfro: 16 bytes
+            0, 0, 0, 0, // version 0, flags 0
+            0, 0, 0, 67, // the size of the mfra
+        ];
+        assert_eq!(mfra(&tracks).unwrap(), expected);
+    }
+
+    #[test]
+    fn fmp4_ends_with_an_mfra_that_points_at_each_track_fragment() {
+        let file = mux(&recording_tracks(), &SyntheticStream::new().take_secs(3));
+        let mfra_at = *box_starts(&file).last().expect("a top-level box");
+        let index = &file[mfra_at..];
+        assert_eq!(&index[4..8], b"mfra", "mfra is the last box");
+        assert_eq!(u32_at(index, 0) as usize, index.len(), "mfra runs to the end of the file");
+        // mfro is the last 16 bytes, and its size field is the size of the mfra.
+        assert_eq!(u32_at(index, index.len() - 4) as usize, index.len(), "mfro holds the size");
+
+        let body = child(&file, b"mfra");
+        assert_eq!(kinds(body), ["tfra", "tfra", "tfra", "mfro"], "one tfra per track");
+        for (_, tfra) in boxes(body).into_iter().filter(|(kind, _)| kind == b"tfra") {
+            let track_id = u32_at(tfra, 4);
+            assert_eq!(u32_at(tfra, 12), 3, "one entry per fragment");
+            for entry in tfra[16..].chunks_exact(19) {
+                let offset = u64_at(entry, 8) as usize;
+                assert_eq!(&file[offset + 4..offset + 8], b"moof", "the entry points at a moof");
+                let moof = &file[offset + 8..offset + u32_at(&file, offset) as usize];
+                let traf = trafs(moof)[usize::from(entry[16]) - 1];
+                assert_eq!(u32_at(child(traf, b"tfhd"), 4), track_id, "the traf is this track's");
+                assert_eq!(tfdt_base(traf), u64_at(entry, 0), "the time is the traf's base time");
+                assert_eq!(&entry[17..19], [1, 1], "the first trun, and its first sample");
+            }
+        }
     }
 }
