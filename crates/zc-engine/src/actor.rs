@@ -1,24 +1,28 @@
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use time::OffsetDateTime;
 use time::macros::format_description;
 
+use zc_core::Codec;
 use zc_core::control::{Command, EngineEvent, EngineStatus};
+use zc_core::dvr::DvrConfig;
 use zc_core::hotkey::{Binding, ChordMatcher, HotkeyEvent, Trigger};
+use zc_core::media::{TrackId, TrackInfo, TrackKind};
 use zc_core::ports::{
     AudioSource, AudioStart, CaptureTarget, Emit, InputSource, OsEvent, SourceError, VideoSource,
     VideoStart,
 };
+use zc_core::profile::{WindowClamp, clamp_window};
 use zc_core::settings::{MicMode, Settings};
-use zc_core::sink::{PacketSink, SharedSink};
+use zc_core::sink::SharedSink;
 use zc_core::watchdog::HealthEvent;
-use zc_core::{Codec, PacketRef};
+
+use crate::recorder::{Recorder, RecorderStats};
 
 /// The platform adapters the engine drives. Every one is optional: the app runs,
 /// and the UI works, before the phase that delivers a given adapter lands.
@@ -85,6 +89,7 @@ impl Engine {
     ) -> Result<EngineHandle, EngineError> {
         let (inbox, rx) = mpsc::channel();
         let (events_tx, events) = mpsc::channel();
+        let (dvr, _) = dvr_config(&config.settings);
         let actor = Actor {
             output_dir: config
                 .settings
@@ -99,7 +104,9 @@ impl Engine {
             events: events_tx,
             wake,
             status: EngineStatus::default(),
-            packets: Arc::default(),
+            recorder: Arc::new(Recorder::new(dvr)),
+            stats_seen: RecorderStats::default(),
+            audio_tracks: Vec::new(),
         };
         let thread =
             thread::Builder::new().name("zc-engine".into()).spawn(move || actor.run(&rx))?;
@@ -177,6 +184,11 @@ impl Drop for EngineHandle {
     }
 }
 
+/// How often the engine looks at the recorder: the status bar's buffered span and the
+/// DVR's error counter. A fixed schedule, so a stream of key and health messages during
+/// gameplay can't postpone it.
+const STATUS_INTERVAL: Duration = Duration::from_secs(1);
+
 /// State owned by the engine thread.
 struct Actor {
     settings: Settings,
@@ -187,7 +199,12 @@ struct Actor {
     events: Sender<EngineEvent>,
     wake: Emit<()>,
     status: EngineStatus,
-    packets: Arc<PacketCounter>,
+    /// Where every source's packets go: the DVR buffer, then any disk writers.
+    recorder: Arc<Recorder>,
+    /// The recorder's counters at the last tick, so a rise is reported once.
+    stats_seen: RecorderStats,
+    /// Audio tracks that started, game audio first. The containers take them (P3.19).
+    audio_tracks: Vec<TrackInfo>,
     hotkeys: ChordMatcher<HotkeyAction>,
 }
 
@@ -226,21 +243,30 @@ fn bindings(settings: &Settings) -> Vec<Binding<HotkeyAction>> {
     bindings
 }
 
-/// Counts what the video source produces. A Phase 1 stand-in for the `Recorder`,
-/// which needs Phase 2's `MasterClock` and Phase 3's `DvrBuffer`; Phase 3 replaces
-/// it. Atomics only, so `push` never allocates or blocks (CLAUDE.md rule 2).
-#[derive(Debug, Default)]
-struct PacketCounter {
-    packets: AtomicU64,
-    keyframes: AtomicU64,
-    bytes: AtomicU64,
+/// Sizes the DVR for these settings, and says how the RAM ceiling clamped the window the
+/// profile asks for (DESIGN §7). With the DVR off, both rings are zero bytes, which
+/// `DvrBuffer` treats as off.
+fn dvr_config(settings: &Settings) -> (DvrConfig, WindowClamp) {
+    let max_video_bps = u64::from(settings.video.max_bitrate_kbps) * 1_000;
+    let ram_ceiling = u64::from(settings.dvr.ram_ceiling_mib) << 20;
+    let clamp = clamp_window(settings.profiles.default.buffer(), max_video_bps, ram_ceiling);
+    let config = if settings.dvr.enabled {
+        let audio_bps = u64::from(settings.audio.bitrate_kbps) * 1_000;
+        DvrConfig::for_window(clamp.window, max_video_bps, audio_bps)
+    } else {
+        DvrConfig { video_bytes: 0, audio_bytes: 0 }
+    };
+    (config, clamp)
 }
 
-impl PacketSink for PacketCounter {
-    fn push(&self, packet: PacketRef<'_>) {
-        self.packets.fetch_add(1, Ordering::Relaxed);
-        self.keyframes.fetch_add(u64::from(packet.meta.keyframe), Ordering::Relaxed);
-        self.bytes.fetch_add(packet.data.len() as u64, Ordering::Relaxed);
+/// The container track for an audio source that has started. `codec_private` stays
+/// empty: the muxer builds the AAC config from the rate and channel count (P3.19).
+fn audio_track(track: TrackId, label: &str, config: &AudioStart) -> TrackInfo {
+    TrackInfo {
+        track,
+        label: label.into(),
+        kind: TrackKind::Audio { sample_rate: config.sample_rate, channels: config.channels },
+        codec_private: Vec::new(),
     }
 }
 
@@ -270,9 +296,21 @@ fn file_stamp(t: OffsetDateTime) -> String {
 impl Actor {
     fn run(mut self, rx: &Receiver<Msg>) {
         tracing::info!(output_dir = %self.output_dir.display(), "engine started");
+        self.update_window();
         self.start_sources();
         self.publish_status();
-        for msg in rx {
+        let mut next_tick = Instant::now() + STATUS_INTERVAL;
+        loop {
+            let now = Instant::now();
+            if now >= next_tick {
+                self.on_tick();
+                next_tick = now + STATUS_INTERVAL;
+            }
+            let msg = match rx.recv_timeout(next_tick.saturating_duration_since(now)) {
+                Ok(msg) => msg,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
             tracing::trace!(?msg, "engine message");
             match msg {
                 Msg::Command(Command::Shutdown) => break,
@@ -296,8 +334,21 @@ impl Actor {
         self.emit(EngineEvent::NotImplemented { feature, phase });
     }
 
-    fn publish_status(&mut self) {
-        self.status.buffer_window = self.settings.profiles.default.buffer();
+    /// Works out the DVR window the settings ask for after the RAM ceiling, and warns if
+    /// the ceiling cut it. The buffer itself keeps the size it was allocated with.
+    fn update_window(&mut self) {
+        let (_, clamp) = dvr_config(&self.settings);
+        self.status.buffer_window = clamp.window;
+        if clamp.clamped {
+            self.emit(EngineEvent::Warning(format!(
+                "The {} MiB DVR memory limit cuts the buffer to {:.0} s.",
+                self.settings.dvr.ram_ceiling_mib,
+                clamp.window.as_secs_f64(),
+            )));
+        }
+    }
+
+    fn publish_status(&self) {
         self.emit(EngineEvent::Status(self.status.clone()));
     }
 
@@ -311,7 +362,6 @@ impl Actor {
     }
 
     fn start_sources(&mut self) {
-        // Phase 3: hand every source the Recorder instead of the packet counter.
         self.start_video();
         self.start_audio();
 
@@ -325,7 +375,8 @@ impl Actor {
         }
     }
 
-    /// Both audio tracks: 48 kHz stereo AAC at the configured bitrate.
+    /// Both audio tracks: 48 kHz stereo AAC at the configured bitrate. Game audio starts
+    /// first, so it is the first audio track (browsers and Discord play only that one).
     fn start_audio(&mut self) {
         let config = AudioStart {
             sample_rate: 48_000,
@@ -333,20 +384,21 @@ impl Actor {
             bitrate_bps: self.settings.audio.bitrate_kbps.saturating_mul(1_000),
         };
         let health = self.health_emitter();
-        let sink: SharedSink = Arc::clone(&self.packets) as SharedSink;
+        let sink: SharedSink = self.recorder.clone();
         let gate_open = self.settings.audio.mic == MicMode::AlwaysOn;
         let mut errors = Vec::new();
-        if let Some(Err(e)) = self
-            .ports
-            .game_audio
-            .as_mut()
-            .map(|a| a.start(&config, Arc::clone(&sink), Arc::clone(&health)))
-        {
-            errors.push(format!("Game audio unavailable: {e}"));
+        if let Some(game) = self.ports.game_audio.as_mut() {
+            match game.start(&config, Arc::clone(&sink), Arc::clone(&health)) {
+                Ok(()) => self.audio_tracks.push(audio_track(game.track(), "Game", &config)),
+                Err(e) => errors.push(format!("Game audio unavailable: {e}")),
+            }
         }
         if let Some(mic) = self.ports.mic.as_mut() {
             match mic.start(&config, sink, health) {
-                Ok(()) => mic.set_gate(gate_open),
+                Ok(()) => {
+                    mic.set_gate(gate_open);
+                    self.audio_tracks.push(audio_track(mic.track(), "Microphone", &config));
+                }
                 Err(e) => errors.push(format!("Microphone unavailable: {e}")),
             }
         }
@@ -358,14 +410,14 @@ impl Actor {
     fn start_video(&mut self) {
         let health = self.health_emitter();
         let config = video_start(&self.settings);
-        let sink: SharedSink = Arc::clone(&self.packets) as SharedSink;
+        let sink: SharedSink = self.recorder.clone();
         match self.ports.video.as_mut().map(|video| video.start(&config, sink, health)) {
             Some(Ok(codec)) => {
                 tracing::info!(codec = codec.name(), "capture started");
                 self.status.capturing = true;
                 self.status.codec = Some(codec);
             }
-            Some(Err(e)) => self.emit(EngineEvent::Error(format!("Capture unavailable: {e}"))),
+            Some(Err(e)) => self.emit(EngineEvent::Error(format!("Capture couldn't start: {e}"))),
             None => self.emit(EngineEvent::Warning(
                 "No capture source yet: the GPU video pipeline arrives in Phase 1.".into(),
             )),
@@ -382,14 +434,8 @@ impl Actor {
         }
         if let Some(video) = video {
             video.stop();
-            let c = &self.packets;
-            tracing::info!(
-                packets = c.packets.load(Ordering::Relaxed),
-                keyframes = c.keyframes.load(Ordering::Relaxed),
-                bytes = c.bytes.load(Ordering::Relaxed),
-                "stream totals (all tracks)"
-            );
         }
+        tracing::info!(stats = ?self.recorder.stats(), "recorder totals");
         self.status.capturing = false;
     }
 
@@ -404,9 +450,10 @@ impl Actor {
                 }
             }
             Command::ApplySettings(settings) => {
-                // Phase 3/4: also re-size the DVR buffer.
+                // Phase 4: also re-size the DVR buffer. Until then it keeps its startup size.
                 let video_changed = self.settings.video != settings.video;
                 self.settings = *settings;
+                self.update_window();
                 self.hotkeys = ChordMatcher::new(bindings(&self.settings));
                 // Switching modes must never leave the push-to-talk gate open.
                 if let Some(mic) = self.ports.mic.as_mut() {
@@ -486,19 +533,40 @@ impl Actor {
         // Phase 4: `Watchdog::on_event` decides; carry out the action it returns.
         tracing::trace!(?event, "health");
     }
+
+    /// Runs once a second while no message arrives. Refreshes the buffered span on the
+    /// status bar when it moved, and warns when the DVR refused video since the last tick.
+    fn on_tick(&mut self) {
+        let buffered = self.recorder.buffered();
+        if buffered != self.status.buffered {
+            self.status.buffered = buffered;
+            self.publish_status();
+        }
+        let stats = self.recorder.stats();
+        if stats.dvr_errors > self.stats_seen.dvr_errors {
+            self.emit(EngineEvent::Warning(
+                "A keyframe interval's worth of video didn't fit in the DVR buffer; \
+                 raise the memory limit or lower the bitrate."
+                    .into(),
+            ));
+        }
+        self.stats_seen = stats;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
     use std::sync::Mutex;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use zc_core::media::TrackInfo;
+    use zc_core::hotkey::Key;
+
+    use crate::synthetic::SyntheticVideoSource;
 
     use super::*;
 
-    /// A video source that never touches a GPU. (`SyntheticVideoSource` arrives in Phase 3.)
+    /// A video source that never touches a GPU and can be told to fail.
     struct FakeVideo {
         fail: bool,
         starts: Arc<AtomicUsize>,
@@ -803,6 +871,82 @@ mod tests {
         let state = game.0.lock().unwrap();
         assert_eq!(state.0, 1, "started once");
         assert_eq!(state.1, [Some(42)]);
+    }
+
+    #[test]
+    fn dvr_is_sized_for_the_clamped_window_and_off_when_disabled() {
+        let mut settings = Settings::default();
+        settings.profiles.default.buffer_secs = 600;
+        settings.dvr.ram_ceiling_mib = 64;
+        let (config, clamp) = dvr_config(&settings);
+        assert!(clamp.clamped);
+        assert_eq!(config, DvrConfig::for_window(clamp.window, 20_000_000, 192_000));
+
+        settings.dvr.enabled = false;
+        let (config, _) = dvr_config(&settings);
+        assert_eq!(config, DvrConfig { video_bytes: 0, audio_bytes: 0 });
+    }
+
+    #[test]
+    fn a_ram_ceiling_that_cuts_the_window_is_announced() {
+        let mut settings = Settings::default();
+        settings.profiles.default.buffer_secs = 600;
+        settings.dvr.ram_ceiling_mib = 64;
+        let config = EngineConfig {
+            settings,
+            default_output_dir: std::env::temp_dir().join("zeroclip-test"),
+        };
+        let engine = Engine::spawn(config, Ports::default(), Arc::new(|()| {})).expect("spawn");
+        wait_for(&engine, |e| matches!(e, EngineEvent::Warning(m) if m.contains("MiB")));
+        let event = wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        let EngineEvent::Status(status) = event else { unreachable!() };
+        assert!(status.buffer_window < zc_core::Hns::from_secs(600));
+    }
+
+    #[test]
+    fn status_reports_the_buffered_footage_each_second() {
+        // Frames arrive at 60 fps in real time, so a tick a second in sees about a second.
+        let video = SyntheticVideoSource::new().realtime(true);
+        let (engine, _) = spawn(Ports { video: Some(Box::new(video)), ..Ports::default() });
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Status(s) if s.buffered >= zc_core::Hns::from_secs(1)),
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn status_keeps_refreshing_while_keys_flood_in() {
+        // During gameplay the inbox is never quiet for a second: every key press is a
+        // message. The status tick must still run.
+        let input = FakeInput::default();
+        let video = SyntheticVideoSource::new().realtime(true);
+        let ports = Ports {
+            video: Some(Box::new(video)),
+            input: Some(Box::new(input.clone())),
+            ..Ports::default()
+        };
+        let (engine, _) = spawn(ports);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        let emit = input.0.lock().unwrap().clone().expect("input started");
+        let stop = Arc::new(AtomicBool::new(false));
+        let flood = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let key = Key::letter('W').expect("a letter");
+                while !stop.load(Ordering::Relaxed) {
+                    emit(OsEvent::Key { key, down: true });
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Status(s) if s.buffered >= zc_core::Hns::from_secs(1)),
+        );
+        stop.store(true, Ordering::Relaxed);
+        flood.join().expect("flood thread");
+        engine.shutdown();
     }
 
     #[test]
