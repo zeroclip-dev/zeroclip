@@ -1,6 +1,6 @@
-//! Fragmented MP4 boxes (ISO/IEC 14496-12, with the AVC and AAC sample descriptions of
-//! 14496-15 and 14496-3). This is the container every recording and DVR dump is written in
-//! (D18).
+//! Fragmented MP4 boxes (ISO/IEC 14496-12, with the AVC and HEVC sample descriptions of
+//! 14496-15 and the AAC ones of 14496-3). This is the container every recording and DVR dump
+//! is written in (D18).
 //!
 //! A file is an init segment, `ftyp` and `moov`, which declares the tracks. Its `mvex` says
 //! that fragments follow. Then there is one `moof` and `mdat` pair per GOP. Every number is
@@ -300,8 +300,8 @@ fn trak(track_id: u32, track: &TrackInfo, video_config: Option<&[u8]>) -> io::Re
     boxed(b"trak", &[tkhd(track_id, track, size)?, mdia].concat())
 }
 
-/// The sample description for a video track: `avc1` with `avcC`, from the first parameter
-/// sets the stream carries.
+/// The sample description for a video track: `avc1` with `avcC`, or `hvc1` with `hvcC`, from
+/// the parameter sets the stream carries.
 fn video_entry(codec: Codec, size: (u16, u16), params: &[u8]) -> io::Result<Vec<u8>> {
     match codec {
         Codec::H264 => {
@@ -316,10 +316,18 @@ fn video_entry(codec: Codec, size: (u16, u16), params: &[u8]) -> io::Result<Vec<
             };
             visual_entry(b"avc1", size, &boxed(b"avcC", &record)?)
         }
-        Codec::Hevc => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "HEVC fragments aren't written yet (P3.12)",
-        )),
+        Codec::Hevc => {
+            let record = match bitstream::hevc_parameter_sets(params) {
+                Some((vps, sps, pps)) => bitstream::hvcc(vps, sps, pps).map_err(invalid_data)?,
+                None => {
+                    warn!(
+                        "no HEVC parameter sets before the first keyframe; the file declares none"
+                    );
+                    bitstream::hvcc(&[], &[], &[]).map_err(invalid_data)?
+                }
+            };
+            visual_entry(b"hvc1", size, &boxed(b"hvcC", &record)?)
+        }
         Codec::Av1 => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "AV1 fragments aren't written yet (P3.13)",
@@ -392,7 +400,7 @@ impl Fmp4Writer {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
             }
             if let TrackKind::Video { codec, .. } = &track.kind
-                && *codec != Codec::H264
+                && !matches!(*codec, Codec::H264 | Codec::Hevc)
             {
                 let message = format!("{} fragments aren't written yet", codec.name());
                 return Err(io::Error::new(io::ErrorKind::Unsupported, message));
@@ -842,10 +850,35 @@ mod tests {
     }
 
     #[test]
-    fn hevc_and_av1_are_unsupported_until_their_cards() {
+    fn av1_is_unsupported_until_p3_13() {
+        let mut track = video();
+        track.kind = TrackKind::Video { codec: Codec::Av1, width: 320, height: 240, fps: 60 };
+        assert_eq!(init_segment(&[track], None).unwrap_err().kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn hvc1_carries_the_hvcc_from_the_first_keyframe() {
         let mut track = video();
         track.kind = TrackKind::Video { codec: Codec::Hevc, width: 320, height: 240, fps: 60 };
-        assert_eq!(init_segment(&[track], None).unwrap_err().kind(), io::ErrorKind::Unsupported);
+        // VPS, SPS and PPS in Annex B, then an IDR slice. The SPS has emulation-prevention
+        // bytes in its profile constraints, as real ones do.
+        #[rustfmt::skip]
+        let in_band: &[u8] = &[
+            0, 0, 0, 1, 0x40, 0x01, 0x0C, // VPS
+            0, 0, 0, 1, 0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, // SPS
+            0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3C, 0xA0,
+            0, 0, 0, 1, 0x44, 0x01, 0xC1, // PPS
+            0, 0, 1, 0x26, 0x01, // IDR
+        ];
+        let init = init_segment(&[track], Some(in_band)).unwrap();
+        let hvc1 = child(sample_entries(&init), b"hvc1");
+        assert_eq!(&hvc1[24..28], [0x01, 0x40, 0x00, 0xF0], "320 x 240");
+        let hvcc = child(&hvc1[78..], b"hvcC");
+        // configurationVersion 1, then the general profile_tier_level from the SPS.
+        assert_eq!(hvcc[0], 1);
+        assert_eq!(hvcc[1..4], [0x01, 0x60, 0x00]);
+        // Three arrays: VPS, SPS and PPS are declared.
+        assert_eq!(hvcc[22], 3);
     }
 
     /// A writer output that the test keeps a handle on, to read the file back.
@@ -1126,9 +1159,9 @@ mod tests {
         let mut video_as_audio = audio(TrackId::Mic, "Mic");
         video_as_audio.track = TrackId::Video;
         assert_eq!(kind_of(&[video_as_audio]), Some(io::ErrorKind::InvalidInput));
-        let mut hevc = video();
-        hevc.kind = TrackKind::Video { codec: Codec::Hevc, width: 320, height: 240, fps: 60 };
-        assert_eq!(kind_of(&[hevc]), Some(io::ErrorKind::Unsupported));
+        let mut av1 = video();
+        av1.kind = TrackKind::Video { codec: Codec::Av1, width: 320, height: 240, fps: 60 };
+        assert_eq!(kind_of(&[av1]), Some(io::ErrorKind::Unsupported));
     }
 
     #[test]
