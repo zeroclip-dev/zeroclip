@@ -190,3 +190,14 @@ a separate `ffmpeg.exe` process (D3), so its LGPL/GPL build never mixes with thi
 license. Costs: ZeroClip is source-available, not "open source" by the OSI definition,
 and GitHub lists the license as "Other". Copies taken while the repo was public under
 GPL (2026-10-08, about two hours) keep their GPL rights for that version.
+
+### D29 · DVR snapshots copy in short locked chunks (revisits D19)
+P3.17 measured the one-shot copy under the recorder lock: 115–135 ms for a 60 s window,
+0.7–1.0 s for 300 s, against D19's 20 ms limit. The audio capture buffer is 100 ms, so
+even a default save would drop audio and video. Instead of shared segments, the snapshot
+now plans under the lock (packet metadata and absolute byte positions only), allocates
+and pre-faults the copy outside it, then copies a few MiB per lock hold, oldest first.
+Every ring counts the bytes it has ever written, so a packet the writer has overwritten
+in the meantime is detected, not copied; the clip then starts at the next keyframe. The
+2 s of headroom `DvrConfig::for_window` adds makes that rare. Cost: a save takes about
+as long as before in total, but no hold is longer than a few milliseconds.
