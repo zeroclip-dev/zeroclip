@@ -2,15 +2,18 @@
 //! repaint, and repaints only happen on input or when the engine wakes us.
 
 pub mod clips;
+pub mod components;
 pub mod home;
 pub mod profiles;
 pub mod settings;
 
 use eframe::egui::{self, Align, Color32, Layout, RichText};
 use zc_core::Hns;
+use zc_core::control::MicState;
 use zc_core::media::Codec;
 
 use crate::app::{NoticeLevel, Tab, ZeroClipApp};
+use components::mic_indicator::MicIndicator;
 
 pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
     egui::Panel::top("top_bar").show(ui, |ui| top_bar(app, ui));
@@ -71,6 +74,10 @@ fn status_bar(app: &ZeroClipApp, ui: &mut egui::Ui) {
         ui.weak(format!("Watchdog: {:?}", status.watchdog));
         ui.separator();
         ui.weak(format!("Game: {}", status.game.as_deref().unwrap_or("none")));
+        if status.mic != MicState::Off {
+            ui.separator();
+            ui.add(MicIndicator(status.mic));
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.weak(concat!("v", env!("CARGO_PKG_VERSION")));
         });

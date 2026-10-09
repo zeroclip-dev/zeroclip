@@ -171,3 +171,4 @@ CI runs formatting, clippy (`-D warnings`), tests and docs on Windows for every 
 | A new upload target | `zc-destinations` (one `impl Destination`) |
 | A setting | `zc_core::settings` with a serde default, plus a field on the Settings tab |
 | A UI screen | `src/ui/` |
+| A UI widget that more than one screen uses | `src/ui/components/` (one module per widget) |
