@@ -950,7 +950,9 @@ impl Actor {
     /// Runs once a second while no message arrives. Refreshes the buffered span on the
     /// status bar when it moved, and warns when the DVR refused video since the last tick.
     fn on_tick(&mut self) {
-        let buffered = self.recorder.buffered();
+        // The ring is sized for the maximum bitrate, so at a lower one it holds more than the
+        // window. A save only takes the window, so that's the most worth showing.
+        let buffered = self.recorder.buffered().min(self.status.buffer_window);
         if buffered != self.status.buffered {
             self.status.buffered = buffered;
             self.publish_status();
