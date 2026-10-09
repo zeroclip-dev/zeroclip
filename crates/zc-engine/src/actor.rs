@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use time::macros::format_description;
 
-use zc_core::control::{Command, EngineEvent, EngineStatus};
+use zc_core::control::{Command, EngineEvent, EngineStatus, MicState};
 use zc_core::dvr::{DvrConfig, DvrError};
 use zc_core::hotkey::{Binding, ChordMatcher, HotkeyEvent, Trigger};
 use zc_core::media::{TrackId, TrackInfo, TrackKind};
@@ -126,6 +126,8 @@ impl Engine {
             recording: None,
             saving: None,
             drive: DriveKind::default(),
+            mic_running: false,
+            ptt_held: false,
         };
         let thread =
             thread::Builder::new().name("zc-engine".into()).spawn(move || actor.run(&rx))?;
@@ -245,6 +247,11 @@ struct Actor {
     saving: Option<thread::JoinHandle<()>>,
     /// What kind of drive the output folder is on, which sets the write pacing for dumps.
     drive: DriveKind,
+    /// Whether the mic source started, so it is running. Set by `start_audio`, cleared by
+    /// `stop_sources`.
+    mic_running: bool,
+    /// Whether the push-to-talk key is down, as the last `Command::PushToTalk` said.
+    ptt_held: bool,
 }
 
 /// A manual recording, from its start until its IO thread has finished the file.
@@ -505,6 +512,30 @@ impl Actor {
         self.emit(EngineEvent::Status(self.status.clone()));
     }
 
+    /// The mic's state for the status bar: `Live` while it captures, `Muted` in push-to-talk with
+    /// the key up, and `Off` when the mic is off or didn't start.
+    fn mic_state(&self) -> MicState {
+        if !self.mic_running {
+            return MicState::Off;
+        }
+        match self.settings.audio.mic {
+            MicMode::Off => MicState::Off,
+            MicMode::AlwaysOn => MicState::Live,
+            MicMode::PushToTalk if self.ptt_held => MicState::Live,
+            MicMode::PushToTalk => MicState::Muted,
+        }
+    }
+
+    /// Publishes the status only if the mic's state moved. A held key auto-repeats its press, and
+    /// those repeats must not flood the UI with identical statuses.
+    fn refresh_mic_state(&mut self) {
+        let state = self.mic_state();
+        if state != self.status.mic {
+            self.status.mic = state;
+            self.publish_status();
+        }
+    }
+
     /// Posts health signals from source threads into the engine's inbox.
     fn health_emitter(&self) -> Emit<HealthEvent> {
         let inbox = self.inbox.clone();
@@ -553,6 +584,7 @@ impl Actor {
                 Ok(()) => {
                     mic.set_gate(gate_open);
                     tracks.push(audio_track(mic.track(), "Microphone", &config));
+                    self.mic_running = true;
                 }
                 Err(e) => errors.push(format!("Microphone unavailable: {e}")),
             }
@@ -568,6 +600,8 @@ impl Actor {
             }
         }
         self.audio_tracks = tracks;
+        // `run` publishes the first status once the sources have started.
+        self.status.mic = self.mic_state();
         for error in errors {
             self.emit(EngineEvent::Error(error));
         }
@@ -604,6 +638,8 @@ impl Actor {
         }
         tracing::info!(stats = ?self.recorder.stats(), "recorder totals");
         self.status.capturing = false;
+        self.mic_running = false;
+        self.status.mic = self.mic_state();
     }
 
     fn on_command(&mut self, command: Command) {
@@ -612,9 +648,11 @@ impl Actor {
             Command::ToggleRecording => self.toggle_recording(),
             Command::Screenshot => self.take_screenshot(),
             Command::PushToTalk(down) => {
+                self.ptt_held = down;
                 if let Some(mic) = self.ports.mic.as_mut() {
                     mic.set_gate(down);
                 }
+                self.refresh_mic_state();
             }
             Command::ApplySettings(settings) => {
                 // Phase 4: also re-size the DVR buffer. Until then it keeps its startup size.
@@ -626,6 +664,9 @@ impl Actor {
                 if let Some(mic) = self.ports.mic.as_mut() {
                     mic.set_gate(self.settings.audio.mic == MicMode::AlwaysOn);
                 }
+                // The gate was just set for the new mode, and the matcher was rebuilt above, so
+                // it has forgotten any push-to-talk key that was down.
+                self.ptt_held = false;
                 if video_changed && let Some(video) = self.ports.video.as_mut() {
                     tracing::info!("video settings changed; restarting capture");
                     video.stop();
@@ -649,6 +690,7 @@ impl Actor {
                     self.detect_drive();
                 }
                 tracing::info!("settings applied");
+                self.status.mic = self.mic_state();
                 self.publish_status();
             }
             Command::Shutdown => unreachable!("handled by the run loop"),
@@ -1205,6 +1247,82 @@ mod tests {
             |e| matches!(e, EngineEvent::Warning(m) if m.starts_with("Nothing to save")),
         );
         assert!(mic.0.lock().unwrap().ends_with(&[true, false]));
+    }
+
+    #[test]
+    fn mic_indicator_follows_the_push_to_talk_key() {
+        use zc_core::hotkey::{Chord, Key};
+        let mut settings = Settings::default();
+        settings.audio.mic = MicMode::PushToTalk;
+        settings.hotkeys.push_to_talk = Some(Chord::new([Key::MOUSE5]).unwrap());
+        let input = FakeInput::default();
+        let ports = Ports {
+            input: Some(Box::new(input.clone())),
+            mic: Some(Box::new(FakeMic::default())),
+            ..Ports::default()
+        };
+        let engine = Engine::spawn(
+            EngineConfig {
+                settings,
+                default_output_dir: std::env::temp_dir().join("zeroclip-test"),
+            },
+            ports,
+            Arc::new(|()| {}),
+        )
+        .expect("spawn");
+        // The mic runs with the key up, so it is muted.
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.mic == MicState::Muted));
+        input.key(Key::MOUSE5, true);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.mic == MicState::Live));
+        // A repeated press changes nothing, so it publishes no status. The barrier shows that.
+        engine.send(Command::PushToTalk(true)).unwrap();
+        engine.send(Command::SaveClip).unwrap();
+        let mut statuses = 0;
+        loop {
+            match engine.wait_event(TIMEOUT).expect("timed out waiting for the barrier") {
+                EngineEvent::Status(_) => statuses += 1,
+                EngineEvent::Warning(m) if m.starts_with("Nothing to save") => break,
+                _ => {}
+            }
+        }
+        assert_eq!(statuses, 0, "a repeated press publishes nothing");
+        input.key(Key::MOUSE5, false);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.mic == MicState::Muted));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn mic_indicator_stays_live_while_the_mic_is_always_on() {
+        let mut settings = Settings::default();
+        settings.audio.mic = MicMode::AlwaysOn;
+        let ports = Ports { mic: Some(Box::new(FakeMic::default())), ..Ports::default() };
+        let engine = Engine::spawn(
+            EngineConfig {
+                settings: settings.clone(),
+                default_output_dir: std::env::temp_dir().join("zeroclip-test"),
+            },
+            ports,
+            Arc::new(|()| {}),
+        )
+        .expect("spawn");
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.mic == MicState::Live));
+        // Applying settings publishes a status again, and the mic is still live.
+        engine.send(Command::ApplySettings(Box::new(settings))).unwrap();
+        let event = wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        let EngineEvent::Status(status) = event else { unreachable!() };
+        assert_eq!(status.mic, MicState::Live);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn mic_indicator_is_off_while_the_mic_is_off() {
+        // The mode is Off, so the mic stays off even with a source attached.
+        let ports = Ports { mic: Some(Box::new(FakeMic::default())), ..Ports::default() };
+        let (engine, _) = spawn(ports);
+        let event = wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        let EngineEvent::Status(status) = event else { unreachable!() };
+        assert_eq!(status.mic, MicState::Off);
+        engine.shutdown();
     }
 
     #[test]
