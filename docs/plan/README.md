@@ -156,6 +156,19 @@ Every card repeats the pitfalls that apply to it locally. These apply everywhere
     - The synthetic_harness watchdog comment, which contradicts DESIGN §8. Change it on
       purpose, and give the reason in the commit.
 
+## Reuse and UI design
+
+- **Reused things become one shared piece.** When the same UI widget, layout or service
+  logic is needed a second time, move it into one shared place instead of copying it:
+  UI building blocks in `src/ui/components/` (one small module per widget, used by every
+  tab), services behind the existing ports in `zc-core`. Don't extract on first use;
+  extract on the second.
+- **Designing the app (Phase 4 UI cards and later):** load the `apple-design` and
+  `emil-design-eng` skills before designing a screen, and apply their principles (restraint,
+  clear hierarchy, typography, purposeful motion, reduced motion) within egui. They are
+  written for the web, so translate rather than copy. Owner wants the UI to feel tasteful,
+  not like a settings dump.
+
 ## 0xtikaa's checkpoints
 
 These steps need a person, a GPU, or a decision:
