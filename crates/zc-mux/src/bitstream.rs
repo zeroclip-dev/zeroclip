@@ -231,6 +231,229 @@ fn trim_trailing_zeros(unit: &[u8]) -> &[u8] {
     unit.get(..end).unwrap_or_default()
 }
 
+/// Writes `data` to `out`, dropping Temporal Delimiter OBUs (type 2) as required by
+/// AV1-in-ISOBMFF. OBUs must have their size fields; if an OBU lacks a size field, one is added.
+pub fn append_av1_sample(data: &[u8], out: &mut Vec<u8>) -> Result<(), TryFromIntError> {
+    for (obu_type, obu) in av1_obus(data) {
+        if obu_type == 2 {
+            // Temporal Delimiter: drop per AV1-in-ISOBMFF spec
+            continue;
+        }
+        if obu.is_empty() {
+            continue;
+        }
+        let header = obu[0];
+        let has_size = (header & 0x02) != 0;
+        if has_size {
+            out.extend_from_slice(obu);
+        } else {
+            // Add size field
+            let extension_flag = (header & 0x04) != 0;
+            let header_len = if extension_flag { 2 } else { 1 };
+            let payload = obu.get(header_len..).unwrap_or(&[]);
+            let new_header = header | 0x02;
+            out.push(new_header);
+            if extension_flag && obu.len() > 1 {
+                out.push(obu[1]);
+            }
+            // write payload length as leb128
+            let mut val = payload.len();
+            loop {
+                let mut byte = (val & 0x7F) as u8;
+                val >>= 7;
+                if val != 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+                if val == 0 {
+                    break;
+                }
+            }
+            out.extend_from_slice(payload);
+        }
+    }
+    Ok(())
+}
+
+/// Splits AV1 OBU stream into (obu_type, whole_obu_slice).
+///
+/// Header byte: obu_type = `(b >> 3) & 0xF`, extension flag = `b & 0x4`, has_size = `b & 0x2`.
+/// If the extension flag is set, skip one extension byte.
+/// If has_size, read the size as leb128; otherwise the OBU runs to the end of the buffer.
+pub fn av1_obus(mut data: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
+    std::iter::from_fn(move || {
+        if data.is_empty() {
+            return None;
+        }
+        let header = *data.first()?;
+        let obu_type = (header >> 3) & 0x0F;
+        let extension_flag = (header & 0x04) != 0;
+        let has_size = (header & 0x02) != 0;
+
+        let mut offset = 1;
+        if extension_flag {
+            if data.len() < 2 {
+                let rem = data;
+                data = &[];
+                return Some((obu_type, rem));
+            }
+            offset += 1;
+        }
+
+        if has_size {
+            let mut obu_size: usize = 0;
+            let mut shift = 0;
+            let mut leb_bytes = 0;
+            let payload_data = &data[offset..];
+            for &byte in payload_data.iter().take(8) {
+                leb_bytes += 1;
+                obu_size |= ((byte & 0x7F) as usize) << shift;
+                if (byte & 0x80) == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            offset += leb_bytes;
+            let total_len = (offset + obu_size).min(data.len());
+            let (obu, rest) = data.split_at(total_len);
+            data = rest;
+            Some((obu_type, obu))
+        } else {
+            let rem = data;
+            data = &[];
+            Some((obu_type, rem))
+        }
+    })
+}
+
+/// Returns the first OBU of type 1 (Sequence Header).
+pub fn av1_sequence_header(data: &[u8]) -> Option<&[u8]> {
+    av1_obus(data).find(|&(obu_type, _)| obu_type == 1).map(|(_, obu)| obu)
+}
+
+/// Helper bit reader for parsing AV1 sequence header.
+struct BitReader<'a> {
+    data: &'a [u8],
+    pos: usize, // bit position
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn bits(&mut self, n: usize) -> Option<u32> {
+        if n > 32 {
+            return None;
+        }
+        let mut val = 0u32;
+        for _ in 0..n {
+            let byte_idx = self.pos / 8;
+            let bit_idx = 7 - (self.pos % 8);
+            if byte_idx >= self.data.len() {
+                return None;
+            }
+            let bit = (self.data[byte_idx] >> bit_idx) & 1;
+            val = (val << 1) | (bit as u32);
+            self.pos += 1;
+        }
+        Some(val)
+    }
+
+    fn uvlc(&mut self) -> Option<u32> {
+        let mut leading_zeros = 0;
+        while self.bits(1)? == 0 {
+            leading_zeros += 1;
+            if leading_zeros >= 32 {
+                return None;
+            }
+        }
+        if leading_zeros == 0 {
+            return Some(0);
+        }
+        let val = self.bits(leading_zeros)?;
+        Some((1 << leading_zeros) - 1 + val)
+    }
+}
+
+/// Constructs an `av1C` configuration record (AV1-ISOBMFF spec) from a sequence header OBU.
+///
+/// Record format:
+/// `[0x81, (seq_profile << 5) | level, (tier << 7) | 0b0000_1100, 0x00]` followed by configOBUs.
+pub fn av1c(seq_obu: &[u8]) -> Vec<u8> {
+    if seq_obu.is_empty() {
+        return vec![0x81, 0, 0x0C, 0];
+    }
+
+    // Skip the OBU header to reach the sequence header payload.
+    let header = seq_obu[0];
+    let extension_flag = (header & 0x04) != 0;
+    let has_size = (header & 0x02) != 0;
+
+    let mut offset = 1;
+    if extension_flag {
+        offset += 1;
+    }
+    if has_size && offset < seq_obu.len() {
+        while offset < seq_obu.len() {
+            let b = seq_obu[offset];
+            offset += 1;
+            if (b & 0x80) == 0 {
+                break;
+            }
+        }
+    }
+
+    if offset >= seq_obu.len() {
+        let mut record = vec![0x81, 0, 0x0C, 0];
+        record.extend_from_slice(seq_obu);
+        return record;
+    }
+
+    let payload = &seq_obu[offset..];
+    let mut reader = BitReader::new(payload);
+
+    let parsed = (|| -> Option<(u8, u8, u8)> {
+        let seq_profile = reader.bits(3)? as u8;
+        let _still_picture = reader.bits(1)?;
+        let reduced_still_picture_header = reader.bits(1)? != 0;
+
+        let (seq_level_idx_0, seq_tier_0) = if reduced_still_picture_header {
+            let level = reader.bits(5)? as u8;
+            (level, 0u8)
+        } else {
+            let timing_info_present = reader.bits(1)? != 0;
+            if timing_info_present {
+                let _num_units = reader.bits(32)?;
+                let _time_scale = reader.bits(32)?;
+                let equal_picture_interval = reader.bits(1)? != 0;
+                if equal_picture_interval {
+                    let _ = reader.uvlc()?;
+                }
+                let decoder_model_info_present = reader.bits(1)? != 0;
+                if decoder_model_info_present {
+                    // skip 5 + 32 + 5 + 5 = 47 bits
+                    let _ = reader.bits(32)?;
+                    let _ = reader.bits(15)?;
+                }
+            }
+            let _initial_display_delay_present = reader.bits(1)?;
+            let _operating_points_cnt_minus_1 = reader.bits(5)?;
+            let _operating_point_idc_0 = reader.bits(12)?;
+            let level = reader.bits(5)? as u8;
+            let tier = if level > 7 { reader.bits(1)? as u8 } else { 0u8 };
+            (level, tier)
+        };
+
+        Some((seq_profile, seq_level_idx_0, seq_tier_0))
+    })();
+
+    let (profile, level, tier) = parsed.unwrap_or((0, 0, 0));
+    let mut record = vec![0x81, (profile << 5) | level, (tier << 7) | 0b0000_1100, 0x00];
+    record.extend_from_slice(seq_obu);
+    record
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,5 +631,50 @@ mod tests {
         expected.extend_from_slice(&[0; 12]);
         expected.extend_from_slice(&[0xF0, 0x00, 0xFC, 0xFD, 0xF8, 0xF8, 0x00, 0x00, 0x0B, 0]);
         assert_eq!(hvcc(&[], &[], &[]).unwrap(), expected);
+    }
+
+    #[test]
+    fn av1c_from_a_sequence_header() {
+        // Hand-pack an AV1 sequence header OBU:
+        // OBU Header: type 1 (Sequence Header), no extension, has_size = 1 -> (1 << 3) | 2 = 0x0A
+        // Size leb128: 4 bytes payload -> 0x04
+        // Payload bits:
+        // seq_profile (3): 0 -> 000
+        // still_picture (1): 0 -> 0
+        // reduced_still_picture_header (1): 0 -> 0
+        // timing_info_present (1): 0 -> 0
+        // initial_display_delay_present (1): 0 -> 0
+        // operating_points_cnt_minus_1 (5): 0 -> 00000
+        // operating_point_idc[0] (12): 0 -> 0000_0000_0000
+        // seq_level_idx[0] (5): 8 (0b01000)
+        // seq_tier_0 (1 if level > 7 else 0): level is 8 > 7, so tier is 0 -> bit 0
+        // Total bits so far: 3+1+1+1+1+5+12+5+1 = 29 bits.
+        // Bit stream:
+        // Byte 0: 0000_0000 (0x00) (seq_profile 000, still 0, reduced 0, timing 0, init_delay 0, op_cnt bit 0)
+        // Byte 1: 0000_0000 (0x00) (op_cnt remaining 4 bits 0000, op_idc first 4 bits 0000)
+        // Byte 2: 0000_0100 (0x04) (op_idc remaining 8 bits 0000_0000 -> wait, op_idc is 12 bits)
+        // Let's pack carefully:
+        // bits:
+        // [0..3]: seq_profile = 000
+        // [3]: still = 0
+        // [4]: reduced = 0
+        // [5]: timing = 0
+        // [6]: initial_display_delay = 0
+        // [7..12]: operating_points_cnt_minus_1 = 00000
+        // [12..24]: operating_point_idc[0] = 0000_0000_0000 (12 bits)
+        // [24..29]: seq_level_idx[0] = 01000 (5 bits, value 8)
+        // [29]: seq_tier_0 = 0 (1 bit)
+        // [30..32]: trailing bits: 00
+        // Byte 0 (bits 0..8): 0000_0000 = 0x00
+        // Byte 1 (bits 8..16): 0000_0000 = 0x00
+        // Byte 2 (bits 16..24): 0000_0000 = 0x00
+        // Byte 3 (bits 24..32): 0100_0000 = 0x40 (seq_level_idx 01000, tier 0, pad 00)
+        let seq_obu = vec![0x0A, 0x04, 0x00, 0x00, 0x00, 0x40];
+        let record = av1c(&seq_obu);
+        assert_eq!(record[0], 0x81);
+        assert_eq!(record[1], 0x08, "seq_profile 0, level 8");
+        assert_eq!(record[2], 0x0C, "tier 0, marker/version bits");
+        assert_eq!(record[3], 0x00);
+        assert_eq!(&record[4..], &seq_obu);
     }
 }
