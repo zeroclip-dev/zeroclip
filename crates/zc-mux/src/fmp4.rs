@@ -381,10 +381,18 @@ fn video_entry(codec: Codec, size: (u16, u16), params: &[u8]) -> io::Result<Vec<
             };
             visual_entry(b"hvc1", size, &boxed(b"hvcC", &record)?)
         }
-        Codec::Av1 => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "AV1 fragments aren't written yet (P3.13)",
-        )),
+        Codec::Av1 => {
+            let record = match bitstream::av1_sequence_header(params) {
+                Some(seq_obu) => bitstream::av1c(seq_obu),
+                None => {
+                    warn!(
+                        "no AV1 sequence header before the first keyframe; the file declares none"
+                    );
+                    bitstream::av1c(&[])
+                }
+            };
+            visual_entry(b"av01", size, &boxed(b"av1C", &record)?)
+        }
     }
 }
 
@@ -457,7 +465,7 @@ impl Fmp4Writer {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
             }
             if let TrackKind::Video { codec, .. } = &track.kind
-                && !matches!(*codec, Codec::H264 | Codec::Hevc)
+                && !matches!(*codec, Codec::H264 | Codec::Hevc | Codec::Av1)
             {
                 let message = format!("{} fragments aren't written yet", codec.name());
                 return Err(io::Error::new(io::ErrorKind::Unsupported, message));
@@ -594,7 +602,8 @@ impl ContainerWriter for Fmp4Writer {
             }
             self.last_video_pts = Some(meta.pts);
         }
-        let size = append_sample(&mut self.data[position], packet.data, is_video)?;
+        let size =
+            append_sample(&mut self.data[position], packet.data, &self.tracks[position].kind)?;
         self.samples[position].push(Sample {
             pts: meta.pts.saturating_sub(origin),
             duration: meta.duration,
@@ -678,16 +687,23 @@ impl ContainerWriter for Fmp4Writer {
     }
 }
 
-/// Appends one packet's bytes to a track's buffer and returns how many were added. Video
-/// becomes length-prefixed NAL units (ISO/IEC 14496-15), and audio is copied as it is. On an
-/// error the buffer is left as it was.
-fn append_sample(buffer: &mut Vec<u8>, data: &[u8], is_video: bool) -> io::Result<u32> {
+/// Appends one packet's bytes to a track's buffer and returns how many were added.
+/// H.264/HEVC become length-prefixed NAL units (ISO/IEC 14496-15).
+/// AV1 strips temporal delimiters and keeps/adds OBU size fields (AV1-ISOBMFF).
+/// Audio is copied as it is. On an error the buffer is left as it was.
+fn append_sample(buffer: &mut Vec<u8>, data: &[u8], kind: &TrackKind) -> io::Result<u32> {
     let start = buffer.len();
-    let converted = if is_video {
-        bitstream::append_length_prefixed(data, buffer).map_err(invalid_data)
-    } else {
-        buffer.extend_from_slice(data);
-        Ok(())
+    let converted = match kind {
+        TrackKind::Video { codec: Codec::H264 | Codec::Hevc, .. } => {
+            bitstream::append_length_prefixed(data, buffer).map_err(invalid_data)
+        }
+        TrackKind::Video { codec: Codec::Av1, .. } => {
+            bitstream::append_av1_sample(data, buffer).map_err(invalid_data)
+        }
+        TrackKind::Audio { .. } => {
+            buffer.extend_from_slice(data);
+            Ok(())
+        }
     };
     let added = converted.and_then(|()| u32::try_from(buffer.len() - start).map_err(invalid_data));
     if added.is_err() {
@@ -944,10 +960,18 @@ mod tests {
     }
 
     #[test]
-    fn av1_is_unsupported_until_p3_13() {
+    fn av01_carries_the_av1c_from_the_first_keyframe() {
         let mut track = video();
         track.kind = TrackKind::Video { codec: Codec::Av1, width: 320, height: 240, fps: 60 };
-        assert_eq!(init_segment(&[track], None).unwrap_err().kind(), io::ErrorKind::Unsupported);
+        // Sequence header OBU
+        let seq_obu = vec![0x0A, 0x04, 0x00, 0x00, 0x00, 0x40];
+        let init = init_segment(&[track], Some(&seq_obu)).unwrap();
+        let av01 = child(sample_entries(&init), b"av01");
+        let av1c = child(&av01[78..], b"av1C");
+        assert_eq!(av1c[0], 0x81);
+        assert_eq!(av1c[1], 0x08, "seq_profile 0, level 8");
+        assert_eq!(av1c[2], 0x0C);
+        assert_eq!(&av1c[4..], &seq_obu);
     }
 
     #[test]
@@ -1258,7 +1282,7 @@ mod tests {
         assert_eq!(kind_of(&[video_as_audio]), Some(io::ErrorKind::InvalidInput));
         let mut av1 = video();
         av1.kind = TrackKind::Video { codec: Codec::Av1, width: 320, height: 240, fps: 60 };
-        assert_eq!(kind_of(&[av1]), Some(io::ErrorKind::Unsupported));
+        assert_eq!(kind_of(&[av1]), None);
     }
 
     #[test]

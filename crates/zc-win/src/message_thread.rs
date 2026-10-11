@@ -176,7 +176,9 @@ mod tests {
                 Ok(())
             },
             move |m| {
-                let _ = msg_tx.send(m.msg);
+                if m.msg == WM_APP + 1 {
+                    let _ = msg_tx.send(m.msg);
+                }
             },
         )
         .expect("spawn");
