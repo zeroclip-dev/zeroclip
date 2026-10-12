@@ -119,23 +119,33 @@ All modes share one zero-allocation encode loop. Memory is pre-allocated at laun
 
 ## 6. Audio Pipeline
 
+Tracks are dynamic: a recording carries one video track and up to seven audio tracks (`TrackId`, D26, D30). Audio track 1 is Master (below). The game and mic tracks are audio tracks 2 and 3, and per-app tracks take the rest.
+
+### Audio track 1 — Master (D30)
+
+A live mix of every enabled source, encoded once more as AAC. Players, browsers and Discord play only the first audio track, so the mix goes there and the per-source tracks follow it unchanged, for the editor (D26).
+
+One mixer thread (`zc_audio::MasterMix`, MMCSS "Pro Audio") does the work. Each source writes its PCM, at the sample its own track gets, into a shared `zc_core::mix::MixBus`: one two-second ring per source on a 48 kHz timeline. Every 20 ms the thread mixes everything up to 200 ms behind real time, soft-clips the sum and encodes it. A sample no source wrote is silence. A block that arrives after its samples were mixed is dropped and counted. Each source's level in the mix is a setting, −60 to +12 dB, read when the sources start.
+
+Master trails real time, so a DVR save ends at the press and waits 300 ms (the lag plus a margin) before it copies, which lets Master cover the clip's end. A recording's Master ends about 200 ms before its video: stopping a recording doesn't wait, since the video keeps arriving during a wait and would only lengthen the file.
+
 ### Parallel audio ring buffers (the v1 gap)
 
 v1 described the ring buffer for video only. Retrospective DVR needs the last X minutes of **both** audio tracks held in matching time-windowed buffers, evicted in step with the video GOPs. Without this, every DVR clip comes out silent. Audio is cheap — two tracks of AAC at 192 kbps is about 48 KB/s, so five minutes is roughly 14 MB against the video's 750 MB. Eviction is driven by the video GOP index: when a GOP is dropped, audio older than that GOP's start PTS is dropped with it.
 
 ### Master clock and PTS
 
-The pipeline extracts `SystemRelativeTime` from the WGC `Direct3D11CaptureFrame` and maps it to the muxer's presentation timestamps. This is the anchor for everything; both audio tracks are aligned against it rather than against each other.
+The pipeline extracts `SystemRelativeTime` from the WGC `Direct3D11CaptureFrame` and maps it to the muxer's presentation timestamps. This is the anchor for everything; every audio track is aligned against it rather than against each other.
 
 The sound card's sample clock and QPC disagree by 10–100 ppm, which is up to 180 ms over a 30-minute session. Audio timestamps therefore count samples (exact and contiguous, which AAC needs) but are re-aligned to the buffer's QPC time by `zc_core::time::SampleTimeline` whenever they drift more than 20 ms: a gap is filled with silence, a fast device has frames dropped, and a gap over 1 s restarts the timeline. Corrections stay under the ~45 ms where viewers notice lip-sync errors.
 
-### Track 1 — system audio
+### Audio track 2 — system audio
 
 v1 proposed `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE` with a UI for picking multiple apps to ignore. **This doesn't map cleanly onto the API** — activation params target a single process tree per client, so "exclude Discord *and* Spotify" doesn't express directly.
 
 Inverting to include-mode — capture the game's process tree, using `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE` — is simpler and usually gets the same result, since the game is already identified by the profile engine. **Resolved (D27):** the UI says "capture from". Audio is a list of tracks, each the focused game, the mic, or a named app, with one include-mode client per app and an on/off switch per track; Discord and Spotify are pre-listed by default.
 
-### Track 2 — microphone
+### Audio track 3 — microphone
 
 Bound to a push-to-talk key via Raw Input. Writes silence when released so track length stays constant and PTS alignment holds.
 
@@ -164,6 +174,8 @@ Profiles should be user-editable from the UI, and unknown executables should be 
 ### Crash rescue
 
 Detects unexpected termination of the tracked game process, dumps the current ring buffer to `recovery.tmp`, and prompts on next focus: *"Game closed unexpectedly. Keep the last X minutes?"* Because session recordings use a fragmented container, a crash mid-session needs no rescue at all — the file is already playable.
+
+A recording is written as `<name>.mp4.partial` and synced after every fragment (D18). A crash leaves that file behind. At startup the app cuts it back to its last complete fragment and renames it to `<name>.mp4`, so at most about 1 s is lost. A file with no complete fragment is left as it is.
 
 ### Encoder watchdog — make it a state machine
 

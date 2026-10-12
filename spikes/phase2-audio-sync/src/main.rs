@@ -59,7 +59,7 @@ impl PacketSink for ProbeSink {
         let slot = match p.meta.track {
             TrackId::GameAudio => Some(0),
             TrackId::Mic => Some(1),
-            TrackId::Video => None,
+            _ => None,
         };
         if let (Some(i), Some(files)) = (slot, probe.files.as_mut()) {
             let _ = files[i].write_all(&adts_header(p.data.len()));

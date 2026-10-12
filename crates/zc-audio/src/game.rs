@@ -20,7 +20,9 @@ use windows::Win32::System::Com::StructuredStorage::{
 use windows::Win32::System::Com::{BLOB, CLSCTX_ALL, CoCreateInstance, IAgileObject};
 use windows::Win32::System::Variant::VT_BLOB;
 use windows::core::{IUnknown, Interface, Ref, implement};
+use zc_core::Hns;
 use zc_core::media::TrackId;
+use zc_core::mix::MixInput;
 use zc_core::ports::{AudioSource, AudioStart, Emit, SourceError};
 use zc_core::sink::SharedSink;
 use zc_core::watchdog::HealthEvent;
@@ -37,11 +39,15 @@ use crate::capture::{Encode, Mmcss, Stream, Worker, pcm16_format};
 /// Activation goes through `ActivateAudioInterfaceAsync` with
 /// [`AUDIOCLIENT_ACTIVATION_PARAMS`](https://learn.microsoft.com/windows/win32/api/audioclientactivationparams/ns-audioclientactivationparams-audioclient_activation_params)
 /// (see Microsoft's ApplicationLoopback sample). Needs Windows 11 (build 20348+).
-/// Retargeting is live: the capture thread notices a new pid within 100 ms.
+/// Retargeting is live: the capture thread notices a new pid within 100 ms. The track has
+/// no holes (D27): while the game is quiet, or nothing is targeted, the thread writes silence,
+/// so the track runs from the moment capture starts.
 #[derive(Debug, Default)]
 pub struct GameAudioSource {
     /// The target pid; 0 means none (pid 0 is the Idle process, never a game).
     target: Arc<AtomicU32>,
+    /// This source's input in the Master mix (D30), if it has one.
+    mix: Option<MixInput>,
     worker: Option<Worker>,
 }
 
@@ -50,6 +56,14 @@ impl GameAudioSource {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Puts this source in the Master mix as `mix`. Set it before `start`. `None` keeps the
+    /// source out of the mix.
+    #[must_use]
+    pub fn with_mix(mut self, mix: Option<MixInput>) -> Self {
+        self.mix = mix;
+        self
     }
 
     /// The process tree being captured.
@@ -82,8 +96,8 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Completion_Impl {
 
 /// Whole-system loopback of the default playback device: the fallback before
 /// Windows 11 build 20348 (D9). It records everything, Discord included, and
-/// delivers nothing while nothing plays; `SampleTimeline` fills those gaps with
-/// silence (up to 1 s) or restarts.
+/// delivers nothing while nothing plays; the capture loop pads those gaps with
+/// silence (`Encode::pad_silence`).
 fn open_endpoint_loopback(
     format: &windows::Win32::Media::Audio::WAVEFORMATEX,
 ) -> Result<Stream, SourceError> {
@@ -176,12 +190,12 @@ impl AudioSource for GameAudioSource {
         _health: Emit<HealthEvent>,
     ) -> Result<(), SourceError> {
         self.stop();
-        let (config, target) = (*config, Arc::clone(&self.target));
+        let (config, target, mix) = (*config, Arc::clone(&self.target), self.mix.clone());
         self.worker = Some(Worker::spawn("zc-game-audio", move |stop, ready| {
             let setup = (|| {
                 let apartment = Apartment::multithreaded()?;
                 let mf = MediaFoundation::start()?;
-                let encode = Encode::new(TrackId::GameAudio, &config)?;
+                let encode = Encode::new(TrackId::GameAudio, &config)?.with_mix(mix);
                 Ok((apartment, mf, encode))
             })();
             let (_apartment, _mf, mut encode) = match setup {
@@ -196,21 +210,21 @@ impl AudioSource for GameAudioSource {
             let (mut current, mut stream) = (0u32, None::<Stream>);
             // Set once process loopback turns out to be unsupported (pre-20348).
             let mut endpoint = false;
+            // Endpoint mode retries the playback device once a second, not on every loop.
+            let mut retry_at = Hns::ZERO;
             while !stop.load(Ordering::Acquire) {
                 let want = target.load(Ordering::Relaxed);
                 if endpoint {
                     // Targets don't matter any more; (re)open after a device change.
-                    if stream.is_none() {
+                    let now = zc_win::clock::now();
+                    if stream.is_none() && now >= retry_at {
                         stream = open_endpoint_loopback(&format)
                             .inspect_err(|e| tracing::debug!(%e, "playback device unavailable"))
                             .ok();
-                        if stream.is_none() {
-                            std::thread::sleep(Duration::from_secs(1));
-                            continue;
-                        }
+                        retry_at = now + Hns::from_secs(1);
                     }
                 } else if want != current {
-                    // A retarget leaves a gap; the timeline fills or restarts it.
+                    // A retarget leaves a gap, which the silence below fills.
                     stream = None;
                     current = want;
                     if want != 0 {
@@ -228,6 +242,11 @@ impl AudioSource for GameAudioSource {
                             }
                         }
                     }
+                }
+                // Before any read: silence up to 100 ms ago, so a buffer after a gap (no target,
+                // a retarget, a failed activation, the playback device away) lands after it.
+                if let Err(e) = encode.pad_silence(zc_win::clock::now(), &*sink) {
+                    tracing::warn!(%e, "game audio silence failed");
                 }
                 match &stream {
                     Some(s) => {

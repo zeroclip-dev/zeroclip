@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::hotkey::Key;
-use crate::media::{Codec, TrackId};
+use crate::media::{Codec, TrackId, TrackInfo};
 use crate::sink::SharedSink;
 use crate::time::Hns;
 use crate::watchdog::HealthEvent;
@@ -106,6 +106,11 @@ pub trait VideoSource: Send {
         health: Emit<HealthEvent>,
     ) -> Result<Codec, SourceError>;
 
+    /// The video track's format: codec, encoded size and fps, and `codec_private` when
+    /// it is known up front. Available once `start` has succeeded, `None` while stopped.
+    /// The engine reads it to declare the video track of a recording.
+    fn format(&self) -> Option<TrackInfo>;
+
     /// Stops and releases GPU resources. Idempotent.
     fn stop(&mut self);
 
@@ -181,3 +186,13 @@ pub trait InputSource: Send {
     /// Stops the input thread. Idempotent.
     fn stop(&mut self);
 }
+
+/// The drive-type probe the app injects: whether the drive holding a path has a seek penalty,
+/// which means a spinning disk. `Ok(None)` means the drive doesn't say. The engine can't call
+/// Windows itself, so the app passes `zc_win::drive::seek_penalty` (P3.24).
+pub type SeekPenalty = fn(&Path) -> Result<Option<bool>, SourceError>;
+
+/// Pins a region of memory in RAM, so Windows can't page it out (DESIGN §4). The returned guard
+/// keeps the region pinned, and dropping it unpins the region. The engine calls this on the DVR
+/// rings, so the guard must be dropped before the memory is freed.
+pub type LockMemory = fn(&[u8]) -> Result<Box<dyn Send>, SourceError>;

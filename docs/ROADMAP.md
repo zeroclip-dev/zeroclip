@@ -60,12 +60,12 @@ Measured 2026-10-05 with `spike-phase2`: every track within ±11 ms of its minut
 
 ## Phase 3 — Buffers, modes, muxing
 
-- [ ] Specs: `DvrBuffer` (all of them, including `dvr_push_never_allocates`), `Tee`, `ChunkedWriter`, `WritePacer`
-- [ ] Implement `zc_mux::container::create` (fMP4, decided in D18)
-- [ ] Crash-safe recordings: sync every fragment, `.partial` files, startup repair (D18)
-- [ ] `Recorder` spec; `SyntheticVideoSource`; the `synthetic_harness` save-clip spec
+- [x] Specs: `DvrBuffer` (all of them, including `dvr_push_never_allocates`), `Tee`, `ChunkedWriter`, `WritePacer`
+- [x] Implement `zc_mux::container::create` (fMP4, decided in D18)
+- [x] Crash-safe recordings: sync every fragment, `.partial` files, startup repair (D18)
+- [x] `Recorder` spec; `SyntheticVideoSource`; the `synthetic_harness` save-clip spec
 - [ ] DVR save, manual recording, session recording; page-lock the buffer (`VirtualLock`)
-- [ ] `zc-win::drive` + HDD pacing for dumps
+- [x] `zc-win::drive` + HDD pacing for dumps
 
 *Done when:* a DVR dump taken at any arbitrary moment decodes from its first frame and has audio.
 
@@ -73,7 +73,7 @@ Measured 2026-10-05 with `spike-phase2`: every track within ±11 ms of its minut
 
 ## Phase 4 — UI, profiles, watchdogs
 
-- [ ] Specs: `Watchdog::on_event`, `ProfileSet`, `clamp_window`
+- [ ] Specs: `Watchdog::on_event`, `ProfileSet`, `clamp_window` (`clamp_window` done early, in Phase 3: P3.16)
 - [ ] `zc-store` (rusqlite, bundled) and the migrations
 - [ ] Profile engine on foreground change, with safe buffer resizing
 - [ ] Watchdog wiring and the `synthetic_harness` recovery spec; crash rescue (`recovery.tmp` + prompt)
@@ -107,7 +107,7 @@ by pulling the network cable resumes and completes with no local file deleted be
 Spread over the phases above; the cards are P2.24, P3.0a (do it before P3.1), P4.18
 and P5.14.
 
-- [ ] Generalise `TrackId` (P3.0a)
+- [x] Generalise `TrackId` (P3.0a)
 - [ ] `AppAudioSource`: one track per chosen app (P2.24)
 - [ ] Audio tracks tab in Settings (P4.18)
 - [ ] Track mixer in the editor: volume, mute, solo, mixed export (P5.14)

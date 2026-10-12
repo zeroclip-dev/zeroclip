@@ -29,8 +29,10 @@ Start each session with:
 
 The protocol:
 
-1. **Branch:** `phase-0`, `phase-1`, … (one per phase). One commit per card, with a
-   message that names the card ID (`P1.7: WGC capture and resize`). There is no remote yet.
+1. **Branch:** work on `feat/<topic>` (or `fix/<topic>`) branched from `dev`, and merge
+   it back into `dev` when its cards are green. `master` only moves when a phase is done
+   and hardware-checked. One commit per card, with a message that names the card ID
+   (`P1.7: WGC capture and resize`).
 2. **Implement the card.** Remove the `#[ignore]` from its specs and make them pass.
    **Never weaken or delete a spec.** If a spec looks wrong, stop and ask 0xtikaa.
 3. **Green gate:** `cargo fmt --all`,
@@ -153,6 +155,19 @@ Every card repeats the pitfalls that apply to it locally. These apply everywhere
       `Destination`/`AuthState` shape) and §12 ("disk stall" fault).
     - The synthetic_harness watchdog comment, which contradicts DESIGN §8. Change it on
       purpose, and give the reason in the commit.
+
+## Reuse and UI design
+
+- **Reused things become one shared piece.** When the same UI widget, layout or service
+  logic is needed a second time, move it into one shared place instead of copying it:
+  UI building blocks in `src/ui/components/` (one small module per widget, used by every
+  tab), services behind the existing ports in `zc-core`. Don't extract on first use;
+  extract on the second.
+- **Designing the app (Phase 4 UI cards and later):** load the `apple-design` and
+  `emil-design-eng` skills before designing a screen, and apply their principles (restraint,
+  clear hierarchy, typography, purposeful motion, reduced motion) within egui. They are
+  written for the web, so translate rather than copy. Owner wants the UI to feel tasteful,
+  not like a settings dump.
 
 ## 0xtikaa's checkpoints
 

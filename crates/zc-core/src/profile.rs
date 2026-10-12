@@ -53,23 +53,47 @@ impl Default for ProfileSet {
     }
 }
 
+/// The file name of an executable, given as a bare name or a full path.
+///
+/// Both `\` and `/` separate path components, on any OS, so a path copied from a
+/// Windows machine works everywhere. Returns `exe` itself when it has no separator,
+/// and an empty string for an empty input.
+#[must_use]
+pub fn exe_name(exe: &str) -> &str {
+    exe.rsplit(['\\', '/']).next().unwrap_or(exe)
+}
+
 impl ProfileSet {
-    /// The profile for an executable, given as a bare file name or a full path.
+    /// The explicit profile for an executable, or `None` if no game profile matches.
     ///
     /// Matching is on the file name only and ignores ASCII case (Windows paths are
-    /// case-insensitive). Both `\` and `/` separate path components, regardless of
-    /// the OS this runs on. Unknown executables get [`ProfileSet::default`].
+    /// case-insensitive). `None` means "no explicit profile", so the engine keeps the
+    /// current profile in that case (sticky profiles, see P4.6).
+    #[must_use]
+    pub fn find(&self, exe: &str) -> Option<&GameProfile> {
+        let name = exe_name(exe);
+        if name.is_empty() {
+            return None;
+        }
+        self.games.iter().find(|g| g.exe.eq_ignore_ascii_case(name))
+    }
+
+    /// The profile for an executable, given as a bare file name or a full path.
+    ///
+    /// Unknown executables get [`ProfileSet::default`]. See [`ProfileSet::find`]
+    /// for the matching rules.
     #[must_use]
     pub fn resolve(&self, exe: &str) -> &GameProfile {
-        let _ = exe;
-        todo!("Phase 4: resolve profiles (see the `profile_*` specs)")
+        self.find(exe).unwrap_or(&self.default)
     }
 
     /// Adds a profile, or replaces the existing one for the same executable
     /// (used to promote a game from the "recent games" list).
     pub fn upsert(&mut self, profile: GameProfile) {
-        let _ = profile;
-        todo!("Phase 4: insert or replace (see the `profile_*` specs)")
+        match self.games.iter_mut().find(|g| g.exe.eq_ignore_ascii_case(&profile.exe)) {
+            Some(slot) => *slot = profile,
+            None => self.games.push(profile),
+        }
     }
 }
 
@@ -91,8 +115,21 @@ pub fn clamp_window(
     max_video_bitrate_bps: u64,
     ram_ceiling_bytes: u64,
 ) -> WindowClamp {
-    let _ = (requested, max_video_bitrate_bps, ram_ceiling_bytes);
-    todo!("Phase 4: clamp the window (see the `profile_clamp_*` specs)")
+    if max_video_bitrate_bps == 0 {
+        // No bitrate means no estimate of the ring's size, so nothing to clamp against.
+        return WindowClamp { window: requested, clamped: false };
+    }
+    // bytes * 8 bits / (bits per second) = seconds, then to ticks. The u128 holds
+    // u64::MAX * 8 * 10^7 without overflow, and the quotient saturates into i64.
+    let ticks_per_sec = u128::from(Hns::PER_SECOND.unsigned_abs());
+    let max_ticks =
+        u128::from(ram_ceiling_bytes) * 8 * ticks_per_sec / u128::from(max_video_bitrate_bps);
+    let max = Hns(i64::try_from(max_ticks).unwrap_or(i64::MAX));
+    if requested > max {
+        WindowClamp { window: max, clamped: true }
+    } else {
+        WindowClamp { window: requested, clamped: false }
+    }
 }
 
 #[cfg(test)]
@@ -107,7 +144,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: ProfileSet::resolve (Phase 4)"]
     fn profile_resolves_by_file_name_ignoring_case() {
         let set = ProfileSet::default();
         assert_eq!(set.resolve("cs2.exe").buffer_secs, 120);
@@ -119,7 +155,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: ProfileSet::resolve (Phase 4)"]
     fn profile_falls_back_to_the_default() {
         let set = ProfileSet::default();
         assert_eq!(set.resolve("notepad.exe"), &set.default);
@@ -128,7 +163,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: ProfileSet::upsert (Phase 4)"]
+    fn profile_find_is_none_for_unknown_exes() {
+        let set = ProfileSet::default();
+        assert!(set.find("notepad.exe").is_none());
+        assert!(set.find("").is_none());
+        assert!(set.find("CS2.EXE").is_some());
+    }
+
+    #[test]
     fn profile_upsert_replaces_by_exe() {
         let mut set = ProfileSet::default();
         set.upsert(GameProfile {
@@ -147,7 +189,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: clamp_window (Phase 4)"]
     fn profile_clamp_keeps_windows_that_fit() {
         // 2 min at 20 Mbps = 300 MB, under a 1 GiB ceiling.
         let c = clamp_window(Hns::from_secs(120), 20_000_000, 1 << 30);
@@ -155,7 +196,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: clamp_window (Phase 4)"]
     fn profile_clamp_shrinks_windows_over_the_ceiling() {
         // 5 min at 20 Mbps = 750 MB > 500 MB ceiling → 500 MB / 2.5 MB/s = 200 s.
         let c = clamp_window(Hns::from_secs(300), 20_000_000, 500_000_000);

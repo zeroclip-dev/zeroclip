@@ -1,4 +1,4 @@
-//! Mic dynamics compressor (DESIGN §6, "Track 2 — microphone").
+//! Mic dynamics compressor (DESIGN §6, "Audio track 3 — microphone").
 //!
 //! Mic track only: it stops shouting from clipping and lifts quiet callouts.
 //! Game audio is never compressed — flattening its dynamic range is exactly what

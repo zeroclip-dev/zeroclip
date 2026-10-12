@@ -9,8 +9,10 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, STGM_READ};
 use windows_core::HSTRING;
+use zc_core::Hns;
 use zc_core::dsp::{Compressor, CompressorParams};
 use zc_core::media::TrackId;
+use zc_core::mix::MixInput;
 use zc_core::ports::{AudioSource, AudioStart, Emit, SourceError};
 use zc_core::sink::SharedSink;
 use zc_core::watchdog::HealthEvent;
@@ -20,7 +22,7 @@ use zc_win::mf::MediaFoundation;
 
 use crate::capture::{Encode, Mmcss, Stream, Worker, pcm16_format};
 
-/// Track 2: the microphone, gated by push-to-talk.
+/// Audio track 3: the microphone, gated by push-to-talk (D30).
 ///
 /// The chosen capture device, or the default *communications* one (the headset
 /// mic, usually), in shared mode. A closed gate writes silence, so the track keeps its length and
@@ -36,6 +38,8 @@ pub struct MicSource {
     compressor: bool,
     /// Endpoint id of the chosen mic; `None` is the Windows default.
     device: Option<String>,
+    /// This source's input in the Master mix (D30), if it has one.
+    mix: Option<MixInput>,
     worker: Option<Worker>,
 }
 
@@ -44,7 +48,21 @@ impl MicSource {
     /// `device` is an id from [`list_microphones`], or `None` for the default.
     #[must_use]
     pub fn new(always_on: bool, compressor: bool, device: Option<String>) -> Self {
-        Self { gate: Arc::new(AtomicBool::new(always_on)), compressor, device, worker: None }
+        Self {
+            gate: Arc::new(AtomicBool::new(always_on)),
+            compressor,
+            device,
+            mix: None,
+            worker: None,
+        }
+    }
+
+    /// Puts this source in the Master mix as `mix`. Set it before `start`. `None` keeps the
+    /// source out of the mix.
+    #[must_use]
+    pub fn with_mix(mut self, mix: Option<MixInput>) -> Self {
+        self.mix = mix;
+        self
     }
 
     /// Whether the dynamics compressor is enabled.
@@ -145,12 +163,12 @@ impl AudioSource for MicSource {
     ) -> Result<(), SourceError> {
         self.stop();
         let (config, gate, use_compressor) = (*config, Arc::clone(&self.gate), self.compressor);
-        let device = self.device.clone();
+        let (device, mix) = (self.device.clone(), self.mix.clone());
         self.worker = Some(Worker::spawn("zc-mic", move |stop, ready| {
             let setup = (|| {
                 let apartment = Apartment::multithreaded()?;
                 let mf = MediaFoundation::start()?;
-                let encode = Encode::new(TrackId::Mic, &config)?;
+                let encode = Encode::new(TrackId::Mic, &config)?.with_mix(mix);
                 // A missing mic isn't fatal: the loop below keeps trying (a dock, a USB plug).
                 let stream = open_mic(&config, device.as_deref())
                     .inspect_err(
@@ -182,9 +200,20 @@ impl AudioSource for MicSource {
                 })
             });
             let mut stream = stream;
+            // While the mic is away, retry once a second but keep the track continuous.
+            let mut retry_at = Hns::ZERO;
             while !stop.load(Ordering::Acquire) {
                 let Some(s) = &stream else {
-                    std::thread::sleep(Duration::from_secs(1));
+                    // Silence up to 100 ms ago, so the mic track has no hole (as game audio).
+                    if let Err(e) = encode.pad_silence(zc_win::clock::now(), &*sink) {
+                        tracing::warn!(%e, "microphone silence failed");
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                    let now = zc_win::clock::now();
+                    if now < retry_at {
+                        continue;
+                    }
+                    retry_at = now + Hns::from_secs(1);
                     stream = open_mic(&config, device.as_deref())
                         .inspect_err(|e| tracing::debug!(%e, "mic still unavailable"))
                         .ok();

@@ -190,3 +190,33 @@ a separate `ffmpeg.exe` process (D3), so its LGPL/GPL build never mixes with thi
 license. Costs: ZeroClip is source-available, not "open source" by the OSI definition,
 and GitHub lists the license as "Other". Copies taken while the repo was public under
 GPL (2026-10-08, about two hours) keep their GPL rights for that version.
+
+### D29 · DVR snapshots copy in short locked chunks (revisits D19)
+P3.17 measured the one-shot copy under the recorder lock: 115–135 ms for a 60 s window,
+0.7–1.0 s for 300 s, against D19's 20 ms limit. The audio capture buffer is 100 ms, so
+even a default save would drop audio and video. Instead of shared segments, the snapshot
+now plans under the lock (packet metadata and absolute byte positions only), allocates
+and pre-faults the copy outside it, then copies a few MiB per lock hold, oldest first.
+Every ring counts the bytes it has ever written, so a packet the writer has overwritten
+in the meantime is detected, not copied; the clip then starts at the next keyframe. The
+2 s of headroom `DvrConfig::for_window` adds makes that rare. Cost: a save takes about
+as long as before in total, but no hold is longer than a few milliseconds. Measured after
+P3.17b (release build, 20 Mbps): longest single hold 0.99 ms for a 60 s window (89 ms in
+total) and 1.24 ms for 300 s (470 ms in total), down from 115–135 ms and about 1 s.
+
+### D30 · Audio track 1 is a live Master mix; the per-source tracks are for editing (extends D26, D27)
+Found in the Phase 3 hardware test: Windows' player, browsers and Discord play only the
+first audio track, so the mic (track 2) was "missing" everywhere but VLC. Now the first
+audio track is **Master**, a live mix of every enabled source (game, mic, app tracks),
+encoded once more as AAC. The per-source tracks follow it unchanged, for the editor (D26).
+Layout: `Audio(0)` Master, `Audio(1)` Game, `Audio(2)` Microphone, `Audio(3..)` app tracks;
+`MAX_AUDIO_TRACKS` goes from 6 to 7, so four app tracks still fit. The mixer works on one
+48 kHz sample timeline taken from each source's QPC-aligned PTS, mixes 200 ms behind real
+time so a late source still lands in place, treats a missing source as silence, and
+soft-clips the sum. Each source's mix gain is a setting (default 0 dB). Costs: one more
+AAC encode (about 1% of a core); Master trails the side tracks by 200 ms. A DVR save cuts
+every track at the moment of the press and waits 300 ms before copying, so the clip ends at
+the press with Master complete. A recording's Master ends about 200 ms before its video
+(cutting per track at stop isn't built). Mix gains apply at the next start, and a source's
+volume in Master is fixed at record time (rebalance from the side tracks in the editor,
+P5.14).

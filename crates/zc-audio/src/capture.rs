@@ -23,6 +23,7 @@ use windows::Win32::System::Threading::{
 use windows::core::w;
 use zc_core::Hns;
 use zc_core::media::TrackId;
+use zc_core::mix::{MixInput, sample_index};
 use zc_core::ports::{AudioStart, SourceError};
 use zc_core::sink::PacketSink;
 use zc_core::time::SampleTimeline;
@@ -174,12 +175,20 @@ impl Drop for Stream {
     }
 }
 
-/// Timestamps (via [`SampleTimeline`]) and encodes one track.
+/// How far behind "now" silence padding stops (see [`Encode::pad_silence`]). It is the same
+/// 100 ms as one `Stream::read` wait, so a real buffer whose QPC time is a few ms late still
+/// lands after the padding, instead of overlapping it and being skipped by the timeline.
+pub(crate) const SILENCE_MARGIN: Hns = Hns::from_millis(100);
+
+/// Timestamps (via [`SampleTimeline`]) and encodes one track. The PCM also goes to the Master
+/// mix, when there is one (D30).
 pub(crate) struct Encode {
     timeline: SampleTimeline,
     encoder: AacEncoder,
     channels: usize,
     rate: u32,
+    /// This source's input in the Master mix, `None` when it isn't in one.
+    mix: Option<MixInput>,
 }
 
 impl Encode {
@@ -194,7 +203,14 @@ impl Encode {
             )?,
             channels: usize::from(config.channels),
             rate: config.sample_rate,
+            mix: None,
         })
+    }
+
+    /// Also writes every captured block into `mix`, at the sample this track's PTS names.
+    pub(crate) fn with_mix(mut self, mix: Option<MixInput>) -> Self {
+        self.mix = mix;
+        self
     }
 
     /// One captured buffer: `None` PCM means silence; `None` QPC means WASAPI had no
@@ -217,9 +233,40 @@ impl Encode {
         let start = p.pts + Hns(i64::from(p.silence) * Hns::PER_SECOND / i64::from(self.rate));
         let kept = frames - p.skip;
         match pcm {
-            Some(pcm) => self.encoder.encode(&pcm[p.skip as usize * self.channels..], start, sink),
+            Some(pcm) => {
+                let pcm = &pcm[p.skip as usize * self.channels..];
+                // Silence needs no write: a sample nothing wrote is silent in the mix.
+                if let Some(mix) = &self.mix {
+                    mix.write(sample_index(start), pcm);
+                }
+                self.encoder.encode(pcm, start, sink)
+            }
             None => self.encoder.encode_silence(kept, start, sink),
         }
+    }
+
+    /// Keeps the track continuous while WASAPI delivers nothing: the game is quiet, there is
+    /// no target yet, or the stream is down. Writes silence from the timeline's next frame up
+    /// to `now − SILENCE_MARGIN`. Call it before every read, so a buffer that follows a gap (a
+    /// retarget, a failed activation) lands after the silence rather than restarting the
+    /// timeline. The first call anchors an unanchored timeline, and so the track's time zero,
+    /// at `now − SILENCE_MARGIN`.
+    pub(crate) fn pad_silence(
+        &mut self,
+        now: Hns,
+        sink: &dyn PacketSink,
+    ) -> Result<(), SourceError> {
+        if self.timeline.expected().is_none() {
+            // Nothing has been encoded yet, so there is nothing to drain: only the anchor moves.
+            self.timeline.place(now - SILENCE_MARGIN, 0);
+            return Ok(());
+        }
+        let frames = self.timeline.silence_due(now, SILENCE_MARGIN);
+        if frames == 0 {
+            return Ok(());
+        }
+        // No QPC: the timeline's own next frame is on time, so `push` writes plain silence.
+        self.push(None, frames, None, sink)
     }
 
     /// Flushes the encoder; call on stop.
@@ -284,5 +331,66 @@ impl Worker {
 impl Drop for Worker {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use zc_core::Packet;
+    use zc_core::media::PacketRef;
+    use zc_win::com::Apartment;
+    use zc_win::mf::MediaFoundation;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Collect(Mutex<Vec<Packet>>);
+
+    impl PacketSink for Collect {
+        fn push(&self, packet: PacketRef<'_>) {
+            self.0.lock().unwrap().push(packet.to_packet());
+        }
+    }
+
+    #[test]
+    fn silent_then_loud_track_has_no_gap() {
+        let (Ok(_apartment), Ok(_mf)) = (Apartment::multithreaded(), MediaFoundation::start())
+        else {
+            return; // no Media Foundation on this image
+        };
+        let config = AudioStart { sample_rate: 48_000, channels: 2, bitrate_bps: 192_000 };
+        let mut encode = Encode::new(TrackId::GameAudio, &config).expect("encoder");
+        let sink = Collect::default();
+        let ms = Hns::from_millis;
+        let start = Hns::from_secs(100);
+        // 1 s of game silence: no buffers arrive, so the capture loop pads every 100 ms.
+        for k in 0..=10 {
+            encode.pad_silence(start + ms(100 * k), &sink).expect("pad");
+        }
+        // 1 s of loud 10 ms buffers, each read 1 ms after its capture.
+        let loud = [4_000i16; 480 * 2];
+        for k in 0..100 {
+            let captured = start + ms(1_000 + 10 * k);
+            encode.pad_silence(captured + ms(1), &sink).expect("pad");
+            encode.push(Some(&loud[..]), 480, Some(captured), &sink).expect("push");
+        }
+        // Silence again.
+        for k in 21..=25 {
+            encode.pad_silence(start + ms(100 * k), &sink).expect("pad");
+        }
+        encode.finish(&sink);
+        let packets = sink.0.into_inner().unwrap();
+        assert!(packets.len() > 100, "{} packets", packets.len());
+        let first = packets[0].meta.pts;
+        assert!(first < start + ms(500), "the track starts at {first}, not at the silence");
+        let last = packets.last().expect("packets");
+        assert!(last.meta.pts + last.meta.duration >= start + ms(2_300), "the track ends early");
+        // Neighbouring packets touch: no gap longer than 25 ms, and no overlap.
+        for pair in packets.windows(2) {
+            let gap = pair[1].meta.pts - (pair[0].meta.pts + pair[0].meta.duration);
+            assert!(gap.ticks().abs() <= ms(25).ticks(), "gap {gap} after {}", pair[0].meta.pts);
+        }
     }
 }
