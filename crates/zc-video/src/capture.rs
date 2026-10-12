@@ -10,15 +10,18 @@ use windows::Graphics::Capture::{
 };
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
-use windows::Win32::Foundation::{E_ACCESSDENIED, HWND, POINT};
+use windows::Win32::Foundation::{E_ACCESSDENIED, HWND, LPARAM, POINT, RECT, TRUE};
 use windows::Win32::Graphics::Direct3D11::{D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_ACCESS_DENIED, IDXGIDevice};
-use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
+    MonitorFromPoint,
+};
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
-use windows::core::{IInspectable, Interface, factory};
+use windows::core::{BOOL, IInspectable, Interface, factory};
 use zc_core::Hns;
 use zc_core::ports::{CaptureTarget, SourceError};
 use zc_win::error::{WinResultExt, platform_error};
@@ -38,8 +41,93 @@ pub struct CapturedFrame {
     pub size: (u32, u32),
 }
 
+/// A display Windows reports, for the settings screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MonitorInfo {
+    /// The index a [`CaptureTarget::Monitor`] takes (`EnumDisplayMonitors` order).
+    pub index: u32,
+    /// Label for the UI, such as `Display 1 – 2560×1440`.
+    pub name: String,
+    /// Whether this is the primary display.
+    pub primary: bool,
+}
+
+/// Every display, in `EnumDisplayMonitors` order. An empty list if the enumeration fails.
+fn monitors() -> Vec<HMONITOR> {
+    unsafe extern "system" fn collect(
+        monitor: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        // SAFETY: `data` is the `&mut Vec<HMONITOR>` that `monitors` passed to
+        // EnumDisplayMonitors, and it stays alive and unaliased until that call returns.
+        let list = unsafe { &mut *(data.0 as *mut Vec<HMONITOR>) };
+        list.push(monitor);
+        TRUE
+    }
+    let mut list: Vec<HMONITOR> = Vec::new();
+    // SAFETY: `collect` only runs during this call, while `list` is alive and not
+    // otherwise borrowed. A null HDC and clip rect mean "every display". The result is
+    // ignored: a partial list is still usable, and an empty one falls back to primary.
+    let _ = unsafe {
+        EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect),
+            LPARAM(std::ptr::from_mut(&mut list) as isize),
+        )
+    };
+    list
+}
+
+/// The display Windows calls primary.
+fn primary_monitor() -> HMONITOR {
+    // SAFETY: plain FFI call; MONITOR_DEFAULTTOPRIMARY always returns a monitor.
+    unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) }
+}
+
+/// Geometry and flags of one display.
+fn monitor_info(monitor: HMONITOR) -> Option<MONITORINFO> {
+    let mut info = MONITORINFO {
+        cbSize: u32::try_from(std::mem::size_of::<MONITORINFO>()).unwrap_or(0),
+        ..Default::default()
+    };
+    // SAFETY: `info` is a live MONITORINFO whose cbSize is set as the call requires.
+    let ok = unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool();
+    ok.then_some(info)
+}
+
+/// The display at `index`, if one is connected.
+fn monitor_at(index: u32) -> Option<HMONITOR> {
+    usize::try_from(index).ok().and_then(|i| monitors().get(i).copied())
+}
+
+/// Every connected display, for a monitor picker. Indices match [`CaptureTarget::Monitor`].
+#[must_use]
+pub fn list_monitors() -> Vec<MonitorInfo> {
+    // `MONITORINFOF_PRIMARY` (WindowsAndMessaging) is 1.
+    const PRIMARY_FLAG: u32 = 1;
+    (0_u32..)
+        .zip(monitors())
+        .filter_map(|(index, monitor)| {
+            let info = monitor_info(monitor)?;
+            let width = info.rcMonitor.right.saturating_sub(info.rcMonitor.left);
+            let height = info.rcMonitor.bottom.saturating_sub(info.rcMonitor.top);
+            Some(MonitorInfo {
+                index,
+                name: format!("Display {} – {width}×{height}", index + 1),
+                primary: info.dwFlags & PRIMARY_FLAG != 0,
+            })
+        })
+        .collect()
+}
+
 /// Resolves a [`CaptureTarget`] into a WGC capture item
 /// ([IGraphicsCaptureItemInterop](https://learn.microsoft.com/windows/win32/api/windows.graphics.capture.interop/nn-windows-graphics-capture-interop-igraphicscaptureiteminterop)).
+///
+/// A monitor index that isn't connected falls back to the primary display, so an
+/// unplugged screen never stops a recording.
 ///
 /// # Errors
 /// WGC unavailable (Windows 10 before 1903) or the target is gone.
@@ -53,21 +141,22 @@ pub fn capture_item(target: CaptureTarget) -> Result<GraphicsCaptureItem, Source
         .context("IGraphicsCaptureItemInterop")?;
     match target {
         CaptureTarget::PrimaryMonitor => {
-            // SAFETY: plain FFI call; the primary monitor always exists.
-            let monitor =
-                unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
-            // SAFETY: `monitor` is a valid HMONITOR obtained just above.
+            // SAFETY: `primary_monitor` returns a valid HMONITOR.
+            unsafe { interop.CreateForMonitor(primary_monitor()) }.context("CreateForMonitor")
+        }
+        CaptureTarget::Monitor(index) => {
+            let monitor = monitor_at(index).unwrap_or_else(|| {
+                tracing::warn!(index, "no monitor at that index; recording the primary display");
+                primary_monitor()
+            });
+            // SAFETY: `monitor` came from EnumDisplayMonitors or MonitorFromPoint just
+            // now. If it has been unplugged since, the call fails cleanly and the caller retries.
             unsafe { interop.CreateForMonitor(monitor) }.context("CreateForMonitor")
         }
         CaptureTarget::Window(hwnd) => {
             // SAFETY: an invalid HWND makes the call fail; it can't cause UB.
             unsafe { interop.CreateForWindow(HWND(hwnd as *mut c_void)) }.context("CreateForWindow")
         }
-        // ponytail: nothing selects a monitor by index until follow-the-game capture
-        // (Phase 4, Q8); add EnumDisplayMonitors then.
-        CaptureTarget::Monitor(_) => Err(SourceError::Unsupported(
-            "capturing a monitor by index isn't built yet (Phase 4)".into(),
-        )),
     }
 }
 

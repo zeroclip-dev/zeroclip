@@ -344,7 +344,7 @@ fn audio_track(track: TrackId, label: &str, config: &AudioStart) -> TrackInfo {
 fn video_start(settings: &Settings) -> VideoStart {
     let v = &settings.video;
     VideoStart {
-        target: CaptureTarget::PrimaryMonitor,
+        target: v.monitor.map_or(CaptureTarget::PrimaryMonitor, CaptureTarget::Monitor),
         // "Auto" asks for the best codec; the adapter walks down the ladder.
         codec: v.codec.unwrap_or(Codec::LADDER[0]),
         fps: v.fps,
@@ -1141,6 +1141,14 @@ mod tests {
         assert_eq!(start.max_bitrate_bps, 20_000_000);
         assert_eq!(start.keyframe_interval, zc_core::Hns::from_secs(1));
         assert!(!start.capture_cursor);
+        assert!(matches!(start.target, CaptureTarget::PrimaryMonitor));
+    }
+
+    #[test]
+    fn video_start_targets_the_chosen_monitor() {
+        let mut settings = Settings::default();
+        settings.video.monitor = Some(1);
+        assert!(matches!(video_start(&settings).target, CaptureTarget::Monitor(1)));
     }
 
     #[test]

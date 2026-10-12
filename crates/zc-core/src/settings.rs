@@ -143,6 +143,9 @@ pub struct VideoSettings {
     pub keyframe_interval_ms: u32,
     /// Draw the mouse cursor into the capture.
     pub capture_cursor: bool,
+    /// The screen to record, as an index in the order Windows lists displays. `None` is
+    /// the primary display. An index that isn't connected falls back to the primary.
+    pub monitor: Option<u32>,
 }
 
 impl Default for VideoSettings {
@@ -154,6 +157,7 @@ impl Default for VideoSettings {
             max_bitrate_kbps: 20_000,
             keyframe_interval_ms: 1_000,
             capture_cursor: false,
+            monitor: None,
         }
     }
 }
@@ -424,6 +428,15 @@ mod tests {
         assert_eq!(s.video.fps, 144);
         assert_eq!(s.video.max_bitrate_kbps, 20_000);
         assert_eq!(s.hotkeys, HotkeySettings::default());
+    }
+
+    #[test]
+    fn a_settings_file_without_a_monitor_records_the_primary() {
+        // Settings written before the Screen option existed have no `monitor` key.
+        let older: Settings = toml::from_str("[video]\nfps = 60\ncapture_cursor = true\n").unwrap();
+        assert_eq!(older.video.monitor, None);
+        let picked: Settings = toml::from_str("[video]\nmonitor = 1\n").unwrap();
+        assert_eq!(picked.video.monitor, Some(1));
     }
 
     fn track(label: &str, exe: &str) -> AppTrack {
