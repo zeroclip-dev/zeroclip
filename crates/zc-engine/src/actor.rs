@@ -39,6 +39,9 @@ pub struct Ports {
     pub game_audio: Option<Box<dyn AudioSource>>,
     /// Microphone (`zc-audio`, Phase 2).
     pub mic: Option<Box<dyn AudioSource>>,
+    /// Per-app audio tracks (`zc-audio`, D26), one per enabled `AppTrack` in settings order, each
+    /// with the label its container track gets. They start after the mic and before Master.
+    pub app_audio: Vec<(String, Box<dyn AudioSource>)>,
     /// The Master mix, track 1 (`zc-audio`, D30). Starts after the sources above, and only if
     /// one of them started.
     pub master_audio: Option<Box<dyn AudioSource>>,
@@ -57,6 +60,7 @@ impl fmt::Debug for Ports {
             .field("video", &self.video.is_some())
             .field("game_audio", &self.game_audio.is_some())
             .field("mic", &self.mic.is_some())
+            .field("app_audio", &self.app_audio.len())
             .field("master_audio", &self.master_audio.is_some())
             .field("input", &self.input.is_some())
             .field("seek_penalty", &self.seek_penalty.is_some())
@@ -489,7 +493,8 @@ impl Actor {
         let video = self.ports.video.is_some().then_some(TrackId::Video);
         let audio = [&self.ports.game_audio, &self.ports.mic, &self.ports.master_audio]
             .into_iter()
-            .filter_map(|source| source.as_ref().map(|source| source.track()));
+            .filter_map(|source| source.as_ref().map(|source| source.track()))
+            .chain(self.ports.app_audio.iter().map(|(_, source)| source.track()));
         let tracks: Vec<TrackId> = video.into_iter().chain(audio).collect();
         let started = Instant::now();
         match self.recorder.lock_memory(lock, &tracks) {
@@ -589,6 +594,13 @@ impl Actor {
                 Err(e) => errors.push(format!("Microphone unavailable: {e}")),
             }
         }
+        // An app track that fails is reported and skipped; it never stops the recording.
+        for (label, app) in &mut self.ports.app_audio {
+            match app.start(&config, Arc::clone(&sink), Arc::clone(&health)) {
+                Ok(()) => tracks.push(audio_track(app.track(), label, &config)),
+                Err(e) => errors.push(format!("{label} audio unavailable: {e}")),
+            }
+        }
         // Only when a source runs, so Master is never a track of silence alone. It starts after
         // them, so its mix point is set before any source writes (D30).
         if !tracks.is_empty()
@@ -625,12 +637,17 @@ impl Actor {
     }
 
     fn stop_sources(&mut self) {
-        let Ports { video, game_audio, mic, master_audio, input, .. } = &mut self.ports;
+        let Ports { video, game_audio, mic, app_audio, master_audio, input, .. } = &mut self.ports;
         if let Some(input) = input {
             input.stop();
         }
         // Master last: it still mixes what the sources wrote before they stopped.
-        for audio in [game_audio, mic, master_audio].into_iter().flatten() {
+        let sources = [game_audio, mic]
+            .into_iter()
+            .flatten()
+            .chain(app_audio.iter_mut().map(|(_, source)| source))
+            .chain(master_audio.as_mut());
+        for audio in sources {
             audio.stop();
         }
         if let Some(video) = video {
@@ -1455,6 +1472,40 @@ mod tests {
         };
         assert!(first(b"Video") < first(b"Master"), "video is track 0");
         assert!(first(b"Master") < first(b"Game"), "Master is the first audio track");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_app_track_is_started_and_named_by_its_label_in_a_saved_clip() {
+        let dir = std::env::temp_dir().join(format!("zeroclip-app-{}", std::process::id()));
+        let mut settings = Settings::default();
+        settings.recording.output_dir = Some(dir.clone());
+        let config = EngineConfig { settings, default_output_dir: dir.clone() };
+        let app = FeedAudio::new(zc_core::TrackId::audio(3).expect("slot 3 is an audio track"));
+        let ports = Ports {
+            video: Some(Box::new(SyntheticVideoSource::new().realtime(true))),
+            game_audio: Some(Box::new(FeedAudio::new(zc_core::TrackId::GameAudio))),
+            app_audio: vec![("Discord".to_owned(), Box::new(app) as Box<dyn AudioSource>)],
+            ..Ports::default()
+        };
+        let engine = Engine::spawn(config, ports, Arc::new(|()| {})).expect("spawn");
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Status(s) if s.buffered >= zc_core::Hns::from_secs(1)),
+        );
+        engine.send(Command::SaveClip).unwrap();
+        let event = wait_for(&engine, |e| matches!(e, EngineEvent::ClipSaved { .. }));
+        let EngineEvent::ClipSaved { path, .. } = event else { unreachable!() };
+        engine.shutdown();
+
+        // The app track is declared after Game, and carries its settings label.
+        let file = std::fs::read(&path).expect("the clip is readable");
+        let first = |name: &[u8]| {
+            file.windows(name.len())
+                .position(|w| w == name)
+                .unwrap_or_else(|| panic!("{} is not in the clip", String::from_utf8_lossy(name)))
+        };
+        assert!(first(b"Game") < first(b"Discord"), "the app track follows the game track");
         let _ = std::fs::remove_dir_all(dir);
     }
 
