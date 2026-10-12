@@ -146,6 +146,9 @@ pub struct VideoSettings {
     /// The screen to record, as an index in the order Windows lists displays. `None` is
     /// the primary display. An index that isn't connected falls back to the primary.
     pub monitor: Option<u32>,
+    /// What to record: only profiled games (default), or the whole screen (D31).
+    #[serde(default)]
+    pub capture_mode: CaptureMode,
 }
 
 impl Default for VideoSettings {
@@ -158,8 +161,21 @@ impl Default for VideoSettings {
             keyframe_interval_ms: 1_000,
             capture_cursor: false,
             monitor: None,
+            capture_mode: CaptureMode::default(),
         }
     }
+}
+
+/// What the video source records (D31).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureMode {
+    /// Only the window of a game that has a profile, while it has focus. Nothing else is
+    /// captured.
+    #[default]
+    Game,
+    /// The whole screen (`video.monitor`), from the start.
+    Screen,
 }
 
 impl VideoSettings {
@@ -437,6 +453,15 @@ mod tests {
         assert_eq!(older.video.monitor, None);
         let picked: Settings = toml::from_str("[video]\nmonitor = 1\n").unwrap();
         assert_eq!(picked.video.monitor, Some(1));
+    }
+
+    #[test]
+    fn capture_mode_defaults_to_game_and_loads_from_older_files() {
+        assert_eq!(Settings::default().video.capture_mode, CaptureMode::Game);
+        let older: Settings = toml::from_str("[video]\nfps = 60\n").unwrap();
+        assert_eq!(older.video.capture_mode, CaptureMode::Game);
+        let screen: Settings = toml::from_str("[video]\ncapture_mode = \"screen\"\n").unwrap();
+        assert_eq!(screen.video.capture_mode, CaptureMode::Screen);
     }
 
     fn track(label: &str, exe: &str) -> AppTrack {

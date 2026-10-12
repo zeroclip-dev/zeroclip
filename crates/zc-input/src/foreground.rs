@@ -31,7 +31,7 @@ fn report(hwnd: HWND) {
             if let Ok(mut emit) = cell.try_borrow_mut()
                 && let Some(emit) = emit.as_mut()
             {
-                emit(OsEvent::Foreground { pid, exe });
+                emit(OsEvent::Foreground { pid, hwnd: hwnd.0 as isize, exe });
             }
         });
     }

@@ -220,3 +220,18 @@ the press with Master complete. A recording's Master ends about 200 ms before it
 (cutting per track at stop isn't built). Mix gains apply at the next start, and a source's
 volume in Master is fixed at record time (rebalance from the side tracks in the editor,
 P5.14).
+
+### D31 · Capture mode: game window by default, whole screen optional (supersedes the primary-monitor part of D24)
+ideo.capture_mode is game (default) or screen. In **Game** mode ZeroClip records only the
+window of a game that has a profile (CaptureTarget::Window), and only while that game has focus.
+Nothing from the desktop is captured. When another app takes focus, the video and audio sources stop,
+but the DVR buffer and the input thread keep running: hotkeys work, and a save cuts a clip from the
+kept buffer. Focusing the same game again resumes into the same buffer. Focusing a different profiled
+game clears the buffer first, so a clip never mixes two games. ZeroClip's own windows and explorer.exe
+(taskbar, Start menu) don't pause capture. **Screen** mode is D24's behaviour: ideo.monitor, from start.
+Costs: the buffer keeps footage from before and after a pause, so a clip can jump in time where the game
+was away; each resume starts a new encoder; a window resize during a pause doesn't clear the buffer (only
+a different game does); the mic and app tracks run only while a profiled game is captured; on Windows 10
+the game-audio fallback is whole-system loopback (D9), so the desktop's sound can reach the game track.
+The DVR ring is still sized at startup from the default profile, so a profile window longer than that is
+capped by the ring until P4.6 adds Recorder::resize.

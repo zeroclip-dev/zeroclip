@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use zc_core::control::{Command, EngineEvent};
-use zc_core::settings::Settings;
+use zc_core::settings::{CaptureMode, Settings};
 use zc_engine::synthetic::{FaultPlan, SyntheticVideoSource};
 use zc_engine::{Engine, EngineConfig, EngineHandle, Ports};
 
@@ -15,9 +15,16 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// The output folder [`engine_with`] uses, under the temp dir.
 const HARNESS_DIR: &str = "zeroclip-harness";
 
+/// The default settings in Screen mode: these specs drive a synthetic screen, not a game.
+fn screen_settings() -> Settings {
+    let mut settings = Settings::default();
+    settings.video.capture_mode = CaptureMode::Screen;
+    settings
+}
+
 fn engine_with(video: SyntheticVideoSource) -> EngineHandle {
     let config = EngineConfig {
-        settings: Settings::default(),
+        settings: screen_settings(),
         default_output_dir: std::env::temp_dir().join(HARNESS_DIR),
     };
     let ports = Ports { video: Some(Box::new(video)), ..Ports::default() };
@@ -59,7 +66,7 @@ fn saving_a_clip_writes_a_file() {
 fn saves_one_after_another_each_write_a_file() {
     let scratch =
         ScratchDir(std::env::temp_dir().join(format!("zeroclip-clips-{}", std::process::id())));
-    let mut settings = Settings::default();
+    let mut settings = screen_settings();
     settings.recording.output_dir = Some(scratch.0.clone());
     let config = EngineConfig { settings, default_output_dir: scratch.0.clone() };
     let video = SyntheticVideoSource::new().realtime(true);
@@ -84,7 +91,7 @@ fn saves_one_after_another_each_write_a_file() {
 fn quitting_right_after_a_save_still_finishes_the_clip() {
     let scratch =
         ScratchDir(std::env::temp_dir().join(format!("zeroclip-quit-save-{}", std::process::id())));
-    let mut settings = Settings::default();
+    let mut settings = screen_settings();
     settings.recording.output_dir = Some(scratch.0.clone());
     let config = EngineConfig { settings, default_output_dir: scratch.0.clone() };
     let video = SyntheticVideoSource::new().realtime(true);
@@ -112,7 +119,7 @@ fn quitting_right_after_a_save_still_finishes_the_clip() {
 fn manual_recording_writes_a_file() {
     let scratch =
         ScratchDir(std::env::temp_dir().join(format!("zeroclip-recording-{}", std::process::id())));
-    let mut settings = Settings::default();
+    let mut settings = screen_settings();
     settings.recording.output_dir = Some(scratch.0.clone());
     let config = EngineConfig { settings, default_output_dir: scratch.0.clone() };
     let video = SyntheticVideoSource::new().realtime(true);
