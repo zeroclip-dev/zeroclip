@@ -60,12 +60,12 @@ Measured 2026-10-05 with `spike-phase2`: every track within ±11 ms of its minut
 
 ## Phase 3 — Buffers, modes, muxing
 
-- [ ] Specs: `DvrBuffer` (all of them, including `dvr_push_never_allocates`), `Tee`, `ChunkedWriter`, `WritePacer`
-- [ ] Implement `zc_mux::container::create` (fMP4, decided in D18)
-- [ ] Crash-safe recordings: sync every fragment, `.partial` files, startup repair (D18)
-- [ ] `Recorder` spec; `SyntheticVideoSource`; the `synthetic_harness` save-clip spec
+- [x] Specs: `DvrBuffer` (all of them, including `dvr_push_never_allocates`), `Tee`, `ChunkedWriter`, `WritePacer`
+- [x] Implement `zc_mux::container::create` (fMP4, decided in D18)
+- [x] Crash-safe recordings: sync every fragment, `.partial` files, startup repair (D18)
+- [x] `Recorder` spec; `SyntheticVideoSource`; the `synthetic_harness` save-clip spec
 - [ ] DVR save, manual recording, session recording; page-lock the buffer (`VirtualLock`)
-- [ ] `zc-win::drive` + HDD pacing for dumps
+- [x] `zc-win::drive` + HDD pacing for dumps
 
 *Done when:* a DVR dump taken at any arbitrary moment decodes from its first frame and has audio.
 

@@ -5,10 +5,28 @@ few minutes of gameplay in memory and saves them with one hotkey — without tou
 the game, without copying frames off the GPU, and without losing the clip when the
 game crashes.
 
-> **Status: pre-alpha.** The app captures the screen and encodes it on the GPU (H.264 or
-> HEVC, 60 fps, fixed keyframe interval), surviving alt-tab, resolution and display changes.
-> It doesn't save clips yet: audio and hotkeys (Phase 2) and the DVR buffer and files
-> (Phase 3) come next. See the [roadmap](docs/ROADMAP.md).
+> **Status: v0.1 scope.** ZeroClip can:
+>
+> - keep a DVR buffer and save the last few minutes as a clip with one hotkey (Alt+F10)
+> - record manually (Alt+F9) to crash-safe fragmented MP4 files
+> - repair recordings that a crash cut short, on the next start
+> - write in HDD-aware chunks, and pace clip dumps on spinning disks
+> - record a live master mix track next to the game and microphone tracks
+> - keep the mic always on, or use push-to-talk
+> - encode with HEVC or H.264 on the GPU
+>
+> See the [roadmap](docs/ROADMAP.md) for what comes next, and
+> [How ZeroClip works](docs/HOW_IT_WORKS.md) for the design in one read.
+
+<!-- GIF placeholder: docs/media/save-clip.gif (save a clip, 10 s max, 720p, 15 fps, under 5 MB). Not recorded yet (P3.28). -->
+
+## Known limits in v0.1
+
+- Browsers and Discord play only the first audio track, which is the live master mix.
+  The separate game and mic tracks are heard in players such as VLC.
+- No MKV output. Recordings and clips are MP4 (fMP4).
+- Game audio follows the focused window only.
+- No tray, no per-game profiles, no watchdog yet.
 
 ## What makes it different
 
@@ -77,7 +95,7 @@ You need:
 - From Phase 5: `ffmpeg` on your `PATH`.
 
 ```powershell
-cargo run                    # the app (the UI works; recording arrives phase by phase)
+cargo run --release          # the app
 cargo test                   # everything that is built so far
 cargo test -- --ignored      # the specs for what isn't built yet (these fail until implemented)
 cargo run -p spike-phase0    # the Phase 0 capture → encode spike
