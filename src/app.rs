@@ -53,6 +53,7 @@ pub struct ZeroClipApp {
     /// Newest first.
     pub notices: VecDeque<Notice>,
     pub clips: ui::clips::ClipList,
+    pub open_apps: ui::components::open_apps::OpenAppsList,
     /// Results from the startup repair thread, moved into `notices` as they arrive.
     repairs: mpsc::Receiver<Notice>,
 }
@@ -90,6 +91,7 @@ impl ZeroClipApp {
             tab: Tab::Home,
             notices: VecDeque::new(),
             clips: ui::clips::ClipList::default(),
+            open_apps: Default::default(),
             repairs,
         })
     }

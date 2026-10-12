@@ -320,7 +320,7 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
     });
 }
 
-fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+pub(super) fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(6.0);
     ui.strong(title);
     ui.add_space(4.0);
