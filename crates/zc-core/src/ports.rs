@@ -170,6 +170,8 @@ pub enum OsEvent {
     Foreground {
         /// Owning process id.
         pid: u32,
+        /// The window, as its `HWND` value (for window capture).
+        hwnd: isize,
         /// Full path of its executable.
         exe: String,
     },
