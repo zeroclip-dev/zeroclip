@@ -14,18 +14,25 @@
 //! - **Track 3, microphone** — [`MicSource`]: the default capture device, gated by
 //!   push-to-talk (a closed gate writes silence so the track keeps its length),
 //!   optionally through the dynamics compressor in `zc_core::dsp`.
+//! - **Tracks 4 and up, per-app audio** — [`AppAudioSource`] (D26): one process-loopback
+//!   client per chosen app (for example `Discord.exe`), each on its own track. An app that
+//!   isn't running writes silence. Unlike the game track there is no whole-system fallback:
+//!   before Windows 11 build 20348 the track stays silent rather than recording everything.
 //!
-//! Both run an event-driven capture loop on their own thread, registered with
+//! Each source runs an event-driven capture loop on its own thread, registered with
 //! MMCSS (`AvSetMmThreadCharacteristicsW("Pro Audio")`) so they don't glitch
 //! under game load. WASAPI is used through the raw `windows` APIs rather than the
 //! `wasapi` crate (DECISIONS), so the audio loop's no-allocation rule stays ours.
 
 mod aac;
+mod app;
 mod capture;
 mod game;
+mod loopback;
 mod mic;
 mod mix;
 
+pub use app::AppAudioSource;
 pub use game::GameAudioSource;
 pub use mic::{MicDevice, MicSource, list_microphones};
 pub use mix::MasterMix;
