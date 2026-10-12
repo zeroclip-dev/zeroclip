@@ -2,3 +2,4 @@
 //! widget.
 
 pub mod mic_indicator;
+pub mod open_apps;
