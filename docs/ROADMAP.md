@@ -73,7 +73,7 @@ Measured 2026-10-05 with `spike-phase2`: every track within ±11 ms of its minut
 
 ## Phase 4 — UI, profiles, watchdogs
 
-- [ ] Specs: `Watchdog::on_event`, `ProfileSet`, `clamp_window` (`clamp_window` done early, in Phase 3: P3.16)
+- [x] Specs: `Watchdog::on_event`, `ProfileSet`, `clamp_window` (`clamp_window` done early, in Phase 3: P3.16)
 - [ ] `zc-store` (rusqlite, bundled) and the migrations
 - [ ] Profile engine on foreground change, with safe buffer resizing
 - [ ] Watchdog wiring and the `synthetic_harness` recovery spec; crash rescue (`recovery.tmp` + prompt)

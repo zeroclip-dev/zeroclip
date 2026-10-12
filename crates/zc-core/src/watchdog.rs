@@ -132,9 +132,7 @@ pub struct Watchdog {
     config: WatchdogConfig,
     state: WatchdogState,
     codec: Codec,
-    #[expect(dead_code, reason = "scaffold: read once on_event is implemented")]
     consecutive_drops: u32,
-    #[expect(dead_code, reason = "scaffold: read once on_event is implemented")]
     failed_reinits: u32,
 }
 
@@ -174,8 +172,66 @@ impl Watchdog {
     /// Events that make no sense in the current state (e.g. `Flushed` while
     /// `Running`) are ignored and return [`WatchdogAction::None`].
     pub fn on_event(&mut self, event: HealthEvent) -> WatchdogAction {
-        let _ = event;
-        todo!("Phase 4: the recovery state machine (see the `watchdog_*` specs)")
+        match (self.state, event) {
+            (WatchdogState::Running, HealthEvent::FrameDropped) => {
+                self.consecutive_drops = self.consecutive_drops.saturating_add(1);
+                if self.consecutive_drops >= self.config.max_consecutive_drops {
+                    self.consecutive_drops = 0;
+                    self.state = WatchdogState::Draining;
+                    WatchdogAction::Drain
+                } else {
+                    WatchdogAction::None
+                }
+            }
+            (WatchdogState::Running, HealthEvent::FrameDelivered { .. }) => {
+                self.consecutive_drops = 0;
+                WatchdogAction::None
+            }
+            (WatchdogState::Running, HealthEvent::EncoderFault { .. }) => {
+                self.state = WatchdogState::Draining;
+                WatchdogAction::Drain
+            }
+            (WatchdogState::Running, HealthEvent::DiskWrite { latency }) => {
+                if latency > self.config.slow_disk_write {
+                    WatchdogAction::PaceDiskWrites
+                } else {
+                    WatchdogAction::None
+                }
+            }
+            (WatchdogState::Draining, HealthEvent::Drained) => {
+                self.state = WatchdogState::Flushing;
+                WatchdogAction::FlushToDisk
+            }
+            (WatchdogState::Flushing, HealthEvent::Flushed) => {
+                self.state = WatchdogState::Reinit;
+                self.failed_reinits = 0;
+                WatchdogAction::Reinit { codec: self.codec }
+            }
+            (WatchdogState::Reinit, HealthEvent::ReinitSucceeded) => {
+                self.state = WatchdogState::Resuming;
+                WatchdogAction::Resume
+            }
+            (WatchdogState::Reinit, HealthEvent::ReinitFailed) => {
+                self.failed_reinits = self.failed_reinits.saturating_add(1);
+                if self.failed_reinits < self.config.reinit_attempts_per_codec {
+                    WatchdogAction::Reinit { codec: self.codec }
+                } else if let Some(next) = self.codec.step_down() {
+                    self.codec = next;
+                    self.failed_reinits = 0;
+                    WatchdogAction::Reinit { codec: next }
+                } else {
+                    self.state = WatchdogState::Failed;
+                    WatchdogAction::GiveUp
+                }
+            }
+            (WatchdogState::Resuming, HealthEvent::KeyframeEmitted) => {
+                self.state = WatchdogState::Running;
+                self.consecutive_drops = 0;
+                WatchdogAction::None
+            }
+            // Out-of-order or irrelevant for the current state: no-op.
+            _ => WatchdogAction::None,
+        }
     }
 }
 
@@ -210,7 +266,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: Watchdog::on_event (Phase 4)"]
     fn watchdog_drains_after_ten_consecutive_drops() {
         let mut w = watchdog(Codec::Hevc);
         assert_eq!(drops(&mut w, 9), WatchdogAction::None);
@@ -220,7 +275,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: Watchdog::on_event (Phase 4)"]
     fn watchdog_resets_the_drop_count_when_a_frame_gets_through() {
         let mut w = watchdog(Codec::Hevc);
         drops(&mut w, 9);
@@ -231,7 +285,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: Watchdog::on_event (Phase 4)"]
     fn watchdog_drains_immediately_on_encoder_fault() {
         let mut w = watchdog(Codec::Hevc);
         let fault = HealthEvent::EncoderFault { hresult: 0x8000_4005_u32.cast_signed() };
@@ -240,7 +293,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: Watchdog::on_event (Phase 4)"]
     fn watchdog_paces_a_slow_disk_instead_of_reinitialising() {
         let mut w = watchdog(Codec::Hevc);
         let slow = HealthEvent::DiskWrite { latency: Hns::from_secs(2) };
@@ -251,7 +303,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: Watchdog::on_event (Phase 4)"]
     fn watchdog_runs_the_full_recovery_sequence() {
         let mut w = watchdog(Codec::Hevc);
         assert_eq!(fault_to_reinit(&mut w), WatchdogAction::Reinit { codec: Codec::Hevc });
@@ -263,7 +314,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: Watchdog::on_event (Phase 4)"]
     fn watchdog_ignores_frame_events_while_recovering() {
         let mut w = watchdog(Codec::Hevc);
         drops(&mut w, 10);
@@ -275,7 +325,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: Watchdog::on_event (Phase 4)"]
     fn watchdog_ignores_out_of_order_events() {
         let mut w = watchdog(Codec::Hevc);
         for e in [HealthEvent::Drained, HealthEvent::Flushed, HealthEvent::ReinitSucceeded] {
@@ -285,7 +334,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: Watchdog::on_event (Phase 4)"]
     fn watchdog_steps_down_the_codec_ladder_after_repeated_reinit_failures() {
         let mut w = watchdog(Codec::Av1);
         assert_eq!(fault_to_reinit(&mut w), WatchdogAction::Reinit { codec: Codec::Av1 });
@@ -299,7 +347,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: Watchdog::on_event (Phase 4)"]
     fn watchdog_gives_up_when_the_ladder_is_exhausted() {
         let mut w = watchdog(Codec::H264);
         assert_eq!(fault_to_reinit(&mut w), WatchdogAction::Reinit { codec: Codec::H264 });
