@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::hotkey::Chord;
-use crate::media::{Codec, ContainerFormat};
+use crate::media::{Codec, ContainerFormat, MAX_AUDIO_TRACKS};
 use crate::profile::ProfileSet;
 use crate::time::Hns;
 
@@ -79,6 +79,7 @@ impl Settings {
                 "Matroska recordings aren't written. Choose Fragmented MP4 (.mp4).".to_owned(),
             );
         }
+        problems.extend(app_track_problems(&self.audio.app_tracks));
 
         let hotkeys = &self.hotkeys;
         let bound = [
@@ -200,6 +201,58 @@ impl Default for MixGains {
 /// The range a Master mix level may take, in dB.
 pub const MIX_GAIN_DB: RangeInclusive<f32> = -60.0..=12.0;
 
+/// Audio slots left after Master, Game and Mic: the most per-app tracks a recording can hold.
+pub const MAX_APP_TRACKS: usize = MAX_AUDIO_TRACKS as usize - 3;
+
+/// One app whose audio is recorded as its own track (D26). The app is found by its
+/// executable name; a tree of processes counts as one app.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppTrack {
+    /// Name shown in the UI and written as the track's title. Unique, case-insensitively.
+    pub label: String,
+    /// Executable file name, such as `Discord.exe`. A path prefix is ignored.
+    pub exe: String,
+    /// Whether the track is recorded at all.
+    pub enabled: bool,
+}
+
+/// The per-app tracks a fresh install records: Discord and Spotify (D27).
+fn default_app_tracks() -> Vec<AppTrack> {
+    vec![
+        AppTrack { label: "Discord".to_owned(), exe: "Discord.exe".to_owned(), enabled: true },
+        AppTrack { label: "Spotify".to_owned(), exe: "Spotify.exe".to_owned(), enabled: true },
+    ]
+}
+
+/// Problems with the per-app tracks, as sentences for the UI.
+fn app_track_problems(tracks: &[AppTrack]) -> Vec<String> {
+    let mut problems = Vec::new();
+    if tracks.len() > MAX_APP_TRACKS {
+        problems.push(format!(
+            "At most {MAX_APP_TRACKS} app tracks are allowed (there are {}).",
+            tracks.len()
+        ));
+    }
+    let mut seen: Vec<String> = Vec::new();
+    for track in tracks {
+        let label = track.label.trim();
+        if label.is_empty() {
+            problems.push("Every app track needs a label.".to_owned());
+            continue;
+        }
+        let key = label.to_lowercase();
+        if seen.contains(&key) {
+            problems.push(format!("Two app tracks are both called \"{label}\"."));
+        } else {
+            seen.push(key);
+        }
+        if track.exe.trim().is_empty() {
+            problems.push(format!("The app track \"{label}\" needs an executable name."));
+        }
+    }
+    problems
+}
+
 /// Audio settings.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -217,6 +270,10 @@ pub struct AudioSettings {
     pub bitrate_kbps: u32,
     /// Each source's level in the Master track (track 1). Read when the sources start.
     pub mix_gain_db: MixGains,
+    /// Apps recorded as their own tracks (D26). Settings files from before this field
+    /// get the defaults.
+    #[serde(default = "default_app_tracks")]
+    pub app_tracks: Vec<AppTrack>,
 }
 
 impl Default for AudioSettings {
@@ -228,6 +285,7 @@ impl Default for AudioSettings {
             mic_compressor: true,
             bitrate_kbps: 192,
             mix_gain_db: MixGains::default(),
+            app_tracks: default_app_tracks(),
         }
     }
 }
@@ -366,5 +424,53 @@ mod tests {
         assert_eq!(s.video.fps, 144);
         assert_eq!(s.video.max_bitrate_kbps, 20_000);
         assert_eq!(s.hotkeys, HotkeySettings::default());
+    }
+
+    fn track(label: &str, exe: &str) -> AppTrack {
+        AppTrack { label: label.to_owned(), exe: exe.to_owned(), enabled: true }
+    }
+
+    #[test]
+    fn app_tracks_default_to_discord_and_spotify_enabled() {
+        let tracks = Settings::default().audio.app_tracks;
+        assert_eq!(tracks, vec![track("Discord", "Discord.exe"), track("Spotify", "Spotify.exe")]);
+        assert!(tracks.iter().all(|t| t.enabled));
+    }
+
+    #[test]
+    fn a_settings_file_without_app_tracks_gets_the_defaults() {
+        let older: Settings = toml::from_str("[audio]\nbitrate_kbps = 128\n").unwrap();
+        assert_eq!(older.audio.app_tracks, AudioSettings::default().app_tracks);
+        assert_eq!(older.audio.app_tracks.len(), 2);
+    }
+
+    #[test]
+    fn app_track_labels_must_be_unique_ignoring_case() {
+        let mut s = Settings::default();
+        s.audio.app_tracks = vec![track("Chat", "Discord.exe"), track("chat ", "Spotify.exe")];
+        assert!(s.problems().iter().any(|p| p.contains("both called \"chat\"")));
+        s.audio.app_tracks[1].label = "Music".to_owned();
+        assert!(s.problems().is_empty());
+    }
+
+    #[test]
+    fn at_most_four_app_tracks_fit_the_audio_slots() {
+        assert_eq!(MAX_APP_TRACKS, 4);
+        let mut s = Settings::default();
+        s.audio.app_tracks =
+            (0..MAX_APP_TRACKS).map(|i| track(&format!("App {i}"), "a.exe")).collect();
+        assert!(s.problems().is_empty(), "{:#?}", s.problems());
+        s.audio.app_tracks.push(track("Extra", "b.exe"));
+        assert!(s.problems().iter().any(|p| p.contains("At most 4 app tracks")));
+    }
+
+    #[test]
+    fn app_tracks_need_a_label_and_an_executable() {
+        let mut s = Settings::default();
+        s.audio.app_tracks = vec![track("  ", "Discord.exe"), track("Spotify", " ")];
+        let problems = s.problems();
+        assert!(problems.iter().any(|p| p == "Every app track needs a label."));
+        assert!(problems.iter().any(|p| p.contains("\"Spotify\" needs an executable name")));
+        assert_eq!(problems.len(), 2, "{problems:#?}");
     }
 }
