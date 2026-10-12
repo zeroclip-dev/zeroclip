@@ -7,7 +7,7 @@ use eframe::egui::{self, Button, ComboBox, DragValue, Grid, Slider, TextEdit};
 use zc_audio::MicDevice;
 use zc_core::hotkey::Chord;
 use zc_core::media::{Codec, ContainerFormat};
-use zc_core::settings::{AAC_BITRATES_KBPS, MIX_GAIN_DB, MicMode, Settings};
+use zc_core::settings::{AAC_BITRATES_KBPS, CaptureMode, MIX_GAIN_DB, MicMode, Settings};
 use zc_video::capture::MonitorInfo;
 
 use super::{dvr_megabytes, human_duration};
@@ -150,26 +150,45 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
         section(ui, "Video", |ui| {
             let (monitors, video) = (&mut draft.monitors, &mut draft.settings.video);
             Grid::new("video").num_columns(2).spacing([24.0, 8.0]).show(ui, |ui| {
-                ui.label("Screen");
-                ui.horizontal(|ui| {
-                    let selected = video.monitor.map_or_else(
-                        || "Primary display (default)".to_owned(),
-                        |i| {
-                            monitors.iter().find(|m| m.index == i).map_or_else(
-                                || format!("Display {} (not connected)", i + 1),
-                                |m| m.name.clone(),
-                            )
-                        },
-                    );
-                    ComboBox::from_id_salt("monitor").selected_text(selected).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut video.monitor, None, "Primary display (default)");
-                        for m in monitors.iter() {
-                            ui.selectable_value(&mut video.monitor, Some(m.index), &m.name);
+                ui.label("Capture");
+                ComboBox::from_id_salt("capture")
+                    .selected_text(capture_label(video.capture_mode))
+                    .show_ui(ui, |ui| {
+                        for option in [CaptureMode::Game, CaptureMode::Screen] {
+                            ui.selectable_value(&mut video.capture_mode, option, capture_label(option));
                         }
                     });
-                    if ui.button("Refresh").clicked() {
-                        *monitors = zc_video::capture::list_monitors();
-                    }
+                ui.end_row();
+                if video.capture_mode == CaptureMode::Game {
+                    ui.label("");
+                    ui.weak("Records only games that have a profile. Add games on the Profiles tab.");
+                    ui.end_row();
+                }
+
+                // The screen only matters when the whole screen is recorded.
+                let screen_on = video.capture_mode == CaptureMode::Screen;
+                ui.label("Screen");
+                ui.add_enabled_ui(screen_on, |ui| {
+                    ui.horizontal(|ui| {
+                        let selected = video.monitor.map_or_else(
+                            || "Primary display (default)".to_owned(),
+                            |i| {
+                                monitors.iter().find(|m| m.index == i).map_or_else(
+                                    || format!("Display {} (not connected)", i + 1),
+                                    |m| m.name.clone(),
+                                )
+                            },
+                        );
+                        ComboBox::from_id_salt("monitor").selected_text(selected).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut video.monitor, None, "Primary display (default)");
+                            for m in monitors.iter() {
+                                ui.selectable_value(&mut video.monitor, Some(m.index), &m.name);
+                            }
+                        });
+                        if ui.button("Refresh").clicked() {
+                            *monitors = zc_video::capture::list_monitors();
+                        }
+                    });
                 });
                 ui.end_row();
 
@@ -359,6 +378,13 @@ pub(super) fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui
 
 fn codec_label(codec: Option<Codec>) -> &'static str {
     codec.map_or("Auto (best the GPU supports)", Codec::name)
+}
+
+fn capture_label(mode: CaptureMode) -> &'static str {
+    match mode {
+        CaptureMode::Game => "Game only (default)",
+        CaptureMode::Screen => "Entire screen",
+    }
 }
 
 fn container_label(container: ContainerFormat) -> &'static str {

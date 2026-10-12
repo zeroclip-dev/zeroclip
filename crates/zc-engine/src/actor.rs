@@ -18,8 +18,8 @@ use zc_core::ports::{
     AudioSource, AudioStart, CaptureTarget, Emit, InputSource, LockMemory, OsEvent, SeekPenalty,
     SourceError, VideoSource, VideoStart,
 };
-use zc_core::profile::{WindowClamp, clamp_window};
-use zc_core::settings::{MicMode, Settings};
+use zc_core::profile::{GameProfile, ProfileSet, WindowClamp, clamp_window, exe_name};
+use zc_core::settings::{CaptureMode, MicMode, Settings};
 use zc_core::sink::{SharedSink, SinkId};
 use zc_core::watchdog::HealthEvent;
 use zc_core::{Codec, Hns};
@@ -132,6 +132,9 @@ impl Engine {
             drive: DriveKind::default(),
             mic_running: false,
             ptt_held: false,
+            video_track: None,
+            game_capture: None,
+            audio_running: false,
         };
         let thread =
             thread::Builder::new().name("zc-engine".into()).spawn(move || actor.run(&rx))?;
@@ -256,6 +259,74 @@ struct Actor {
     mic_running: bool,
     /// Whether the push-to-talk key is down, as the last `Command::PushToTalk` said.
     ptt_held: bool,
+    /// The video track of the encoder that last started. Kept while capture is paused, so a clip
+    /// can still be cut from the buffer (D31).
+    video_track: Option<TrackInfo>,
+    /// The game whose buffer is held: its window and exe file name. Set when capture starts for a
+    /// profiled game, and kept while paused. Only used in Game mode (D31).
+    game_capture: Option<GameCapture>,
+    /// Whether the audio sources are running. Set by `start_audio`, cleared by `stop_capture`.
+    audio_running: bool,
+}
+
+/// The game window capture follows, and its exe file name.
+struct GameCapture {
+    hwnd: isize,
+    exe: String,
+}
+
+/// The window that took focus, as a foreground change reports it.
+#[derive(Clone, Copy, Debug)]
+struct Focus<'a> {
+    pid: u32,
+    hwnd: isize,
+    exe: &'a str,
+}
+
+/// What a foreground change does to capture in Game mode (D31).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureDecision {
+    /// Capture this window. `clear_buffer` when the buffer holds a different game.
+    Start { hwnd: isize, clear_buffer: bool },
+    /// Stop capture, and keep the buffer.
+    Pause,
+    /// Leave capture as it is.
+    Keep,
+}
+
+/// The taskbar, Start menu and desktop belong to explorer.exe. Focusing them changes neither the
+/// game being captured nor the game's audio.
+fn is_shell(exe: &str) -> bool {
+    exe_name(exe).eq_ignore_ascii_case("explorer.exe")
+}
+
+/// Decides what a focus change does to capture (D31). `kept` is the game whose buffer is held
+/// (window, exe file name), and `capturing` says whether its window is being captured now.
+///
+/// In Screen mode nothing changes. In Game mode, a profiled game starts capture (or moves it to
+/// its new window), and any other app pauses it. ZeroClip's own windows and the shell are ignored,
+/// so opening ZeroClip or the Start menu mid-game doesn't pause capture.
+fn capture_decision(
+    mode: CaptureMode,
+    profiles: &ProfileSet,
+    kept: Option<(isize, &str)>,
+    capturing: bool,
+    own_pid: u32,
+    focus: Focus<'_>,
+) -> CaptureDecision {
+    if mode == CaptureMode::Screen || focus.pid == own_pid || is_shell(focus.exe) {
+        return CaptureDecision::Keep;
+    }
+    if profiles.find(focus.exe).is_none() {
+        return CaptureDecision::Pause;
+    }
+    let same_game =
+        kept.is_some_and(|(_, exe)| exe_name(exe).eq_ignore_ascii_case(exe_name(focus.exe)));
+    let same_window = kept.is_some_and(|(hwnd, _)| hwnd == focus.hwnd);
+    if capturing && same_window && same_game {
+        return CaptureDecision::Keep;
+    }
+    CaptureDecision::Start { hwnd: focus.hwnd, clear_buffer: kept.is_some() && !same_game }
 }
 
 /// A manual recording, from its start until its IO thread has finished the file.
@@ -318,8 +389,7 @@ fn bindings(settings: &Settings) -> Vec<Binding<HotkeyAction>> {
 /// `DvrBuffer` treats as off.
 fn dvr_config(settings: &Settings) -> (DvrConfig, WindowClamp) {
     let max_video_bps = u64::from(settings.video.max_bitrate_kbps) * 1_000;
-    let ram_ceiling = u64::from(settings.dvr.ram_ceiling_mib) << 20;
-    let clamp = clamp_window(settings.profiles.default.buffer(), max_video_bps, ram_ceiling);
+    let clamp = clamp_for(settings, &settings.profiles.default);
     let config = if settings.dvr.enabled {
         let audio_bps = u64::from(settings.audio.bitrate_kbps) * 1_000;
         DvrConfig::for_window(clamp.window, max_video_bps, audio_bps)
@@ -327,6 +397,13 @@ fn dvr_config(settings: &Settings) -> (DvrConfig, WindowClamp) {
         DvrConfig { video_bytes: 0, audio_bytes: 0 }
     };
     (config, clamp)
+}
+
+/// The DVR window a profile asks for, limited by the RAM ceiling at the video bitrate.
+fn clamp_for(settings: &Settings, profile: &GameProfile) -> WindowClamp {
+    let max_video_bps = u64::from(settings.video.max_bitrate_kbps) * 1_000;
+    let ram_ceiling = u64::from(settings.dvr.ram_ceiling_mib) << 20;
+    clamp_window(profile.buffer(), max_video_bps, ram_ceiling)
 }
 
 /// The container track for an audio source that has started. `codec_private` stays
@@ -340,11 +417,17 @@ fn audio_track(track: TrackId, label: &str, config: &AudioStart) -> TrackInfo {
     }
 }
 
-/// What the video source is asked to do, from the user's settings.
-fn video_start(settings: &Settings) -> VideoStart {
+/// What Screen mode records: the chosen monitor, or the primary one.
+fn screen_target(settings: &Settings) -> CaptureTarget {
+    settings.video.monitor.map_or(CaptureTarget::PrimaryMonitor, CaptureTarget::Monitor)
+}
+
+/// What the video source is asked to do: `target` comes from the capture mode (see
+/// `Actor::capture_target`), the rest from the user's settings.
+fn video_start(settings: &Settings, target: CaptureTarget) -> VideoStart {
     let v = &settings.video;
     VideoStart {
-        target: v.monitor.map_or(CaptureTarget::PrimaryMonitor, CaptureTarget::Monitor),
+        target,
         // "Auto" asks for the best codec; the adapter walks down the ladder.
         codec: v.codec.unwrap_or(Codec::LADDER[0]),
         fps: v.fps,
@@ -440,7 +523,14 @@ impl Actor {
     /// Works out the DVR window the settings ask for after the RAM ceiling, and warns if
     /// the ceiling cut it. The buffer itself keeps the size it was allocated with.
     fn update_window(&mut self) {
-        let (_, clamp) = dvr_config(&self.settings);
+        // In Game mode the buffer belongs to the game last captured, so its profile sets the window.
+        let profile = match (self.settings.video.capture_mode, &self.game_capture) {
+            (CaptureMode::Game, Some(game)) => {
+                self.settings.profiles.find(&game.exe).unwrap_or(&self.settings.profiles.default)
+            }
+            _ => &self.settings.profiles.default,
+        };
+        let clamp = clamp_for(&self.settings, profile);
         self.status.buffer_window = clamp.window;
         if clamp.clamped {
             self.emit(EngineEvent::Warning(format!(
@@ -551,8 +641,10 @@ impl Actor {
     }
 
     fn start_sources(&mut self) {
-        self.start_video();
-        self.start_audio();
+        // Game mode starts nothing here: capture begins when a profiled game takes focus (D31).
+        if let Some(target) = self.capture_target() {
+            self.start_capture(target);
+        }
 
         let inbox = self.inbox.clone();
         let os_events: Emit<OsEvent> = Arc::new(move |event| {
@@ -612,6 +704,7 @@ impl Actor {
             }
         }
         self.audio_tracks = tracks;
+        self.audio_running = true;
         // `run` publishes the first status once the sources have started.
         self.status.mic = self.mic_state();
         for error in errors {
@@ -619,15 +712,36 @@ impl Actor {
         }
     }
 
-    fn start_video(&mut self) {
+    /// What the video source should record now, or `None` when nothing should be: in Game mode
+    /// that is only the game window while it is captured.
+    fn capture_target(&self) -> Option<CaptureTarget> {
+        match self.settings.video.capture_mode {
+            CaptureMode::Screen => Some(screen_target(&self.settings)),
+            CaptureMode::Game if self.status.capturing => {
+                self.game_capture.as_ref().map(|game| CaptureTarget::Window(game.hwnd))
+            }
+            CaptureMode::Game => None,
+        }
+    }
+
+    /// Starts the video source on `target`, and the audio sources unless they already run.
+    fn start_capture(&mut self, target: CaptureTarget) {
+        self.start_video(target);
+        if !self.audio_running {
+            self.start_audio();
+        }
+    }
+
+    fn start_video(&mut self, target: CaptureTarget) {
         let health = self.health_emitter();
-        let config = video_start(&self.settings);
+        let config = video_start(&self.settings, target);
         let sink: SharedSink = self.recorder.clone();
         match self.ports.video.as_mut().map(|video| video.start(&config, sink, health)) {
             Some(Ok(codec)) => {
-                tracing::info!(codec = codec.name(), "capture started");
+                tracing::info!(codec = codec.name(), ?target, "capture started");
                 self.status.capturing = true;
                 self.status.codec = Some(codec);
+                self.video_track = self.ports.video.as_ref().and_then(|video| video.format());
             }
             Some(Err(e)) => self.emit(EngineEvent::Error(format!("Capture couldn't start: {e}"))),
             None => self.emit(EngineEvent::Warning(
@@ -637,10 +751,77 @@ impl Actor {
     }
 
     fn stop_sources(&mut self) {
-        let Ports { video, game_audio, mic, app_audio, master_audio, input, .. } = &mut self.ports;
-        if let Some(input) = input {
+        if let Some(input) = self.ports.input.as_mut() {
             input.stop();
         }
+        self.stop_capture();
+    }
+
+    /// Restarts capture after a video setting or the capture mode changed. The DVR buffer
+    /// restarts from empty, since GOPs from the old encoder can't share a clip with the new one.
+    fn restart_capture(&mut self) {
+        tracing::info!("video settings changed; restarting capture");
+        let target = self.capture_target();
+        let was_capturing = self.status.capturing;
+        if let Some(video) = self.ports.video.as_mut() {
+            video.stop();
+        }
+        if self.recording.as_ref().is_some_and(|r| r.id.is_some()) {
+            self.stop_recording();
+            self.emit(EngineEvent::Warning(
+                "Video settings changed, so the recording was stopped.".into(),
+            ));
+        }
+        // `clear` keeps the rings' memory, so the pins taken at startup still hold.
+        self.recorder.clear();
+        self.status.capturing = false;
+        match target {
+            // Audio keeps running when only the video restarts.
+            Some(target) if was_capturing => self.start_video(target),
+            Some(target) => self.start_capture(target),
+            None => self.stop_capture(),
+        }
+    }
+
+    /// Starts, pauses or keeps capture for the window that took focus (D31).
+    fn on_capture_focus(&mut self, focus: Focus<'_>) {
+        let kept = self.game_capture.as_ref().map(|game| (game.hwnd, game.exe.as_str()));
+        let decision = capture_decision(
+            self.settings.video.capture_mode,
+            &self.settings.profiles,
+            kept,
+            self.status.capturing,
+            std::process::id(),
+            focus,
+        );
+        match decision {
+            CaptureDecision::Keep => {}
+            CaptureDecision::Pause => {
+                if self.status.capturing {
+                    tracing::info!("focus left the game; capture paused");
+                    self.stop_capture();
+                }
+            }
+            CaptureDecision::Start { hwnd, clear_buffer } => {
+                if self.status.capturing {
+                    self.stop_capture();
+                }
+                if clear_buffer {
+                    self.recorder.clear();
+                }
+                let exe = exe_name(focus.exe).to_owned();
+                tracing::info!(exe, hwnd, clear_buffer, "capturing the game window");
+                self.game_capture = Some(GameCapture { hwnd, exe });
+                self.update_window();
+                self.start_capture(CaptureTarget::Window(hwnd));
+            }
+        }
+    }
+
+    /// Stops the video and audio sources and keeps the DVR buffer. The input thread keeps running,
+    /// so the hotkeys work and the next game focus can start capture again (D31).
+    fn stop_capture(&mut self) {
+        let Ports { video, game_audio, mic, app_audio, master_audio, .. } = &mut self.ports;
         // Master last: it still mixes what the sources wrote before they stopped.
         let sources = [game_audio, mic]
             .into_iter()
@@ -655,6 +836,7 @@ impl Actor {
         }
         tracing::info!(stats = ?self.recorder.stats(), "recorder totals");
         self.status.capturing = false;
+        self.audio_running = false;
         self.mic_running = false;
         self.status.mic = self.mic_state();
     }
@@ -684,21 +866,12 @@ impl Actor {
                 // The gate was just set for the new mode, and the matcher was rebuilt above, so
                 // it has forgotten any push-to-talk key that was down.
                 self.ptt_held = false;
-                if video_changed && let Some(video) = self.ports.video.as_mut() {
-                    tracing::info!("video settings changed; restarting capture");
-                    video.stop();
-                    // A new codec, size or frame rate can't continue the same file or share
-                    // DVR clips with the old encoder's GOPs.
-                    if self.recording.as_ref().is_some_and(|r| r.id.is_some()) {
-                        self.stop_recording();
-                        self.emit(EngineEvent::Warning(
-                            "Video settings changed, so the recording was stopped.".into(),
-                        ));
-                    }
-                    // `clear` keeps the rings' memory, so the pins taken at startup still hold.
-                    self.recorder.clear();
-                    self.status.capturing = false;
-                    self.start_video();
+                // In Game mode with nothing captured, the next game focus starts capture with the
+                // new settings, so there is nothing to restart now.
+                let restart = self.settings.video.capture_mode == CaptureMode::Screen
+                    || self.status.capturing;
+                if video_changed && self.ports.video.is_some() && restart {
+                    self.restart_capture();
                 }
                 if let Some(dir) = &self.settings.recording.output_dir
                     && *dir != self.output_dir
@@ -861,7 +1034,9 @@ impl Actor {
             self.emit(EngineEvent::Warning("Still saving the previous clip.".into()));
             return;
         }
-        let Some(video) = self.ports.video.as_ref().and_then(|video| video.format()) else {
+        // The buffer outlives a pause (D31), so the track comes from the last encoder, not the
+        // running one.
+        let Some(video) = self.video_track.clone() else {
             self.emit(EngineEvent::Warning("Nothing to save yet: capture hasn't started.".into()));
             return;
         };
@@ -938,21 +1113,16 @@ impl Actor {
                 };
                 self.on_command(command);
             }
-            // Phase 2 policy: game audio follows every focus change. Phase 4 narrows
-            // it to profiled games, resolves the profile, resizes the DVR buffer and
-            // maybe starts a session.
-            OsEvent::Foreground { pid, exe } => {
+            OsEvent::Foreground { pid, hwnd, exe } => {
                 tracing::debug!(pid, exe, "foreground changed");
-                // The taskbar, Start menu and desktop belong to explorer.exe, which
-                // makes no sound: clicking them mid-game must not retarget the game's
-                // audio track away from the game.
-                let is_shell = exe
-                    .rsplit(['\\', '/'])
-                    .next()
-                    .is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe"));
-                if !is_shell && let Some(game) = self.ports.game_audio.as_mut() {
+                // The shell makes no sound: clicking the taskbar mid-game must not retarget
+                // the game's audio track away from the game.
+                if !is_shell(&exe)
+                    && let Some(game) = self.ports.game_audio.as_mut()
+                {
                     game.set_target_process(Some(pid));
                 }
+                self.on_capture_focus(Focus { pid, hwnd, exe: &exe });
                 self.status.game = Some(exe);
                 self.publish_status();
             }
@@ -1007,20 +1177,21 @@ mod tests {
 
     use super::*;
 
-    /// A video source that never touches a GPU and can be told to fail.
+    /// A video source that never touches a GPU and can be told to fail. It records the target of
+    /// every start.
     struct FakeVideo {
         fail: bool,
-        starts: Arc<AtomicUsize>,
+        targets: Arc<Mutex<Vec<CaptureTarget>>>,
     }
 
     impl VideoSource for FakeVideo {
         fn start(
             &mut self,
-            _: &VideoStart,
+            config: &VideoStart,
             _: SharedSink,
             _: Emit<HealthEvent>,
         ) -> Result<Codec, SourceError> {
-            self.starts.fetch_add(1, Ordering::Relaxed);
+            self.targets.lock().unwrap().push(config.target);
             if self.fail {
                 Err(SourceError::Unsupported("no GPU in this test".into()))
             } else {
@@ -1028,7 +1199,12 @@ mod tests {
             }
         }
         fn format(&self) -> Option<TrackInfo> {
-            None
+            (!self.fail).then(|| TrackInfo {
+                track: TrackId::Video,
+                label: "Video".into(),
+                kind: TrackKind::Video { codec: Codec::Hevc, width: 1920, height: 1080, fps: 60 },
+                codec_private: Vec::new(),
+            })
         }
         fn stop(&mut self) {}
         fn request_keyframe(&mut self) {}
@@ -1039,37 +1215,49 @@ mod tests {
 
     fn with_video(fail: bool) -> Ports {
         Ports {
-            video: Some(Box::new(FakeVideo { fail, starts: Arc::default() })),
+            video: Some(Box::new(FakeVideo { fail, targets: Arc::default() })),
             ..Ports::default()
         }
     }
 
+    /// The default settings, in Screen mode, for tests about the whole screen.
+    fn screen_settings() -> Settings {
+        let mut settings = Settings::default();
+        settings.video.capture_mode = CaptureMode::Screen;
+        settings
+    }
+
     #[test]
     fn changed_video_settings_restart_capture_once() {
-        let starts = Arc::new(AtomicUsize::new(0));
-        let video = FakeVideo { fail: false, starts: Arc::clone(&starts) };
-        let (engine, _) = spawn(Ports { video: Some(Box::new(video)), ..Ports::default() });
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let video = FakeVideo { fail: false, targets: Arc::clone(&targets) };
+        let (engine, _) =
+            spawn_in(screen_settings(), Ports { video: Some(Box::new(video)), ..Ports::default() });
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.capturing));
 
-        let mut settings = Settings::default();
+        let mut settings = screen_settings();
         settings.profiles.default.buffer_secs = 90; // not a video setting
         engine.send(Command::ApplySettings(Box::new(settings.clone()))).unwrap();
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
-        assert_eq!(starts.load(Ordering::Relaxed), 1, "unchanged video settings keep capturing");
+        assert_eq!(targets.lock().unwrap().len(), 1, "unchanged video settings keep capturing");
 
         settings.video.fps = 30;
         engine.send(Command::ApplySettings(Box::new(settings))).unwrap();
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.capturing));
-        assert_eq!(starts.load(Ordering::Relaxed), 2);
+        assert_eq!(targets.lock().unwrap().len(), 2);
     }
 
     const TIMEOUT: Duration = Duration::from_secs(5);
 
     fn spawn(ports: Ports) -> (EngineHandle, Arc<AtomicUsize>) {
+        spawn_in(Settings::default(), ports)
+    }
+
+    fn spawn_in(settings: Settings, ports: Ports) -> (EngineHandle, Arc<AtomicUsize>) {
         let wakes = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&wakes);
         let config = EngineConfig {
-            settings: Settings::default(),
+            settings,
             default_output_dir: std::env::temp_dir().join("zeroclip-test"),
         };
         let engine = Engine::spawn(
@@ -1117,7 +1305,7 @@ mod tests {
 
     #[test]
     fn reports_the_codec_once_capture_starts() {
-        let (engine, _) = spawn(with_video(false));
+        let (engine, _) = spawn_in(screen_settings(), with_video(false));
         wait_for(
             &engine,
             |e| matches!(e, EngineEvent::Status(s) if s.capturing && s.codec == Some(Codec::Hevc)),
@@ -1126,7 +1314,7 @@ mod tests {
 
     #[test]
     fn capture_failure_is_reported_not_fatal() {
-        let (engine, _) = spawn(with_video(true));
+        let (engine, _) = spawn_in(screen_settings(), with_video(true));
         wait_for(&engine, |e| matches!(e, EngineEvent::Error(m) if m.starts_with("Capture")));
         let event = wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
         let EngineEvent::Status(status) = event else { unreachable!() };
@@ -1135,20 +1323,154 @@ mod tests {
 
     #[test]
     fn video_start_follows_settings() {
-        let start = video_start(&Settings::default());
+        let start = video_start(&Settings::default(), CaptureTarget::PrimaryMonitor);
         assert_eq!(start.codec, Codec::Av1, "Auto asks for the best codec");
         assert_eq!(start.min_bitrate_bps, 5_000_000);
         assert_eq!(start.max_bitrate_bps, 20_000_000);
         assert_eq!(start.keyframe_interval, zc_core::Hns::from_secs(1));
         assert!(!start.capture_cursor);
-        assert!(matches!(start.target, CaptureTarget::PrimaryMonitor));
+        assert_eq!(start.target, CaptureTarget::PrimaryMonitor);
     }
 
     #[test]
-    fn video_start_targets_the_chosen_monitor() {
+    fn screen_mode_targets_the_chosen_monitor() {
         let mut settings = Settings::default();
         settings.video.monitor = Some(1);
-        assert!(matches!(video_start(&settings).target, CaptureTarget::Monitor(1)));
+        assert_eq!(screen_target(&settings), CaptureTarget::Monitor(1));
+        assert_eq!(
+            video_start(&settings, screen_target(&settings)).target,
+            CaptureTarget::Monitor(1)
+        );
+    }
+
+    fn focus(pid: u32, hwnd: isize, exe: &str) -> Focus<'_> {
+        Focus { pid, hwnd, exe }
+    }
+
+    const CS2: &str = r"C:\Games\cs2.exe";
+    const DISCORD: &str = r"C:\Apps\Discord.exe";
+
+    #[test]
+    fn screen_mode_never_changes_capture() {
+        let decision = capture_decision(
+            CaptureMode::Screen,
+            &ProfileSet::default(),
+            None,
+            true,
+            1,
+            focus(9, 5, DISCORD),
+        );
+        assert_eq!(decision, CaptureDecision::Keep);
+    }
+
+    #[test]
+    fn game_mode_starts_on_a_profiled_game() {
+        let decision = capture_decision(
+            CaptureMode::Game,
+            &ProfileSet::default(),
+            None,
+            false,
+            1,
+            focus(42, 100, CS2),
+        );
+        assert_eq!(decision, CaptureDecision::Start { hwnd: 100, clear_buffer: false });
+    }
+
+    #[test]
+    fn game_mode_pauses_on_any_other_app() {
+        let decision = capture_decision(
+            CaptureMode::Game,
+            &ProfileSet::default(),
+            Some((100, "cs2.exe")),
+            true,
+            1,
+            focus(8, 5, DISCORD),
+        );
+        assert_eq!(decision, CaptureDecision::Pause);
+    }
+
+    #[test]
+    fn same_game_after_a_pause_keeps_the_buffer() {
+        let decision = capture_decision(
+            CaptureMode::Game,
+            &ProfileSet::default(),
+            Some((100, "cs2.exe")),
+            false,
+            1,
+            focus(42, 100, CS2),
+        );
+        assert_eq!(decision, CaptureDecision::Start { hwnd: 100, clear_buffer: false });
+    }
+
+    #[test]
+    fn a_different_game_clears_the_buffer() {
+        let decision = capture_decision(
+            CaptureMode::Game,
+            &ProfileSet::default(),
+            Some((100, "cs2.exe")),
+            false,
+            1,
+            focus(77, 300, r"D:\Games\RainbowSix.exe"),
+        );
+        assert_eq!(decision, CaptureDecision::Start { hwnd: 300, clear_buffer: true });
+    }
+
+    #[test]
+    fn another_window_of_the_same_game_moves_capture_and_keeps_the_buffer() {
+        let decision = capture_decision(
+            CaptureMode::Game,
+            &ProfileSet::default(),
+            Some((100, "cs2.exe")),
+            true,
+            1,
+            focus(42, 200, CS2),
+        );
+        assert_eq!(decision, CaptureDecision::Start { hwnd: 200, clear_buffer: false });
+    }
+
+    #[test]
+    fn the_game_being_captured_is_left_alone() {
+        let decision = capture_decision(
+            CaptureMode::Game,
+            &ProfileSet::default(),
+            Some((100, "cs2.exe")),
+            true,
+            1,
+            focus(42, 100, CS2),
+        );
+        assert_eq!(decision, CaptureDecision::Keep);
+    }
+
+    #[test]
+    fn zeroclip_and_the_shell_never_pause_capture() {
+        let (profiles, kept) = (ProfileSet::default(), Some((100, "cs2.exe")));
+        let own =
+            capture_decision(CaptureMode::Game, &profiles, kept, true, 1, focus(1, 5, DISCORD));
+        assert_eq!(own, CaptureDecision::Keep, "our own window is ignored");
+        let shell = capture_decision(
+            CaptureMode::Game,
+            &profiles,
+            kept,
+            true,
+            1,
+            focus(3, 6, r"C:\Windows\explorer.exe"),
+        );
+        assert_eq!(shell, CaptureDecision::Keep, "the taskbar is ignored");
+    }
+
+    #[test]
+    fn a_game_without_a_profile_is_not_captured() {
+        let mut settings = Settings::default();
+        settings.profiles.games.clear();
+        let decision = capture_decision(
+            CaptureMode::Game,
+            &settings.profiles,
+            None,
+            false,
+            1,
+            focus(42, 100, CS2),
+        );
+        assert_eq!(decision, CaptureDecision::Pause, "without a profile, the game is not captured");
     }
 
     #[test]
@@ -1159,7 +1481,7 @@ mod tests {
 
     #[test]
     fn screenshot_is_saved_in_the_output_folder() {
-        let (engine, _) = spawn(with_video(false));
+        let (engine, _) = spawn_in(screen_settings(), with_video(false));
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.capturing));
         engine.send(Command::Screenshot).unwrap();
         let event = wait_for(&engine, |e| matches!(e, EngineEvent::ScreenshotSaved { .. }));
@@ -1279,7 +1601,7 @@ mod tests {
     #[test]
     fn mic_indicator_follows_the_push_to_talk_key() {
         use zc_core::hotkey::{Chord, Key};
-        let mut settings = Settings::default();
+        let mut settings = screen_settings();
         settings.audio.mic = MicMode::PushToTalk;
         settings.hotkeys.push_to_talk = Some(Chord::new([Key::MOUSE5]).unwrap());
         let input = FakeInput::default();
@@ -1320,7 +1642,7 @@ mod tests {
 
     #[test]
     fn mic_indicator_stays_live_while_the_mic_is_always_on() {
-        let mut settings = Settings::default();
+        let mut settings = screen_settings();
         settings.audio.mic = MicMode::AlwaysOn;
         let ports = Ports { mic: Some(Box::new(FakeMic::default())), ..Ports::default() };
         let engine = Engine::spawn(
@@ -1389,12 +1711,13 @@ mod tests {
             game_audio: Some(Box::new(game.clone())),
             ..Ports::default()
         };
-        let (engine, _) = spawn(ports);
+        // Screen mode, so the audio starts with the engine. Game mode would wait for a profiled game.
+        let (engine, _) = spawn_in(screen_settings(), ports);
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
         let emit = input.0.lock().unwrap().clone().expect("input started");
-        emit(OsEvent::Foreground { pid: 42, exe: r"C:\Games\game.exe".into() });
+        emit(OsEvent::Foreground { pid: 42, hwnd: 100, exe: r"C:\Games\game.exe".into() });
         // Clicking the taskbar focuses explorer.exe, which must not take the audio.
-        emit(OsEvent::Foreground { pid: 7, exe: r"C:\Windows\Explorer.EXE".into() });
+        emit(OsEvent::Foreground { pid: 7, hwnd: 200, exe: r"C:\Windows\Explorer.EXE".into() });
         wait_for(
             &engine,
             |e| matches!(e, EngineEvent::Status(s) if s.game.as_deref() == Some(r"C:\Windows\Explorer.EXE")),
@@ -1402,6 +1725,59 @@ mod tests {
         let state = game.0.lock().unwrap();
         assert_eq!(state.0, 1, "started once");
         assert_eq!(state.1, [Some(42)]);
+    }
+
+    /// Waits until the status names `exe` as the focused app, with capture `capturing`. That status
+    /// is published after the focus change is handled.
+    fn wait_for_focus(engine: &EngineHandle, exe: &str, capturing: bool) {
+        wait_for(engine, |e| {
+            matches!(e, EngineEvent::Status(s)
+                if s.game.as_deref() == Some(exe) && s.capturing == capturing)
+        });
+    }
+
+    #[test]
+    fn game_mode_captures_a_profiled_game_window_only() {
+        let (targets, input) = (Arc::new(Mutex::new(Vec::new())), FakeInput::default());
+        let video = FakeVideo { fail: false, targets: Arc::clone(&targets) };
+        let ports = Ports {
+            input: Some(Box::new(input.clone())),
+            video: Some(Box::new(video)),
+            ..Ports::default()
+        };
+        let (engine, _) = spawn(ports);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        assert!(targets.lock().unwrap().is_empty(), "nothing is captured before a game");
+
+        let emit = input.0.lock().unwrap().clone().expect("input started");
+        emit(OsEvent::Foreground { pid: 7, hwnd: 900, exe: DISCORD.into() });
+        wait_for_focus(&engine, DISCORD, false);
+        emit(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into() });
+        wait_for_focus(&engine, CS2, true);
+        assert_eq!(*targets.lock().unwrap(), [CaptureTarget::Window(100)]);
+
+        emit(OsEvent::Foreground { pid: 7, hwnd: 900, exe: DISCORD.into() });
+        wait_for_focus(&engine, DISCORD, false);
+        // Alt+F10 still saves while capture is paused: the buffer is kept, so the save is only
+        // "nothing buffered yet", not "capture hasn't started".
+        engine.send(Command::SaveClip).unwrap();
+        wait_for(&engine, |e| matches!(e, EngineEvent::Warning(m) if m == "Nothing to save yet."));
+
+        emit(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into() });
+        wait_for_focus(&engine, CS2, true);
+        assert_eq!(targets.lock().unwrap().len(), 2, "the same game resumes on its window");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn screen_mode_records_the_primary_monitor_from_the_start() {
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let video = FakeVideo { fail: false, targets: Arc::clone(&targets) };
+        let ports = Ports { video: Some(Box::new(video)), ..Ports::default() };
+        let (engine, _) = spawn_in(screen_settings(), ports);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.capturing));
+        assert_eq!(*targets.lock().unwrap(), [CaptureTarget::PrimaryMonitor]);
+        engine.shutdown();
     }
 
     /// An audio source that pushes a 20 ms synthetic packet of its track about every 20 ms, from
@@ -1451,7 +1827,7 @@ mod tests {
     #[test]
     fn master_leads_the_audio_tracks_of_a_saved_clip() {
         let dir = std::env::temp_dir().join(format!("zeroclip-master-{}", std::process::id()));
-        let mut settings = Settings::default();
+        let mut settings = screen_settings();
         settings.recording.output_dir = Some(dir.clone());
         let config = EngineConfig { settings, default_output_dir: dir.clone() };
         let ports = Ports {
@@ -1486,7 +1862,7 @@ mod tests {
     #[test]
     fn an_app_track_is_started_and_named_by_its_label_in_a_saved_clip() {
         let dir = std::env::temp_dir().join(format!("zeroclip-app-{}", std::process::id()));
-        let mut settings = Settings::default();
+        let mut settings = screen_settings();
         settings.recording.output_dir = Some(dir.clone());
         let config = EngineConfig { settings, default_output_dir: dir.clone() };
         let app = FeedAudio::new(zc_core::TrackId::audio(3).expect("slot 3 is an audio track"));
@@ -1551,7 +1927,8 @@ mod tests {
     fn status_reports_the_buffered_footage_each_second() {
         // Frames arrive at 60 fps in real time, so a tick a second in sees about a second.
         let video = SyntheticVideoSource::new().realtime(true);
-        let (engine, _) = spawn(Ports { video: Some(Box::new(video)), ..Ports::default() });
+        let (engine, _) =
+            spawn_in(screen_settings(), Ports { video: Some(Box::new(video)), ..Ports::default() });
         wait_for(
             &engine,
             |e| matches!(e, EngineEvent::Status(s) if s.buffered >= zc_core::Hns::from_secs(1)),
@@ -1570,7 +1947,7 @@ mod tests {
             input: Some(Box::new(input.clone())),
             ..Ports::default()
         };
-        let (engine, _) = spawn(ports);
+        let (engine, _) = spawn_in(screen_settings(), ports);
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
         let emit = input.0.lock().unwrap().clone().expect("input started");
         let stop = Arc::new(AtomicBool::new(false));
@@ -1609,7 +1986,7 @@ mod tests {
         // The output folder is a plain file, so no recording file can be created in it.
         let blocker = std::env::temp_dir().join(format!("zeroclip-blocker-{}", std::process::id()));
         std::fs::write(&blocker, b"").unwrap();
-        let mut settings = Settings::default();
+        let mut settings = screen_settings();
         settings.recording.output_dir = Some(blocker.clone());
         let config = EngineConfig { settings, default_output_dir: blocker.clone() };
         let video = SyntheticVideoSource::new().realtime(true);
@@ -1630,7 +2007,7 @@ mod tests {
     fn changing_video_settings_ends_the_recording_and_empties_the_dvr() {
         let dir = std::env::temp_dir().join(format!("zeroclip-restart-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut settings = Settings::default();
+        let mut settings = screen_settings();
         settings.recording.output_dir = Some(dir.clone());
         let config = EngineConfig { settings: settings.clone(), default_output_dir: dir.clone() };
         let video = SyntheticVideoSource::new().realtime(true);
@@ -1731,7 +2108,7 @@ mod tests {
             lock_memory: Some(record_pin),
             ..Ports::default()
         };
-        let (engine, _) = spawn(ports);
+        let (engine, _) = spawn_in(screen_settings(), ports);
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.capturing));
         assert!(pinned_first.load(Ordering::SeqCst), "the pin ran after a source had started");
         engine.shutdown();
@@ -1745,7 +2122,7 @@ mod tests {
             lock_memory: Some(refuse_lock),
             ..Ports::default()
         };
-        let (engine, _) = spawn(ports);
+        let (engine, _) = spawn_in(screen_settings(), ports);
         let mut warnings = 0;
         loop {
             match engine.wait_event(TIMEOUT).expect("status") {
