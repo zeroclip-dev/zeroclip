@@ -4,7 +4,9 @@
 use eframe::egui::{self, DragValue, TextEdit};
 use zc_core::profile::GameProfile;
 
+use super::components::open_apps;
 use super::dvr_megabytes;
+use super::settings::section;
 use crate::app::ZeroClipApp;
 
 pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
@@ -20,6 +22,8 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
     let max_kbps = app.draft.settings.video.max_bitrate_kbps;
     let ceiling_mb = u64::from(app.draft.settings.dvr.ram_ceiling_mib) * 1_048_576 / 1_000_000;
     let profiles = &mut app.draft.settings.profiles;
+    let tracks = &mut app.draft.settings.audio.app_tracks;
+    let open_apps_list = &mut app.open_apps;
     let mut remove = None;
 
     egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
@@ -59,6 +63,8 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
                 session_recording: false,
             });
         }
+        ui.add_space(8.0);
+        section(ui, "Open apps", |ui| open_apps::show(ui, open_apps_list, profiles, tracks));
     });
 }
 
