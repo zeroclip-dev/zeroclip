@@ -68,7 +68,7 @@ pub enum ContainerFormat {
     #[default]
     #[serde(rename = "fmp4")]
     FragmentedMp4,
-    /// Matroska.
+    /// Matroska. Not written (D18); the variant stays so older settings files still parse.
     #[serde(rename = "mkv")]
     Matroska,
 }
@@ -84,30 +84,107 @@ impl ContainerFormat {
     }
 }
 
-/// The three tracks every recording carries (DESIGN §6).
+/// Codec-specific description of a track, taken from the encoder's output media type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrackKind {
+    /// A video track.
+    Video {
+        /// Codec.
+        codec: Codec,
+        /// Width, pixels.
+        width: u32,
+        /// Height, pixels.
+        height: u32,
+        /// Nominal frame rate.
+        fps: u32,
+    },
+    /// An AAC audio track.
+    Audio {
+        /// Sample rate, Hz.
+        sample_rate: u32,
+        /// Channel count.
+        channels: u16,
+    },
+}
+
+/// One track in a container.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackInfo {
+    /// Which track.
+    pub track: TrackId,
+    /// Human-readable name such as "Game" or "Microphone", set when the track starts.
+    pub label: String,
+    /// What it contains.
+    pub kind: TrackKind,
+    /// Decoder configuration, as the encoder reports it. It holds the Annex-B parameter
+    /// sets (H.264 SPS and PPS, HEVC VPS, SPS and PPS) or the AV1 sequence header OBU,
+    /// as Media Foundation gives them in `MF_MT_MPEG_SEQUENCE_HEADER`
+    /// (<https://learn.microsoft.com/windows/win32/medfound/mf-mt-mpeg-sequence-header-attribute>),
+    /// or an AAC `AudioSpecificConfig`.
+    ///
+    /// It may be empty. The fMP4 writer then takes the parameter sets from the first
+    /// keyframe, and builds the AAC config from the sample rate and channel count.
+    /// Never pass AAC `MF_MT_USER_DATA` raw: it starts with 12 bytes of HEAACWAVEINFO.
+    pub codec_private: Vec<u8>,
+}
+
+/// Most audio tracks a recording can carry. Video is always one more track (DESIGN §6).
+pub const MAX_AUDIO_TRACKS: u8 = 7;
+
+/// An audio track's slot, below [`MAX_AUDIO_TRACKS`]. The field is private, so the only
+/// ways to make one are [`TrackId::audio`] and the named constants on [`TrackId`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AudioTrack(u8);
+
+/// The tracks of a recording: one video track and up to [`MAX_AUDIO_TRACKS`] audio
+/// tracks (DESIGN §6). Labels such as "Game" live in [`TrackInfo`], not here,
+/// so this type stays `Copy` and allocation-free.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TrackId {
     /// Encoded video from the GPU pipeline.
     Video,
-    /// Track 1: game/system audio (process loopback).
-    GameAudio,
-    /// Track 2: microphone, gated by push-to-talk.
-    Mic,
+    /// An audio track; slot 0 is Master, then the game and mic tracks (D30).
+    Audio(AudioTrack),
 }
 
 impl TrackId {
-    /// Number of tracks.
-    pub const COUNT: usize = 3;
-    /// All tracks, in index order.
-    pub const ALL: [Self; Self::COUNT] = [Self::Video, Self::GameAudio, Self::Mic];
+    /// Audio track 1: the live mix of every enabled source, audio slot 0 (D30).
+    // CamelCase, like the variants these names replaced, so call sites read the same.
+    #[allow(non_upper_case_globals)]
+    pub const Master: Self = Self::Audio(AudioTrack(0));
+    /// Audio track 2: game/system audio (process loopback), audio slot 1.
+    #[allow(non_upper_case_globals)]
+    pub const GameAudio: Self = Self::Audio(AudioTrack(1));
+    /// Audio track 3: microphone, gated by push-to-talk, audio slot 2.
+    #[allow(non_upper_case_globals)]
+    pub const Mic: Self = Self::Audio(AudioTrack(2));
+
+    /// Number of tracks: video plus every audio slot.
+    pub const COUNT: usize = 1 + MAX_AUDIO_TRACKS as usize;
+    /// All tracks, in index order: video, then audio slots 0 and up.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Video,
+        Self::Audio(AudioTrack(0)),
+        Self::Audio(AudioTrack(1)),
+        Self::Audio(AudioTrack(2)),
+        Self::Audio(AudioTrack(3)),
+        Self::Audio(AudioTrack(4)),
+        Self::Audio(AudioTrack(5)),
+        Self::Audio(AudioTrack(6)),
+    ];
+
+    /// The audio track in slot `n`, or `None` if `n` is [`MAX_AUDIO_TRACKS`] or more.
+    #[must_use]
+    pub const fn audio(n: u8) -> Option<Self> {
+        if n < MAX_AUDIO_TRACKS { Some(Self::Audio(AudioTrack(n))) } else { None }
+    }
 
     /// Dense index, for per-track arrays.
     #[must_use]
     pub const fn index(self) -> usize {
         match self {
             Self::Video => 0,
-            Self::GameAudio => 1,
-            Self::Mic => 2,
+            Self::Audio(AudioTrack(n)) => 1 + n as usize,
         }
     }
 
@@ -190,6 +267,22 @@ mod tests {
         }
         assert!(!TrackId::Video.is_audio());
         assert!(TrackId::Mic.is_audio());
+    }
+
+    #[test]
+    fn track_indices_are_dense_for_all_audio_tracks() {
+        for (i, t) in TrackId::ALL.iter().enumerate() {
+            assert_eq!(t.index(), i);
+        }
+        for n in 0..MAX_AUDIO_TRACKS {
+            let track = TrackId::audio(n).expect("slot below the maximum");
+            assert!(track.is_audio());
+            assert_eq!(track.index(), 1 + usize::from(n));
+        }
+        assert_eq!(TrackId::audio(0), Some(TrackId::Master));
+        assert_eq!(TrackId::audio(1), Some(TrackId::GameAudio));
+        assert_eq!(TrackId::audio(2), Some(TrackId::Mic));
+        assert_eq!(TrackId::audio(MAX_AUDIO_TRACKS), None);
     }
 
     #[test]

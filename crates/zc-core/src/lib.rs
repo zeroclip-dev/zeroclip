@@ -8,8 +8,10 @@
 //! |---|---|---|
 //! | [`time`] | [`Hns`] (100 ns ticks), the [`FramePacer`](time::FramePacer) and the [`MasterClock`](time::MasterClock) | §3, §6 |
 //! | [`media`] | codecs and the capability ladder, tracks, encoded packets | §3 |
+//! | [`mix`] | the Master mix: one sample timeline with a ring per source, mixed 200 ms behind | §6 |
 //! | [`sink`] | how packets flow: [`PacketSink`](sink::PacketSink), [`Tee`](sink::Tee) | §5 |
 //! | [`dvr`] | the GOP-aware retrospective ring buffer | §4, §6 |
+//! | [`ring`] | allocation-free packet FIFO in one byte ring, for the DVR buffer and the recording spool | §4, §5 |
 //! | [`watchdog`] | the encoder watchdog state machine | §8 |
 //! | [`profile`] | per-game profiles and RAM clamping | §7 |
 //! | [`hotkey`] | keys, chords and the chord matcher | §8 |
@@ -29,8 +31,10 @@ pub mod dsp;
 pub mod dvr;
 pub mod hotkey;
 pub mod media;
+pub mod mix;
 pub mod ports;
 pub mod profile;
+pub mod ring;
 pub mod settings;
 pub mod sink;
 pub mod testing;

@@ -15,14 +15,14 @@ state machine; editing never re-encodes; nothing is ever deleted unverified.
 
 | Crate | Owns | Depends on | OS |
 |---|---|---|---|
-| `zeroclip` (repo root) | egui UI, settings file, logging, **wiring** (composition root) | `zc-engine`, `zc-core`, `zc-video`; more adapters as phases land | Windows |
+| `zeroclip` (repo root) | egui UI, settings file, logging, **wiring** (composition root) | `zc-engine`, `zc-core`, `zc-mux`, `zc-video`, `zc-win` (drive probe, page-locking); more adapters as phases land | Windows |
 | `zc-engine` | the engine actor, recording modes, the `Recorder`, synthetic sources | `zc-core`, `zc-mux` | any |
 | `zc-core` | `Hns` time, packets, codecs, DVR buffer, watchdog FSM, profiles, hotkeys, DSP, settings, **ports** | — | any |
 | `zc-mux` | container writers (fMP4/MKV), chunked writes, HDD pacing | `zc-core` | any |
 | `zc-video` | D3D11 device, WGC capture, BGRA→NV12, MF hardware encoder, screenshots | `zc-core`, `zc-win` | Windows |
 | `zc-audio` | WASAPI process loopback, mic + push-to-talk, MF AAC encoder | `zc-core`, `zc-win` | Windows |
 | `zc-input` | Raw Input hotkeys, foreground-window tracking | `zc-core`, `zc-win` | Windows |
-| `zc-win` | COM/MF lifetimes, QPC clock, message-only window thread, drive detection | `zc-core` | Windows |
+| `zc-win` | COM/MF lifetimes, QPC clock, message-only window thread, drive detection, page-locking | `zc-core` | Windows |
 | `zc-store` | SQLite metadata: clips, keyframes, profiles, probe cache, waveforms, uploads | `zc-core` | any |
 | `zc-editor` | keyframe snapping, stitch compatibility, waveform peaks, ffmpeg CLI jobs | `zc-core` | any* |
 | `zc-destinations` | the `Destination` trait, Discord webhooks, YouTube (BYO credentials) | `zc-core` | any |
@@ -50,9 +50,10 @@ state machine; editing never re-encodes; nothing is ever deleted unverified.
 | `zc-engine` | engine actor | owns settings, profile, watchdog, modes; starts/stops sources | touch the hot path |
 | WGC frame pool | `zc-video` | pace to the target fps, convert to NV12, hand the ring slot to the encoder thread | allocate, block |
 | Encoder (`zc-video` thread) | `zc-video` | NeedInput → `ProcessInput`; HaveOutput → `ProcessOutput` → `PacketSink::push`; repeat the last frame while the screen is static | allocate, block on I/O |
-| `zc-game-audio`, `zc-mic` | `zc-audio` | WASAPI event loop → `SampleTimeline` → AAC → `PacketSink::push` (MMCSS "Pro Audio"); the mic applies the PTT gate and compressor; both reopen a lost device | allocate, block on I/O |
+| `zc-game-audio`, `zc-mic`, one per app track (up to 6 source tracks) | `zc-audio` | WASAPI event loop → `SampleTimeline` → AAC → `PacketSink::push` (MMCSS "Pro Audio"); the mic applies the PTT gate and compressor; both reopen a lost device; each also writes its PCM into the Master `MixBus` | allocate, block on I/O |
+| `zc-master-mix` (Master, D30, audio track 1) | `zc-audio` | every 20 ms: mix the `MixBus` up to 200 ms behind real time → AAC → `PacketSink::push` (MMCSS "Pro Audio") | allocate, block on I/O, hold the bus lock across an encode |
 | `zc-input` (message thread) | `zc-input` | Raw Input + WinEvent hook → `OsEvent`s; never logs keystrokes | do real work in callbacks |
-| IO | engine (Phase 3) | chunked, paced disk writes; clip dumps | hold the recorder lock |
+| IO | engine (Phase 3) | one thread per clip dump and per recording (chunked writes; dumps paced on HDD) | hold the recorder lock |
 | tokio pool | app (Phase 5–6) | uploads, waveform extraction, ffmpeg jobs | — |
 
 ## Data flow
@@ -69,9 +70,9 @@ flowchart LR
         clock["MasterClock<br/>raw → session PTS"] --> dvr["DvrBuffer<br/>GOP-indexed rings"]
         clock --> tee["Tee"]
     end
-    tee --> session["session / manual writer<br/>(fMP4 or MKV)"]
+    tee --> spool["recording spool<br/>(allocation-free)"]
     dvr -- "snapshot on hotkey" --> dump["clip writer"]
-    session --> io["IO thread<br/>8–16 MB chunks, HDD pacing"]
+    spool --> io["IO thread<br/>8–16 MB chunks, HDD pacing"]
     dump --> io
 ```
 
@@ -81,7 +82,7 @@ flowchart LR
   them into memory they pre-allocated. Owned `Packet`s exist only off the hot path
   (snapshots, tests).
 - **One encode, many sinks.** The `Tee` fans packets out to whichever writers are
-  active, so DVR and session recording run together (DESIGN §5).
+  active. A manual recording runs Tee → spool → IO thread, so DVR and recording run together (DESIGN §5).
 
 ## Time
 
@@ -131,11 +132,13 @@ stateDiagram-v2
 
 | Mode | Trigger | Path | Container |
 |---|---|---|---|
-| DVR clip | hotkey | snapshot of `DvrBuffer` → clip writer | fMP4/MKV, remuxed on export |
-| Manual | hotkey toggle | `Tee` → session writer | fMP4/MKV |
-| Session | game profile | `Tee` → session writer, for the life of the game | fMP4/MKV |
+| DVR clip | hotkey | snapshot of `DvrBuffer` → clip writer | fMP4 |
+| Manual | hotkey toggle | `Tee` → session writer | fMP4 |
+| Session | game profile | `Tee` → session writer, for the life of the game | fMP4 |
 | Screenshot | hotkey | one texture → staging → PNG | PNG |
-| Crash rescue | game died unexpectedly | `DvrBuffer` → `recovery.tmp` → prompt | fMP4/MKV |
+| Crash rescue | game died unexpectedly | `DvrBuffer` → `recovery.tmp` → prompt | fMP4 |
+| Recording file | while a recording runs | spool → IO thread → `<name>.mp4.partial`, synced per fragment | fMP4, renamed to `<name>.mp4` when finished |
+| Startup repair | app start, for each `*.partial` left behind | cut to the last complete fragment → `<name>.mp4`; never overwrites | fMP4 |
 
 ## Errors and logging
 
@@ -168,3 +171,4 @@ CI runs formatting, clippy (`-D warnings`), tests and docs on Windows for every 
 | A new upload target | `zc-destinations` (one `impl Destination`) |
 | A setting | `zc_core::settings` with a serde default, plus a field on the Settings tab |
 | A UI screen | `src/ui/` |
+| A UI widget that more than one screen uses | `src/ui/components/` (one module per widget) |

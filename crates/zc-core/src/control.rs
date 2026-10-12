@@ -11,7 +11,7 @@ use crate::time::Hns;
 use crate::watchdog::WatchdogState;
 
 /// Requests to the engine.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     /// Write the last N seconds of the DVR buffer (N from the active profile) to a clip file.
     SaveClip,
@@ -79,6 +79,18 @@ pub enum EngineEvent {
     },
 }
 
+/// Whether the microphone is capturing right now, for the status bar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MicState {
+    /// Not capturing: the mic is off, or it failed to start.
+    #[default]
+    Off,
+    /// Push-to-talk with the key up: the mic runs, but its gate writes silence.
+    Muted,
+    /// Capturing: always on, or push-to-talk with the key held.
+    Live,
+}
+
 /// What the engine is doing right now, for the status bar.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EngineStatus {
@@ -86,6 +98,8 @@ pub struct EngineStatus {
     pub capturing: bool,
     /// A manual or session recording is being written.
     pub recording: bool,
+    /// Whether the microphone is capturing right now.
+    pub mic: MicState,
     /// Codec in use, once the capability ladder has run.
     pub codec: Option<Codec>,
     /// Footage currently in the DVR buffer.

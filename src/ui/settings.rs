@@ -3,11 +3,11 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Button, ComboBox, DragValue, Grid, TextEdit};
+use eframe::egui::{self, Button, ComboBox, DragValue, Grid, Slider, TextEdit};
 use zc_audio::MicDevice;
 use zc_core::hotkey::Chord;
 use zc_core::media::{Codec, ContainerFormat};
-use zc_core::settings::{AAC_BITRATES_KBPS, MicMode, Settings};
+use zc_core::settings::{AAC_BITRATES_KBPS, MIX_GAIN_DB, MicMode, Settings};
 
 use super::{dvr_megabytes, human_duration};
 use crate::app::ZeroClipApp;
@@ -131,12 +131,13 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
 
                 ui.label("Container");
                 let container = &mut draft.settings.recording.container;
+                // Fragmented MP4 is the only container written (D18). A settings file that still
+                // says Matroska shows that choice here, and Settings::problems blocks saving it.
                 ComboBox::from_id_salt("container")
                     .selected_text(container_label(*container))
                     .show_ui(ui, |ui| {
-                        for option in [ContainerFormat::FragmentedMp4, ContainerFormat::Matroska] {
-                            ui.selectable_value(container, option, container_label(option));
-                        }
+                        let option = ContainerFormat::FragmentedMp4;
+                        ui.selectable_value(container, option, container_label(option));
                     });
                 ui.end_row();
             });
@@ -204,13 +205,13 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
         section(ui, "Audio", |ui| {
             let audio = &mut draft.settings.audio;
             let (mics, listed) = (&mut draft.mics, &mut draft.mics_listed);
-            ui.checkbox(&mut audio.game_audio, "Record the game's audio (track 1)");
+            ui.checkbox(&mut audio.game_audio, "Record the game's audio (track 2)");
             ui.weak(
                 "Only the game in focus is captured: Discord, music and notifications stay \
                  out of your clips. Needs Windows 11; older Windows records all system audio.",
             );
             ui.horizontal(|ui| {
-                ui.label("Microphone (track 2)");
+                ui.label("Microphone (track 3)");
                 ComboBox::from_id_salt("mic").selected_text(mic_label(audio.mic)).show_ui(ui, |ui| {
                     for option in [MicMode::Off, MicMode::AlwaysOn, MicMode::PushToTalk] {
                         ui.selectable_value(&mut audio.mic, option, mic_label(option));
@@ -256,7 +257,24 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
                         }
                     });
             });
-            ui.weak("Turning game audio or the microphone on or off, or changing the microphone, takes effect the next time ZeroClip starts.");
+            ui.add_space(4.0);
+            ui.strong("Master track (track 1)");
+            ui.weak("The live mix players and Discord play. Each level sets how loud that source is in it.");
+            ui.horizontal(|ui| {
+                ui.label("Game level");
+                ui.add_enabled(
+                    audio.game_audio,
+                    Slider::new(&mut audio.mix_gain_db.game, MIX_GAIN_DB).suffix(" dB"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Microphone level");
+                ui.add_enabled(
+                    audio.mic != MicMode::Off,
+                    Slider::new(&mut audio.mix_gain_db.mic, MIX_GAIN_DB).suffix(" dB"),
+                );
+            });
+            ui.weak("Turning game audio or the microphone on or off, changing the microphone, or changing a Master level takes effect the next time ZeroClip starts.");
         });
 
         section(ui, "Hotkeys", |ui| {

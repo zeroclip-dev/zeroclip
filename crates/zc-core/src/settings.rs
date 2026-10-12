@@ -3,6 +3,7 @@
 //! Every field has a serde default, so settings files written by older versions
 //! keep loading as options are added. The app stores this as TOML.
 
+use std::ops::RangeInclusive;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -13,7 +14,7 @@ use crate::profile::ProfileSet;
 use crate::time::Hns;
 
 /// Everything the user can configure.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Where files go and in what container.
@@ -60,8 +61,23 @@ impl Settings {
         if !AAC_BITRATES_KBPS.contains(&self.audio.bitrate_kbps) {
             problems.push("The audio bitrate must be 96, 128, 160 or 192 kbps.".to_owned());
         }
+        for (source, db) in [
+            ("game audio", self.audio.mix_gain_db.game),
+            ("microphone", self.audio.mix_gain_db.mic),
+        ] {
+            if !MIX_GAIN_DB.contains(&db) {
+                problems.push(format!(
+                    "The {source} level in the Master track must be between -60 and +12 dB (it is {db})."
+                ));
+            }
+        }
         if self.audio.mic == MicMode::PushToTalk && self.hotkeys.push_to_talk.is_none() {
             problems.push("Push-to-talk mode needs a push-to-talk hotkey.".to_owned());
+        }
+        if self.recording.container == ContainerFormat::Matroska {
+            problems.push(
+                "Matroska recordings aren't written. Choose Fragmented MP4 (.mp4).".to_owned(),
+            );
         }
 
         let hotkeys = &self.hotkeys;
@@ -90,7 +106,7 @@ impl Settings {
 pub struct RecordingSettings {
     /// Output folder. `None` means `<Videos>\ZeroClip`.
     pub output_dir: Option<PathBuf>,
-    /// Container for recordings. Both survive crashes; see docs/OPEN_QUESTIONS.md.
+    /// Container for recordings. Only fragmented MP4 is written (D18).
     pub container: ContainerFormat,
 }
 
@@ -165,13 +181,32 @@ pub enum MicMode {
 /// The AAC bitrates the Microsoft encoder supports, in kbit/s.
 pub const AAC_BITRATES_KBPS: [u32; 4] = [96, 128, 160, 192];
 
+/// Each source's level in the Master mix, in dB (D30). Zero is the level the source is recorded at.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MixGains {
+    /// Game audio's level in Master.
+    pub game: f32,
+    /// The microphone's level in Master.
+    pub mic: f32,
+}
+
+impl Default for MixGains {
+    fn default() -> Self {
+        Self { game: 0.0, mic: 0.0 }
+    }
+}
+
+/// The range a Master mix level may take, in dB.
+pub const MIX_GAIN_DB: RangeInclusive<f32> = -60.0..=12.0;
+
 /// Audio settings.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioSettings {
-    /// Record the focused game's audio (track 1).
+    /// Record the focused game's audio (track 2).
     pub game_audio: bool,
-    /// Microphone behaviour (track 2).
+    /// Microphone behaviour (track 3).
     pub mic: MicMode,
     /// Which microphone, as a Windows endpoint id. `None` follows the Windows
     /// default communications device.
@@ -180,6 +215,8 @@ pub struct AudioSettings {
     pub mic_compressor: bool,
     /// AAC bitrate per track, kbit/s.
     pub bitrate_kbps: u32,
+    /// Each source's level in the Master track (track 1). Read when the sources start.
+    pub mix_gain_db: MixGains,
 }
 
 impl Default for AudioSettings {
@@ -190,6 +227,7 @@ impl Default for AudioSettings {
             mic_device: None,
             mic_compressor: true,
             bitrate_kbps: 192,
+            mix_gain_db: MixGains::default(),
         }
     }
 }
@@ -289,6 +327,15 @@ mod tests {
     }
 
     #[test]
+    fn a_settings_file_that_chose_matroska_still_loads_but_is_flagged() {
+        let mut s: Settings = toml::from_str("[recording]\ncontainer = \"mkv\"\n").unwrap();
+        assert_eq!(s.recording.container, ContainerFormat::Matroska);
+        assert!(s.problems().iter().any(|p| p.contains("Matroska")));
+        s.recording.container = ContainerFormat::FragmentedMp4;
+        assert!(s.problems().is_empty());
+    }
+
+    #[test]
     fn settings_round_trip_through_toml() {
         let mut s = Settings::default();
         s.video.codec = Some(Codec::Hevc);
@@ -297,6 +344,19 @@ mod tests {
         let text = toml::to_string_pretty(&s).unwrap();
         let back: Settings = toml::from_str(&text).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn master_mix_levels_default_to_zero_and_must_stay_in_range() {
+        let mut s = Settings::default();
+        assert_eq!(s.audio.mix_gain_db, MixGains::default());
+        s.audio.mix_gain_db.mic = 13.0;
+        assert!(s.problems().iter().any(|p| p.contains("microphone level")));
+        s.audio.mix_gain_db.mic = -60.0;
+        assert!(s.problems().is_empty(), "-60 dB is the bottom of the range");
+        // A settings file from before the Master track has no levels: they read as zero.
+        let older: Settings = toml::from_str("[audio]\nbitrate_kbps = 128\n").unwrap();
+        assert_eq!(older.audio.mix_gain_db, MixGains::default());
     }
 
     #[test]

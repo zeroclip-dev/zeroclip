@@ -22,7 +22,9 @@
 //! modes get tested deterministically (DESIGN §12, "synthetic-load test harness").
 
 mod actor;
+mod output;
 pub mod recorder;
+pub mod spool;
 pub mod synthetic;
 
 pub use actor::{Engine, EngineConfig, EngineError, EngineHandle, Ports};
