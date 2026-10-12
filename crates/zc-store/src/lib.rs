@@ -13,7 +13,9 @@
 //! the next numbered file instead.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use rusqlite::Connection;
 use zc_core::Hns;
 use zc_core::media::Codec;
 
@@ -60,34 +62,78 @@ pub struct ClipRecord {
 }
 
 /// Store failures.
-#[derive(Debug)]
-pub struct StoreError(pub String);
-
-impl std::fmt::Display for StoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "metadata store: {}", self.0)
-    }
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    /// SQLite refused an operation (I/O, a corrupt file, a bad statement).
+    #[error("metadata store: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    /// The file was written by a newer ZeroClip. This build does not know its schema.
+    #[error(
+        "the metadata database is from a newer ZeroClip (schema v{found}; this build knows v{known})"
+    )]
+    TooNew {
+        /// Version stored in the file.
+        found: u32,
+        /// Newest version this build knows.
+        known: u32,
+    },
 }
 
-impl std::error::Error for StoreError {}
-
 /// The metadata database.
+///
+/// `rusqlite::Connection` is `Send` but not `Sync`. Share one store between threads as
+/// `Arc<Mutex<Store>>`. The store is never on the capture or audio hot path, so a lock is fine.
 #[derive(Debug)]
 pub struct Store {
-    _private: (),
+    conn: Connection,
 }
 
 impl Store {
     /// Opens (or creates) the database at `path` and applies pending migrations.
     ///
+    /// The connection uses WAL mode (readers do not block the writer), waits up to 5 s on a
+    /// busy database, and enforces foreign keys (off by default in SQLite).
+    ///
     /// # Errors
     /// SQLite errors, or a database from a newer ZeroClip.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let _ = path;
-        todo!(
-            "Phase 4: add rusqlite (bundled), open with WAL mode, run MIGRATIONS in a transaction"
-        )
+        let mut conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        // journal_mode returns a row, so plain pragma_update fails with "Execute returned results".
+        conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0))?;
+        // Off by default per connection. The schema's ON DELETE CASCADE needs it.
+        conn.pragma_update(None, "foreign_keys", true)?;
+        migrate(&mut conn)?;
+        Ok(Self { conn })
     }
+
+    /// The schema version stored in the file (`PRAGMA user_version`).
+    ///
+    /// # Errors
+    /// SQLite errors.
+    pub fn schema_version(&self) -> Result<u32, StoreError> {
+        Ok(self.conn.pragma_query_value(None, "user_version", |r| r.get(0))?)
+    }
+}
+
+/// Applies every migration past the file's `user_version`, one transaction per migration.
+///
+/// A migration and its version bump commit together, so a crash never leaves a half-applied
+/// schema that claims to be complete.
+fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
+    let found: u32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    let known = u32::try_from(MIGRATIONS.len()).unwrap_or(u32::MAX);
+    if found > known {
+        return Err(StoreError::TooNew { found, known });
+    }
+    for (i, (_name, sql)) in MIGRATIONS.iter().enumerate().skip(found as usize) {
+        let tx = conn.transaction()?;
+        tx.execute_batch(sql)?;
+        let version = u32::try_from(i + 1).unwrap_or(u32::MAX);
+        tx.pragma_update(None, "user_version", version)?;
+        tx.commit()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -100,5 +146,53 @@ mod tests {
             assert!(name.starts_with(&format!("{:04}_", i + 1)), "{name}");
             assert!(sql.contains("CREATE TABLE"), "{name} is empty");
         }
+    }
+
+    /// A fresh database path for one test (the directory is recreated each run).
+    fn scratch_db(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("zeroclip-store-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("metadata.db")
+    }
+
+    #[test]
+    fn store_open_applies_every_migration() {
+        let path = scratch_db("every-migration");
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), u32::try_from(MIGRATIONS.len()).unwrap());
+        let tables: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM sqlite_master WHERE name = 'clips'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tables, 1);
+    }
+
+    #[test]
+    fn store_reopen_is_idempotent() {
+        let path = scratch_db("reopen");
+        let first = Store::open(&path).unwrap().schema_version().unwrap();
+        let second = Store::open(&path).unwrap().schema_version().unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn store_refuses_a_newer_schema() {
+        let path = scratch_db("newer");
+        drop(Store::open(&path).unwrap());
+        let raw = Connection::open(&path).unwrap();
+        raw.pragma_update(None, "user_version", 99).unwrap();
+        drop(raw);
+        let err = Store::open(&path).unwrap_err();
+        assert!(matches!(err, StoreError::TooNew { found: 99, .. }), "{err}");
+    }
+
+    #[test]
+    fn store_enables_foreign_keys() {
+        let path = scratch_db("foreign-keys");
+        let store = Store::open(&path).unwrap();
+        let on: i64 = store.conn.pragma_query_value(None, "foreign_keys", |r| r.get(0)).unwrap();
+        assert_eq!(on, 1);
     }
 }
