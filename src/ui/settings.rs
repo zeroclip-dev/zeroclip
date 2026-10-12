@@ -8,6 +8,7 @@ use zc_audio::MicDevice;
 use zc_core::hotkey::Chord;
 use zc_core::media::{Codec, ContainerFormat};
 use zc_core::settings::{AAC_BITRATES_KBPS, MIX_GAIN_DB, MicMode, Settings};
+use zc_video::capture::MonitorInfo;
 
 use super::{dvr_megabytes, human_duration};
 use crate::app::ZeroClipApp;
@@ -27,6 +28,8 @@ pub struct Draft {
     /// Microphones Windows reports, re-listed every `MIC_POLL` while the screen is open.
     mics: Vec<MicDevice>,
     mics_listed: Instant,
+    /// Displays Windows reports. Listed when the draft is made, and by the Refresh button.
+    monitors: Vec<MonitorInfo>,
     /// Problems from the last save attempt.
     pub problems: Vec<String>,
 }
@@ -48,6 +51,7 @@ impl Draft {
             push_to_talk: hotkeys.push_to_talk.as_ref().map(Chord::to_string).unwrap_or_default(),
             mics: zc_audio::list_microphones(),
             mics_listed: Instant::now(),
+            monitors: zc_video::capture::list_monitors(),
             problems: Vec::new(),
         }
     }
@@ -144,8 +148,31 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
         });
 
         section(ui, "Video", |ui| {
-            let video = &mut draft.settings.video;
+            let (monitors, video) = (&mut draft.monitors, &mut draft.settings.video);
             Grid::new("video").num_columns(2).spacing([24.0, 8.0]).show(ui, |ui| {
+                ui.label("Screen");
+                ui.horizontal(|ui| {
+                    let selected = video.monitor.map_or_else(
+                        || "Primary display (default)".to_owned(),
+                        |i| {
+                            monitors.iter().find(|m| m.index == i).map_or_else(
+                                || format!("Display {} (not connected)", i + 1),
+                                |m| m.name.clone(),
+                            )
+                        },
+                    );
+                    ComboBox::from_id_salt("monitor").selected_text(selected).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut video.monitor, None, "Primary display (default)");
+                        for m in monitors.iter() {
+                            ui.selectable_value(&mut video.monitor, Some(m.index), &m.name);
+                        }
+                    });
+                    if ui.button("Refresh").clicked() {
+                        *monitors = zc_video::capture::list_monitors();
+                    }
+                });
+                ui.end_row();
+
                 ui.label("Codec");
                 ComboBox::from_id_salt("codec").selected_text(codec_label(video.codec)).show_ui(
                     ui,
@@ -183,6 +210,7 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
                 ui.checkbox(&mut video.capture_cursor, "Capture the mouse cursor");
                 ui.end_row();
             });
+            ui.weak("Screen applies when recording starts. Changing it during a recording stops that recording.");
             ui.weak("The keyframe interval is also the trim precision in the editor.");
         });
 
