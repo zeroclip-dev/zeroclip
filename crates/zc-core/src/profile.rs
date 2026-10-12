@@ -53,23 +53,47 @@ impl Default for ProfileSet {
     }
 }
 
+/// The file name of an executable, given as a bare name or a full path.
+///
+/// Both `\` and `/` separate path components, on any OS, so a path copied from a
+/// Windows machine works everywhere. Returns `exe` itself when it has no separator,
+/// and an empty string for an empty input.
+#[must_use]
+pub fn exe_name(exe: &str) -> &str {
+    exe.rsplit(['\\', '/']).next().unwrap_or(exe)
+}
+
 impl ProfileSet {
-    /// The profile for an executable, given as a bare file name or a full path.
+    /// The explicit profile for an executable, or `None` if no game profile matches.
     ///
     /// Matching is on the file name only and ignores ASCII case (Windows paths are
-    /// case-insensitive). Both `\` and `/` separate path components, regardless of
-    /// the OS this runs on. Unknown executables get [`ProfileSet::default`].
+    /// case-insensitive). `None` means "no explicit profile", so the engine keeps the
+    /// current profile in that case (sticky profiles, see P4.6).
+    #[must_use]
+    pub fn find(&self, exe: &str) -> Option<&GameProfile> {
+        let name = exe_name(exe);
+        if name.is_empty() {
+            return None;
+        }
+        self.games.iter().find(|g| g.exe.eq_ignore_ascii_case(name))
+    }
+
+    /// The profile for an executable, given as a bare file name or a full path.
+    ///
+    /// Unknown executables get [`ProfileSet::default`]. See [`ProfileSet::find`]
+    /// for the matching rules.
     #[must_use]
     pub fn resolve(&self, exe: &str) -> &GameProfile {
-        let _ = exe;
-        todo!("Phase 4: resolve profiles (see the `profile_*` specs)")
+        self.find(exe).unwrap_or(&self.default)
     }
 
     /// Adds a profile, or replaces the existing one for the same executable
     /// (used to promote a game from the "recent games" list).
     pub fn upsert(&mut self, profile: GameProfile) {
-        let _ = profile;
-        todo!("Phase 4: insert or replace (see the `profile_*` specs)")
+        match self.games.iter_mut().find(|g| g.exe.eq_ignore_ascii_case(&profile.exe)) {
+            Some(slot) => *slot = profile,
+            None => self.games.push(profile),
+        }
     }
 }
 
@@ -120,7 +144,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: ProfileSet::resolve (Phase 4)"]
     fn profile_resolves_by_file_name_ignoring_case() {
         let set = ProfileSet::default();
         assert_eq!(set.resolve("cs2.exe").buffer_secs, 120);
@@ -132,7 +155,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: ProfileSet::resolve (Phase 4)"]
     fn profile_falls_back_to_the_default() {
         let set = ProfileSet::default();
         assert_eq!(set.resolve("notepad.exe"), &set.default);
@@ -141,7 +163,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: ProfileSet::upsert (Phase 4)"]
+    fn profile_find_is_none_for_unknown_exes() {
+        let set = ProfileSet::default();
+        assert!(set.find("notepad.exe").is_none());
+        assert!(set.find("").is_none());
+        assert!(set.find("CS2.EXE").is_some());
+    }
+
+    #[test]
     fn profile_upsert_replaces_by_exe() {
         let mut set = ProfileSet::default();
         set.upsert(GameProfile {
