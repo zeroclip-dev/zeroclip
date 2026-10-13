@@ -108,7 +108,7 @@ impl SpoolReader {
     }
 }
 
-/// Creates a recording spool with the default budget of [`SPOOL_BYTES`].
+/// Creates a recording spool with the default budget of `SPOOL_BYTES`.
 #[must_use]
 pub fn spool() -> (SpoolWriter, SpoolReader) {
     spool_with_capacity(SPOOL_BYTES)

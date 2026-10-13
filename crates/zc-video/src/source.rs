@@ -8,6 +8,14 @@
 //!   feeds the encoder when it asks for input, pushes its output into the sink, and
 //!   repeats the last frame when the screen is static.
 //! - **Engine thread**: only calls `start`, `stop`, `request_keyframe`, `screenshot`.
+//!
+//! Windows choices: frames come from [Windows.Graphics.Capture](https://learn.microsoft.com/en-us/windows/uwp/audio-video-camera/screen-capture),
+//! which hands out GPU textures for a [`GraphicsCaptureItem`](https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture.graphicscaptureitem),
+//! so frames never pass through system memory. They live on one Direct3D 11 device with
+//! [multithread protection](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nn-d3d11-id3d11multithread),
+//! because the capture callback and the encoder thread both use it. The encoder thread
+//! joins the multithreaded apartment ([`Apartment`]) and starts Media Foundation
+//! ([`MediaFoundation`]) for the hardware encoder.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
