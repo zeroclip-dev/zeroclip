@@ -1,6 +1,11 @@
 //! WASAPI process loopback (include mode, D9), shared by [`GameAudioSource`](crate::GameAudioSource)
 //! and [`AppAudioSource`](crate::AppAudioSource): activation of one process tree, and the
 //! start-up every process-loopback capture thread shares.
+//!
+//! Process loopback is an activation-time option, not a device: the client is created
+//! through [`ActivateAudioInterfaceAsync`](https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/nf-mmdeviceapi-activateaudiointerfaceasync)
+//! with the `VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK` target. See
+//! [loopback recording](https://learn.microsoft.com/en-us/windows/win32/coreaudio/loopback-recording).
 
 use std::mem::ManuallyDrop;
 use std::sync::mpsc::{self, SyncSender};
@@ -31,14 +36,15 @@ use zc_win::mf::MediaFoundation;
 use crate::capture::Encode;
 
 /// Signals when the asynchronous activation finishes. Agile and panic-free, as
-/// COM callbacks must be.
+/// COM callbacks must be. Implements [`IActivateAudioInterfaceCompletionHandler`](https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/nn-mmdeviceapi-iactivateaudiointerfacecompletionhandler).
 #[implement(IActivateAudioInterfaceCompletionHandler, IAgileObject)]
 struct Completion {
     done: SyncSender<()>,
 }
 
 // IAgileObject is a marker interface: no methods, it just tells COM the handler can
-// be called from any thread.
+// be called from any thread, so COM may call it on its own worker thread instead of
+// marshalling back to ours. See [`IAgileObject`](https://learn.microsoft.com/en-us/windows/win32/api/objidl/nn-objidl-iagileobject).
 impl windows::Win32::System::Com::IAgileObject_Impl for Completion_Impl {}
 
 impl IActivateAudioInterfaceCompletionHandler_Impl for Completion_Impl {
@@ -53,6 +59,11 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Completion_Impl {
 
 /// An audio client capturing process `pid` and its children. Needs Windows 11 (build
 /// 20348+); older systems get `SourceError::Unsupported`.
+///
+/// Activation is asynchronous only, so we wait on a channel with a timeout. The
+/// parameters travel as a `VT_BLOB` [`PROPVARIANT`](https://learn.microsoft.com/en-us/windows/win32/api/propidlbase/ns-propidlbase-propvariant)
+/// holding an [`AUDIOCLIENT_ACTIVATION_PARAMS`](https://learn.microsoft.com/en-us/windows/win32/api/audioclientactivationparams/ns-audioclientactivationparams-audioclient_activation_params).
+/// Include mode records the target's whole tree, so launcher and child processes are both covered.
 pub(crate) fn activate(pid: u32) -> Result<IAudioClient, SourceError> {
     let params = AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
@@ -63,7 +74,8 @@ pub(crate) fn activate(pid: u32) -> Result<IAudioClient, SourceError> {
             },
         },
     };
-    // ManuallyDrop: windows-rs gives PROPVARIANT a Drop that calls PropVariantClear,
+    // ManuallyDrop: windows-rs gives PROPVARIANT a Drop that calls
+    // [`PropVariantClear`](https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-propvariantclear),
     // which would CoTaskMemFree this blob's stack pointer and corrupt the heap.
     // `params` outlives the wait below.
     let prop = ManuallyDrop::new(PROPVARIANT {

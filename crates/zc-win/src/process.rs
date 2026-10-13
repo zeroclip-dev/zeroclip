@@ -2,6 +2,12 @@
 //!
 //! Everything here is a read-only query. Nothing is injected, suspended or
 //! terminated, and no admin rights are needed for the processes we can open.
+//!
+//! Windows are listed with [`EnumWindows`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enumwindows),
+//! processes with a Toolhelp snapshot. Each process is opened with only
+//! [`PROCESS_QUERY_LIMITED_INFORMATION`](https://learn.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights),
+//! which is enough for an image path and timestamps and is granted for more processes
+//! than full query rights.
 
 use std::ffi::c_void;
 use std::path::Path;
@@ -66,7 +72,9 @@ unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     BOOL(1)
 }
 
-/// `Some` if `hwnd` is a window the user could pick as an audio source.
+/// `Some` if `hwnd` is a window the user could pick as an audio source. The filters
+/// mirror what Windows leaves out of its Alt+Tab list: hidden, cloaked, tool and owned windows.
+/// See [`IsWindowVisible`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindowvisible).
 fn describe_window(hwnd: HWND) -> Option<OpenApp> {
     // SAFETY: IsWindowVisible accepts any HWND value and returns FALSE for a bad one.
     if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
@@ -91,7 +99,9 @@ fn describe_window(hwnd: HWND) -> Option<OpenApp> {
 }
 
 /// Whether DWM has cloaked the window (hidden UWP, another virtual desktop, and so on).
-/// A failed query counts as not cloaked, so no window is lost to an API error.
+/// A failed query counts as not cloaked, so no window is lost to an API error. See
+/// [`DwmGetWindowAttribute`](https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmgetwindowattribute)
+/// and [`DWMWA_CLOAKED`](https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/ne-dwmapi-dwmwindowattribute).
 fn is_cloaked(hwnd: HWND) -> bool {
     let mut cloaked = 0_u32;
     // SAFETY: `cloaked` is a u32 and we pass its size, as DWMWA_CLOAKED requires.
@@ -106,20 +116,26 @@ fn is_cloaked(hwnd: HWND) -> bool {
     queried.is_ok() && cloaked != 0
 }
 
-/// Whether the window has the `WS_EX_TOOLWINDOW` style.
+/// Whether the window has the `WS_EX_TOOLWINDOW` style: a floating palette, not an app's
+/// main window. See [extended window styles](https://learn.microsoft.com/en-us/windows/win32/winmsg/extended-window-styles)
+/// and [`GetWindowLongPtrW`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowlongptrw).
 fn is_tool_window(hwnd: HWND) -> bool {
     // SAFETY: GetWindowLongPtrW reads the extended style of `hwnd`. A bad handle gives 0.
     let style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
     style & WS_EX_TOOLWINDOW.0 != 0
 }
 
-/// Whether the window has an owner window.
+/// Whether the window has an owner window. Owned windows are dialogs and secondary
+/// windows of an app whose main window is already listed. See
+/// [`GetWindow`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindow).
 fn has_owner(hwnd: HWND) -> bool {
     // SAFETY: GetWindow reads the owner of `hwnd`. A window with no owner gives an error or a null handle.
     unsafe { GetWindow(hwnd, GW_OWNER) }.is_ok_and(|owner| !owner.0.is_null())
 }
 
-/// The trimmed title, or `None` when the window has none.
+/// The trimmed title, or `None` when the window has none. Read with
+/// [`GetWindowTextW`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowtextw),
+/// the UTF-16 variant, so non-ASCII titles survive.
 fn window_title(hwnd: HWND) -> Option<String> {
     let mut buffer = [0_u16; 512];
     // SAFETY: the buffer is writable and we pass its exact length. The return value is the copied length.
@@ -131,6 +147,8 @@ fn window_title(hwnd: HWND) -> Option<String> {
 }
 
 /// The executable file name (no directory) of process `pid`, or `None` if it can't be opened.
+/// The full image path comes from [`QueryFullProcessImageNameW`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew),
+/// which works with limited rights, unlike the older module-name APIs.
 fn exe_name_for_pid(pid: u32) -> Option<String> {
     let process = open_process_limited(pid)?;
     let mut buffer = [0_u16; 1024];
@@ -150,6 +168,7 @@ fn exe_name_for_pid(pid: u32) -> Option<String> {
 }
 
 /// Opens `pid` with the least access that gives its image path and creation time. The handle closes when the result drops.
+/// See [`OpenProcess`](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess).
 fn open_process_limited(pid: u32) -> Option<Owned<windows::Win32::Foundation::HANDLE>> {
     // SAFETY: OpenProcess only reads its arguments. The handle it returns is wrapped in `Owned` below, which closes it.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
@@ -157,7 +176,10 @@ fn open_process_limited(pid: u32) -> Option<Owned<windows::Win32::Foundation::HA
     Some(unsafe { Owned::new(handle) })
 }
 
-/// The process's creation time in 100 ns ticks since 1601, or `None` if unavailable.
+/// The process's creation time in 100 ns ticks since 1601, or `None` if unavailable. Read
+/// with [`GetProcessTimes`](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes),
+/// which fills four [`FILETIME`](https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-filetime)s;
+/// only the creation one is used.
 fn creation_time(pid: u32) -> Option<u64> {
     let process = open_process_limited(pid)?;
     let mut created = FILETIME::default();
@@ -173,6 +195,7 @@ fn creation_time(pid: u32) -> Option<u64> {
 }
 
 /// The root of the process tree for `exe`: its matching process with the earliest creation time.
+/// A parent starts before its children, so the earliest-started match is normally the root.
 ///
 /// `None` if no process matches. If no creation time can be read, the lowest pid
 /// is used. Matching is per [`exe_matches`].
@@ -184,7 +207,10 @@ pub fn root_pid_for_exe(exe: &str) -> Option<u32> {
     timed.map(|(_, pid)| pid).or_else(|| pids.iter().copied().min())
 }
 
-/// Every running process whose executable name matches `exe`.
+/// Every running process whose executable name matches `exe`. Walks a Toolhelp snapshot:
+/// [`CreateToolhelp32Snapshot`](https://learn.microsoft.com/en-us/windows/win32/api/tlhelp32/nf-tlhelp32-createtoolhelp32snapshot)
+/// with [`Process32FirstW`](https://learn.microsoft.com/en-us/windows/win32/api/tlhelp32/nf-tlhelp32-process32firstw)
+/// and [`Process32NextW`](https://learn.microsoft.com/en-us/windows/win32/api/tlhelp32/nf-tlhelp32-process32nextw).
 fn pids_for_exe(exe: &str) -> Vec<u32> {
     // SAFETY: TH32CS_SNAPPROCESS with pid 0 takes a snapshot of all processes. The result is wrapped in `Owned` below.
     let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {

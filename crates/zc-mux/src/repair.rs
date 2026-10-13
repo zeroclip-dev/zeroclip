@@ -9,7 +9,7 @@
 //! The walk reads only box headers and seeks past each body. It never trusts a size from the
 //! file: a size that overflows or runs past the end of the file ends the walk. The bodies that
 //! are read are the moofs, which give the index and the length, and the moov, which holds the
-//! `mehd`. Each is read in full, up to [`MAX_BOX_LEN`].
+//! `mehd`. Each is read in full, up to `MAX_BOX_LEN`.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;

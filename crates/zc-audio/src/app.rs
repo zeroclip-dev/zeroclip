@@ -1,3 +1,10 @@
+//! Per-app audio (D26): one app's process tree on its own track, via WASAPI process loopback.
+//!
+//! The Windows calls are in `loopback`: `loopback::activate` asks for process loopback
+//! with [`ActivateAudioInterfaceAsync`](https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/nf-mmdeviceapi-activateaudiointerfaceasync),
+//! and `loopback::setup` joins the MTA and starts Media Foundation for the track's encoder.
+//! The exe-to-pid lookup is the injected resolver, so this module does no process queries itself.
+
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 

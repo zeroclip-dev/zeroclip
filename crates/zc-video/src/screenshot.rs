@@ -4,6 +4,11 @@
 //! ([`staging_copy`]); the caller (the engine thread, off the hot path) maps it and
 //! encodes the PNG ([`save_png`]). This is the one place a frame is deliberately
 //! copied to system memory.
+//!
+//! Direct3D 11 GPU memory is not CPU-readable, so the frame goes through a
+//! [`D3D11_USAGE_STAGING`](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_usage)
+//! texture: a GPU-side copy, then [`ID3D11DeviceContext::Map`](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-map)
+//! for CPU reads.
 
 use std::path::Path;
 
@@ -14,7 +19,11 @@ use windows::Win32::Graphics::Direct3D11::{
 use zc_core::ports::SourceError;
 use zc_win::error::WinResultExt;
 
-/// Copies `texture` into a new CPU-readable staging texture, on the GPU.
+/// Copies `texture` into a new CPU-readable staging texture, on the GPU. The copy
+/// is queued on the device context and runs in GPU order, so the frame cannot be
+/// read before the copy finishes. See
+/// [`ID3D11Device::CreateTexture2D`](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11device-createtexture2d)
+/// and [`ID3D11DeviceContext::CopyResource`](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-copyresource).
 ///
 /// # Errors
 /// The texture couldn't be created.
@@ -44,6 +53,9 @@ pub fn staging_copy(
 }
 
 /// Saves the top-left `size` pixels of a BGRA staging texture as a PNG at `path`.
+/// `Map` blocks until the GPU copy is done, and every `Map` is paired with an
+/// [`Unmap`](https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-unmap).
+/// The frame is read as BGRA because that is the format WGC delivers.
 ///
 /// # Errors
 /// Mapping or file errors.

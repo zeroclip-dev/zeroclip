@@ -2,7 +2,9 @@
 //!
 //! WGC's `SystemRelativeTime` and WASAPI's `u64QPCPosition` are both QPC-based
 //! and already in 100 ns units; this clock reads "now" on the same timeline, e.g.
-//! to timestamp a placeholder frame during an HDCP pause.
+//! to timestamp a placeholder frame during an HDCP pause. QPC is monotonic and
+//! high-resolution, and it's the timeline the capture APIs already report on
+//! ([`QueryPerformanceCounter`](https://learn.microsoft.com/en-us/windows/win32/api/profileapi/nf-profileapi-queryperformancecounter)).
 
 use std::sync::OnceLock;
 
@@ -21,7 +23,8 @@ pub fn now() -> Hns {
     ticks_to_hns(ticks, frequency())
 }
 
-/// QPC ticks per second. Fixed at boot, so read once.
+/// QPC ticks per second. Fixed at boot, so read once, from
+/// [`QueryPerformanceFrequency`](https://learn.microsoft.com/en-us/windows/win32/api/profileapi/nf-profileapi-queryperformancefrequency).
 #[must_use]
 pub fn frequency() -> i64 {
     static FREQUENCY: OnceLock<i64> = OnceLock::new();

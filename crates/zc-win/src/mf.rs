@@ -6,12 +6,15 @@ use zc_core::ports::SourceError;
 use crate::error::WinResultExt;
 
 /// Keeps Media Foundation started until dropped. `MFStartup` is reference-counted,
-/// so the video and audio pipelines can each hold one.
+/// so the video and audio pipelines can each hold one. See
+/// [`MFStartup`](https://learn.microsoft.com/en-us/windows/win32/api/mfapi/nf-mfapi-mfstartup).
 #[derive(Debug)]
 pub struct MediaFoundation(());
 
 impl MediaFoundation {
-    /// Calls `MFStartup(MF_VERSION, MFSTARTUP_FULL)`.
+    /// Calls `MFStartup(MF_VERSION, MFSTARTUP_FULL)`. `FULL` rather than `LITE`, because
+    /// `LITE` starts without the work-queue services that the hardware encoders use.
+    /// See [`MFStartup`](https://learn.microsoft.com/en-us/windows/win32/api/mfapi/nf-mfapi-mfstartup).
     ///
     /// # Errors
     /// If Media Foundation is missing — e.g. Windows "N" editions without the
