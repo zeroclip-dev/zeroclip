@@ -12,8 +12,8 @@ use crate::error::WinResultExt;
 pub struct MediaFoundation(());
 
 impl MediaFoundation {
-    /// Calls `MFStartup(MF_VERSION, MFSTARTUP_FULL)`. `FULL` rather than `LITE`, because
-    /// `LITE` starts without the work-queue services that the hardware encoders use.
+    /// Calls `MFStartup(MF_VERSION, MFSTARTUP_FULL)`. `LITE` would only skip the sockets library,
+    /// which we never use, so `FULL` is just the documented default.
     /// See [`MFStartup`](https://learn.microsoft.com/en-us/windows/win32/api/mfapi/nf-mfapi-mfstartup).
     ///
     /// # Errors
