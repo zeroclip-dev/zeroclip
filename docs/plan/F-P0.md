@@ -202,7 +202,6 @@ Size **S** · **hardware check: 0xtikaa** · depends on P0.3
 - `spikes/phase0-capture-encode/src/main.rs`
 - `.gitignore`
 - `docs/ROADMAP.md`
-- `CLAUDE.md`
 - `README.md`
 
 **Steps**
@@ -210,7 +209,7 @@ Size **S** · **hardware check: 0xtikaa** · depends on P0.3
 1. Read the codec from `std::env::args().nth(1)`: "h264" (default) | "hevc" | "av1" → MFVideoFormat_H264 / MFVideoFormat_HEVC / MFVideoFormat_AV1. Write to `spike-phase0-<codec>.mp4`. Change the OUTPUT const into a fn or format the name in main.
 2. In .gitignore, change `/spike-phase0.mp4` to `/spike-phase0*.mp4`.
 3. Run each codec. Record the results in a `//! ## Findings` section of the spike's module doc: GPU and driver, which codecs worked, average frame interval, CPU %, whether Video Encode was busy, and whether the file plays in VLC and in a browser. HEVC MP4 plays in Chrome/Edge on Windows with hardware decode, but not in Firefox. AV1 needs RTX 40 / Arc / RDNA3.
-4. If the done-when holds, tick both Phase 0 boxes in docs/ROADMAP.md. Change CLAUDE.md's 'Current phase' line to 'Phase 1, capture core (crates/zc-video)' and README's status blockquote to match.
+4. If the done-when holds, tick both Phase 0 boxes in docs/ROADMAP.md. Change the ROADMAP "Current phase" line to 'Phase 1, capture core (crates/zc-video)' and README's status blockquote to match.
 
 **Verify**
 

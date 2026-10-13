@@ -10,6 +10,8 @@ documented core beats a perfect product that isn't finished.
 How to see what is left in the code: `cargo test -- --ignored` runs every spec that
 hasn't been implemented yet.
 
+**Current phase: Phase 3 is done on hardware except P3.28 (README GIF), P3.29 (launch post) and P3.30 (tag v0.1.0). Next code: Phase 4, start at P4.1 ([docs/plan/P4.md](plan/P4.md)).**
+
 Every box below is broken into task cards in [docs/plan/](plan/README.md). Work the
 cards; tick a box here when its cards are done.
 
