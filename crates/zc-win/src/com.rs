@@ -11,7 +11,11 @@ use crate::error::WinResultExt;
 ///
 /// Create one at the top of every thread that touches COM, WinRT
 /// (Windows.Graphics.Capture) or Media Foundation. `RoInitialize` initialises both
-/// COM and WinRT. Not `Send`: apartment membership belongs to the thread.
+/// COM and WinRT. We use the MTA because our capture and encode threads run no
+/// message loop, and WinRT callbacks then arrive on any thread instead of being
+/// marshalled to one. Not `Send`: apartment membership belongs to the thread.
+/// See [multithreaded apartments](https://learn.microsoft.com/en-us/windows/win32/com/multithreaded-apartments)
+/// and [`RoInitialize`](https://learn.microsoft.com/en-us/windows/win32/api/roapi/nf-roapi-roinitialize).
 #[derive(Debug)]
 pub struct Apartment {
     _not_send: PhantomData<*const ()>,
