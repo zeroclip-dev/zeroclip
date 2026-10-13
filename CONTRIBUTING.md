@@ -5,8 +5,7 @@ step on each other.
 
 ## Before your first pull request
 
-- **Sign the CLA.** Every contributor signs the Contributor License Agreement once,
-  before their first PR is merged. Open the PR and the maintainer will send it to you.
+- **Sign the [CLA](CLA.md).** Open the PR and the CLA bot comments on it; reply with the sentence it shows. You sign once, and the PR can't merge until you have.
 - ZeroClip is under the [PolyForm Noncommercial license](LICENSE) plus the
   paid-content permission described there. Your contribution is licensed the same way.
 - Open an issue first for anything bigger than a bug fix, so we agree on the approach.
