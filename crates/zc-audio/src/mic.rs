@@ -25,7 +25,11 @@ use crate::capture::{Encode, Mmcss, Stream, Worker, pcm16_format};
 /// Audio track 3: the microphone, gated by push-to-talk (D30).
 ///
 /// The chosen capture device, or the default *communications* one (the headset
-/// mic, usually), in shared mode. A closed gate writes silence, so the track keeps its length and
+/// mic, usually), in shared mode. The communications role is the one voice apps use, so
+/// it is the mic the user expects, and the endpoint comes from
+/// [`IMMDeviceEnumerator::GetDefaultAudioEndpoint`](https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/nf-mmdeviceapi-immdeviceenumerator-getdefaultaudioendpoint)
+/// with [`ERole`](https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/ne-mmdeviceapi-erole).
+/// Device selection goes through the [MMDevice API](https://learn.microsoft.com/en-us/windows/win32/coreaudio/mmdevice-api). A closed gate writes silence, so the track keeps its length and
 /// timestamps (DESIGN §6). The optional compressor has no lookahead, so the Mic
 /// track needs no offset (`Compressor::latency`, `MasterClock::set_track_offset`).
 /// If the mic is unplugged or the default device changes, capture reopens every
@@ -90,6 +94,8 @@ pub struct MicDevice {
 /// The microphones available right now, in Windows' order. Empty on any failure.
 ///
 /// Safe to call from the UI thread: the COM work runs on its own short-lived thread.
+/// Enumeration uses [`IMMDeviceEnumerator::EnumAudioEndpoints`](https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/nf-mmdeviceapi-immdeviceenumerator-enumaudioendpoints)
+/// for active capture endpoints, created with [`CoCreateInstance`](https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-cocreateinstance).
 #[must_use]
 pub fn list_microphones() -> Vec<MicDevice> {
     std::thread::Builder::new()
@@ -104,6 +110,10 @@ pub fn list_microphones() -> Vec<MicDevice> {
         .unwrap_or_default()
 }
 
+/// The friendly name comes from the endpoint's property store, via
+/// [`IMMDevice::OpenPropertyStore`](https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/nf-mmdeviceapi-immdevice-openpropertystore)
+/// and [`IPropertyStore::GetValue`](https://learn.microsoft.com/en-us/windows/win32/api/propsys/nf-propsys-ipropertystore-getvalue).
+/// The endpoint id is the string `GetId` allocates, which we free with `CoTaskMemFree`.
 fn enumerate() -> Result<Vec<MicDevice>, SourceError> {
     let _apartment = Apartment::multithreaded()?;
     let mut found = Vec::new();
@@ -132,6 +142,10 @@ fn enumerate() -> Result<Vec<MicDevice>, SourceError> {
     Ok(found)
 }
 
+/// Opens the chosen endpoint, or the default communications one. The endpoint is
+/// activated as an [`IAudioClient`](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nn-audioclient-iaudioclient)
+/// with [`IMMDevice::Activate`](https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/nf-mmdeviceapi-immdevice-activate).
+/// A chosen device that is unplugged is reported as unavailable rather than replaced.
 fn open_mic(config: &AudioStart, chosen: Option<&str>) -> Result<Stream, SourceError> {
     // SAFETY: plain COM calls on this thread's apartment.
     let client: IAudioClient = unsafe {
