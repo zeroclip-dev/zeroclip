@@ -16,7 +16,8 @@ game crashes.
 > - encode with HEVC or H.264 on the GPU
 >
 > See the [roadmap](docs/ROADMAP.md) for what comes next, and
-> [How ZeroClip works](docs/HOW_IT_WORKS.md) for the design in one read.
+> [How ZeroClip works](docs/HOW_IT_WORKS.md) for the design in one read. Want to help? See
+> [CONTRIBUTING.md](CONTRIBUTING.md).
 
 <!-- GIF placeholder: docs/media/save-clip.gif (save a clip, 10 s max, 720p, 15 fps, under 5 MB). Not recorded yet (P3.28). -->
 

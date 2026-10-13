@@ -1,4 +1,4 @@
-//! The recording spool: a hand-off from the hot path to the IO thread (CLAUDE.md rule 2,
+//! The recording spool: a hand-off from the hot path to the IO thread (CONTRIBUTING.md rule 2,
 //! DESIGN §5).
 //!
 //! A recording's [`PacketWriter`] runs under the recorder's lock, on the encoder and
