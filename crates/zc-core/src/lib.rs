@@ -23,7 +23,7 @@
 //!
 //! Behaviour that is designed but not built yet is pinned down by tests marked
 //! `#[ignore = "spec: …"]`. Run `cargo test -p zc-core -- --ignored` to see what is
-//! left; see `CLAUDE.md` for the workflow.
+//! left; see `CONTRIBUTING.md` for the workflow.
 
 pub mod backoff;
 pub mod control;

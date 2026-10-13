@@ -1,10 +1,10 @@
 # The build plan
 
 This plan covers every remaining roadmap item as a small task card: 119 cards across
-Foundations and Phases 0–6. It was made on 2026-10-04 with Opus, by a read-only sweep of
+Foundations and Phases 0–6. It was made on 2026-10-04 by a read-only sweep of
 every source file. That sweep found all 71 ignored specs, all 81 `todo!()`s and all 12
 scaffold attributes, and each one belongs to a card. The cards are meant to be worked
-one per session, by Sonnet or by hand.
+one at a time.
 
 | File | Covers |
 |---|---|
@@ -25,7 +25,7 @@ whose dependencies are ticked.
 
 Start each session with:
 
-> Do the next unchecked task in docs/plan/. Read its card and the files it names. Follow CLAUDE.md.
+> Do the next unchecked task in docs/plan/. Read its card and the files it names. Follow CONTRIBUTING.md.
 
 The protocol:
 
