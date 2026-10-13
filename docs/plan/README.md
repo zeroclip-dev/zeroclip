@@ -148,7 +148,7 @@ Every card repeats the pitfalls that apply to it locally. These apply everywhere
     `_Impl` methods trivial, and use `try_borrow_mut` and `try_lock`, never `unwrap`.
 15. **Docs that are out of date.** Each phase's close-out card fixes the drift in its
     own area:
-    - CLAUDE.md's "Current phase" line.
+    - ROADMAP "Current phase" line.
     - The ARCHITECTURE thread table: one IO thread per dump or recording, and tokio only
       from Phase 6.
     - DESIGN §7 ("SQLite" profiles, `sysinfo`), §8 (`recovery.tmp`), §10 (the
