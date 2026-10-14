@@ -26,7 +26,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          path-to-document: https://github.com/0xtikaa/zeroclip/blob/dev/CLA.md
+          path-to-document: https://github.com/zeroclip-dev/zeroclip/blob/dev/CLA.md
           path-to-signatures: signatures/cla.json
           branch: cla-signatures
-          allowlist: 0xtikaa,bot*,dependabot[bot]
+          allowlist: 0xtikaa,Tu2525,bot*,dependabot[bot]
