@@ -251,3 +251,16 @@ contend with game asset streaming (pacing from P3.23-25 applies); a ring file is
 never grown; a crash leaves the ring on disk, which P4.11 rescue can read; clips older than the RAM
 part are slower to dump than RAM-only.
 The ring defaults to a different drive than the recordings folder when one exists, so session writes and ring writes don't compete.
+
+### D33 · Game profiles are sticky: only a profiled game changes the profile (builds on D21, D27, D31)
+A profiled game becomes the tracked game when it takes focus. Its profile stays in effect until
+another profiled game takes focus, or its process exits (P4.7). Apps without a profile never change
+it, so alt-tabbing to Discord or opening Task Manager can't shrink the buffer before a crash rescue.
+Those apps go to `EngineStatus::recent_games` instead (newest first, at most 8), so the user can
+promote one to a profile. Game audio and the input process watch follow the tracked game's pid only,
+which amends D27: audio no longer follows every app that takes focus. Explorer and ZeroClip don't
+count as games. A resize (D21) releases the page locks on the old rings, resizes, and pins the new
+rings the same way; it logs its duration.
+Costs: an unprofiled game can't get its own window length while a profiled game is tracked; the
+profile stays in effect after the user has left the game, until another profiled game takes focus
+or the game exits.
