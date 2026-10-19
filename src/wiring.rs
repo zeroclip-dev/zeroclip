@@ -96,6 +96,7 @@ pub fn ports(settings: &Settings) -> Ports {
             .map(|bus| Box::new(zc_audio::MasterMix::new(bus)) as Box<dyn AudioSource>),
         seek_penalty: Some(zc_win::drive::seek_penalty),
         lock_memory: Some(pin_memory),
+        total_memory: Some(zc_win::memory::total_physical_mib),
     }
 }
 
