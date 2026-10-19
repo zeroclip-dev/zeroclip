@@ -235,3 +235,19 @@ a different game does); the mic and app tracks run only while a profiled game is
 the game-audio fallback is whole-system loopback (D9), so the desktop's sound can reach the game track.
 The DVR ring is still sized at startup from the default profile, so a profile window longer than that is
 capped by the ring until P4.6 adds Recorder::resize.
+
+### D32 · DVR buffer storage: RAM, disk or hybrid, sized to free memory (amends D4, D21)
+`dvr.storage` is `ram`, `disk` or `hybrid`. **RAM** is D4 as built: pre-allocated, page-locked.
+**Disk** writes each finished GOP to a fixed-size ring file on a drive the user picks (default: a
+non-system drive if present); only the in-flight GOP stays in RAM. **Hybrid** keeps the newest
+`dvr.ram_secs` (default 20) in RAM and spills older GOPs to the ring file, so a long window costs
+about 50-100 MB of RAM. A dump reads RAM first, then the ring, and writes oldest first, so it no
+longer doubles RAM. The RAM part is capped at a share of *available* memory read at startup
+(`GlobalMemoryStatusEx`, default 5% of total); a window that doesn't fit is shortened and the UI says
+so, and the cost per window length is shown next to the setting. Under `QueryMemoryResourceNotification`
+low-memory the RAM part shrinks and page-locking is dropped. Default is hybrid with a 60 s window.
+Costs: continuous writes (about 9 GB/hour at 20 Mbps, 22 GB/hour at 50 Mbps) wear the drive and can
+contend with game asset streaming (pacing from P3.23-25 applies); a ring file is overwritten in place,
+never grown; a crash leaves the ring on disk, which P4.11 rescue can read; clips older than the RAM
+part are slower to dump than RAM-only.
+The ring defaults to a different drive than the recordings folder when one exists, so session writes and ring writes don't compete.
