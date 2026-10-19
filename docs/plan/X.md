@@ -8,7 +8,7 @@ Generated from the planning inventory (2026-10-04) and edited by hand. See [READ
 
 Tick a box when the card is done. Write `(awaiting HW check)` after the title while 0xtikaa still has to verify it on hardware.
 
-- [ ] X.2 · GitHub Sponsors: .github/FUNDING.yml
+- [x] X.2 · GitHub Sponsors: .github/FUNDING.yml
 - [ ] X.3 · Publish the repo + CI badge in the README
 
 ## Cards
