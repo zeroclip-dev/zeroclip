@@ -143,6 +143,7 @@ impl Engine {
             ptt_held: false,
             video_track: None,
             game_capture: None,
+            tracked: None,
             audio_running: false,
         };
         let thread =
@@ -276,6 +277,9 @@ struct Actor {
     /// The game whose buffer is held: its window and exe file name. Set when capture starts for a
     /// profiled game, and kept while paused. Only used in Game mode (D31).
     game_capture: Option<GameCapture>,
+    /// The game whose profile is in effect (P4.6). Sticky: other apps don't change it, so the
+    /// buffer keeps the game's window while the user is elsewhere.
+    tracked: Option<Tracked>,
     /// Whether the audio sources are running. Set by `start_audio`, cleared by `stop_capture`.
     audio_running: bool,
 }
@@ -285,6 +289,15 @@ struct GameCapture {
     hwnd: isize,
     exe: String,
 }
+
+/// The game with a profile in effect: its process, and its exe file name.
+struct Tracked {
+    pid: u32,
+    exe: String,
+}
+
+/// How many recently focused games without a profile the status keeps.
+const RECENT_GAMES: usize = 8;
 
 /// The window that took focus, as a foreground change reports it.
 #[derive(Clone, Copy, Debug)]
@@ -399,16 +412,21 @@ fn bindings(settings: &Settings) -> Vec<Binding<HotkeyAction>> {
 /// profile asks for (DESIGN §7). With the DVR off, both rings are zero bytes, which
 /// `DvrBuffer` treats as off.
 fn dvr_config(settings: &Settings, total_mib: Option<u64>) -> (DvrConfig, WindowClamp) {
-    let max_video_bps = u64::from(settings.video.max_bitrate_kbps) * 1_000;
     let ram = effective_ram_ceiling(settings.dvr.ram_ceiling_mib, total_mib);
     let clamp = clamp_for(settings, &settings.profiles.default, ram.mib);
     let config = if settings.dvr.enabled {
-        let audio_bps = u64::from(settings.audio.bitrate_kbps) * 1_000;
-        DvrConfig::for_window(clamp.window, max_video_bps, audio_bps)
+        dvr_for(settings, clamp.window)
     } else {
         DvrConfig { video_bytes: 0, audio_bytes: 0 }
     };
     (config, clamp)
+}
+
+/// The DVR rings for a `window` at the bitrates in these settings.
+fn dvr_for(settings: &Settings, window: Hns) -> DvrConfig {
+    let max_video_bps = u64::from(settings.video.max_bitrate_kbps) * 1_000;
+    let audio_bps = u64::from(settings.audio.bitrate_kbps) * 1_000;
+    DvrConfig::for_window(window, max_video_bps, audio_bps)
 }
 
 /// The DVR window a profile asks for, limited by the effective RAM ceiling (`ram_ceiling_mib`, the
@@ -486,7 +504,7 @@ fn save_clip_file(
 impl Actor {
     fn run(mut self, rx: &Receiver<Msg>) {
         tracing::info!(output_dir = %self.output_dir.display(), "engine started");
-        self.update_window();
+        self.reapply_profile();
         self.detect_drive();
         // Before the sources start: pinning holds the recorder lock while Windows commits the
         // whole buffer, which would stall the encoder and audio threads if they were running.
@@ -533,18 +551,16 @@ impl Actor {
         }
     }
 
-    /// Works out the DVR window the settings ask for after the RAM ceiling, and warns if
-    /// the ceiling cut it. The buffer itself keeps the size it was allocated with.
-    fn update_window(&mut self) {
-        // In Game mode the buffer belongs to the game last captured, so its profile sets the window.
-        let profile = match (self.settings.video.capture_mode, &self.game_capture) {
-            (CaptureMode::Game, Some(game)) => {
-                self.settings.profiles.find(&game.exe).unwrap_or(&self.settings.profiles.default)
-            }
-            _ => &self.settings.profiles.default,
-        };
+    /// Makes `profile` the one in effect: the DVR window is the profile's, limited by the RAM
+    /// ceiling. A window that changed resizes the buffer (D21). `announce` says a game took focus,
+    /// so the UI hears about it. A settings change re-applies quietly. The status keeps the active
+    /// window, so there is only one copy of it to go stale.
+    fn apply_profile(&mut self, profile: &GameProfile, exe: &str, announce: bool) {
         let ram = effective_ram_ceiling(self.settings.dvr.ram_ceiling_mib, self.total_mib);
         let clamp = clamp_for(&self.settings, profile, ram.mib);
+        if clamp.window != self.status.buffer_window && self.settings.dvr.enabled {
+            self.recorder.resize(dvr_for(&self.settings, clamp.window));
+        }
         self.status.buffer_window = clamp.window;
         if clamp.clamped {
             let source = if ram.from_system_ram { ", set from your system RAM," } else { "" };
@@ -554,6 +570,64 @@ impl Actor {
                 clamp.window.as_secs_f64(),
             )));
         }
+        if announce {
+            self.emit(EngineEvent::ProfileApplied {
+                exe: exe.to_owned(),
+                window: clamp.window,
+                clamped: clamp.clamped,
+            });
+        }
+    }
+
+    /// Applies the tracked game's profile again after the settings changed, or the default when no
+    /// game is tracked or its profile was removed.
+    fn reapply_profile(&mut self) {
+        let profile = self
+            .tracked
+            .as_ref()
+            .and_then(|tracked| self.settings.profiles.find(&tracked.exe))
+            .unwrap_or(&self.settings.profiles.default)
+            .clone();
+        self.apply_profile(&profile, "", false);
+    }
+
+    /// Handles a focus change for profiles (P4.6). A profiled game becomes the tracked game: its
+    /// profile applies, and its process gets the input watch and the game audio. Any other app
+    /// keeps the current profile (sticky, D33), so alt-tabbing to Discord or opening Task Manager
+    /// can't shrink the buffer before a crash rescue. Such an app is listed as a recent game
+    /// instead.
+    fn on_profile_focus(&mut self, pid: u32, exe: &str) {
+        let name = exe_name(exe);
+        let Some(profile) = self.settings.profiles.find(exe).cloned() else {
+            let is_tracked =
+                self.tracked.as_ref().is_some_and(|t| t.exe.eq_ignore_ascii_case(name));
+            if !name.is_empty() && !is_shell(exe) && !is_tracked && pid != std::process::id() {
+                self.remember_recent(name);
+            }
+            return;
+        };
+        if self.tracked.as_ref().is_some_and(|tracked| tracked.pid == pid) {
+            return;
+        }
+        self.tracked = Some(Tracked { pid, exe: name.to_owned() });
+        if let Some(input) = self.ports.input.as_mut()
+            && let Err(error) = input.watch_process(pid)
+        {
+            tracing::warn!(pid, %error, "couldn't watch the game's process");
+        }
+        if let Some(audio) = self.ports.game_audio.as_mut() {
+            audio.set_target_process(Some(pid));
+        }
+        self.apply_profile(&profile, name, true);
+    }
+
+    /// Moves `exe` to the front of the recent games, dropping an older entry for it, and keeps
+    /// the newest [`RECENT_GAMES`].
+    fn remember_recent(&mut self, exe: &str) {
+        let recent = &mut self.status.recent_games;
+        recent.retain(|game| !game.eq_ignore_ascii_case(exe));
+        recent.insert(0, exe.to_owned());
+        recent.truncate(RECENT_GAMES);
     }
 
     /// Asks the drive probe whether the output folder is on a spinning disk, which sets the
@@ -827,7 +901,6 @@ impl Actor {
                 let exe = exe_name(focus.exe).to_owned();
                 tracing::info!(exe, hwnd, clear_buffer, "capturing the game window");
                 self.game_capture = Some(GameCapture { hwnd, exe });
-                self.update_window();
                 self.start_capture(CaptureTarget::Window(hwnd));
             }
         }
@@ -872,7 +945,7 @@ impl Actor {
                 // Phase 4: also re-size the DVR buffer. Until then it keeps its startup size.
                 let video_changed = self.settings.video != settings.video;
                 self.settings = *settings;
-                self.update_window();
+                self.reapply_profile();
                 self.hotkeys = ChordMatcher::new(bindings(&self.settings));
                 // Switching modes must never leave the push-to-talk gate open.
                 if let Some(mic) = self.ports.mic.as_mut() {
@@ -1130,15 +1203,10 @@ impl Actor {
             }
             OsEvent::Foreground { pid, hwnd, exe } => {
                 tracing::debug!(pid, exe, "foreground changed");
-                // The shell makes no sound: clicking the taskbar mid-game must not retarget
-                // the game's audio track away from the game.
-                if !is_shell(&exe)
-                    && let Some(game) = self.ports.game_audio.as_mut()
-                {
-                    game.set_target_process(Some(pid));
-                }
+                self.on_profile_focus(pid, &exe);
                 self.on_capture_focus(Focus { pid, hwnd, exe: &exe });
-                self.status.game = Some(exe);
+                // The status holds the file name, not the full path (P4.6).
+                self.status.game = Some(exe_name(&exe).to_owned());
                 self.publish_status();
             }
             // P4.7 implements the crash rescue that acts on this.
@@ -1723,7 +1791,7 @@ mod tests {
     }
 
     #[test]
-    fn game_audio_starts_and_follows_focus() {
+    fn game_audio_follows_the_tracked_game_only() {
         let (input, game) = (FakeInput::default(), FakeAudio::default());
         let ports = Ports {
             input: Some(Box::new(input.clone())),
@@ -1734,16 +1802,14 @@ mod tests {
         let (engine, _) = spawn_in(screen_settings(), ports);
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
         let emit = input.0.lock().unwrap().clone().expect("input started");
-        emit(OsEvent::Foreground { pid: 42, hwnd: 100, exe: r"C:\Games\game.exe".into() });
-        // Clicking the taskbar focuses explorer.exe, which must not take the audio.
+        emit(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into() });
+        // Clicking the taskbar and alt-tabbing to an app without a profile must not take the audio.
         emit(OsEvent::Foreground { pid: 7, hwnd: 200, exe: r"C:\Windows\Explorer.EXE".into() });
-        wait_for(
-            &engine,
-            |e| matches!(e, EngineEvent::Status(s) if s.game.as_deref() == Some(r"C:\Windows\Explorer.EXE")),
-        );
+        emit(OsEvent::Foreground { pid: 9, hwnd: 300, exe: DISCORD.into() });
+        wait_for_focus(&engine, "Discord.exe", false);
         let state = game.0.lock().unwrap();
         assert_eq!(state.0, 1, "started once");
-        assert_eq!(state.1, [Some(42)]);
+        assert_eq!(state.1, [Some(42)], "set once, for the game");
     }
 
     #[test]
@@ -1758,12 +1824,86 @@ mod tests {
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.game.is_some()));
     }
 
-    /// Waits until the status names `exe` as the focused app, with capture `capturing`. That status
-    /// is published after the focus change is handled.
+    /// Starts an engine in Screen mode with a synthetic input, and returns the input too.
+    fn spawn_with_input(settings: Settings) -> (EngineHandle, SyntheticInput) {
+        let input = SyntheticInput::default();
+        let ports = Ports { input: Some(Box::new(input.clone())), ..Ports::default() };
+        let (engine, _) = spawn_in(settings, ports);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        (engine, input)
+    }
+
+    #[test]
+    fn foreground_game_applies_its_profile() {
+        let (engine, input) = spawn_with_input(screen_settings());
+        input.inject(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into() });
+        let EngineEvent::ProfileApplied { exe, window, clamped } =
+            wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!((exe.as_str(), window, clamped), ("cs2.exe", Hns::from_secs(120), false));
+        assert_eq!(input.watched(), [42], "the game's process is watched");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn unknown_apps_keep_the_current_profile() {
+        let (engine, input) = spawn_with_input(screen_settings());
+        input.inject(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into() });
+        wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }));
+        input.inject(OsEvent::Foreground {
+            pid: 9,
+            hwnd: 300,
+            exe: r"C:\Windows\notepad.exe".into(),
+        });
+        // Collect what the engine says up to the status for the new focus.
+        let mut events = Vec::new();
+        loop {
+            let event = engine.wait_event(TIMEOUT).expect("timed out waiting for an event");
+            let done = matches!(&event, EngineEvent::Status(s) if s.game.as_deref() == Some("notepad.exe"));
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        assert!(
+            !events.iter().any(|e| matches!(e, EngineEvent::ProfileApplied { .. })),
+            "an unknown app must not change the profile"
+        );
+        let EngineEvent::Status(status) = events.pop().expect("the status") else { unreachable!() };
+        assert_eq!(status.buffer_window, Hns::from_secs(120), "the game's window stays");
+        assert_eq!(status.recent_games, ["notepad.exe"]);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn profile_window_is_clamped_to_the_ram_ceiling() {
+        let mut settings = screen_settings();
+        settings.dvr.ram_ceiling_mib = 64;
+        let max_video_bps = u64::from(settings.video.max_bitrate_kbps) * 1_000;
+        let (engine, input) = spawn_with_input(settings);
+        input.inject(OsEvent::Foreground {
+            pid: 42,
+            hwnd: 100,
+            exe: r"C:\Games\RainbowSix.exe".into(),
+        });
+        let EngineEvent::ProfileApplied { window, clamped, .. } =
+            wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }))
+        else {
+            unreachable!()
+        };
+        assert!(clamped, "5 min at this bitrate doesn't fit in 64 MiB");
+        assert_eq!(window, clamp_window(Hns::from_secs(300), max_video_bps, 64 << 20).window);
+        engine.shutdown();
+    }
+
+    /// Waits until the status names `exe` (by file name) as the focused app, with capture
+    /// `capturing`. That status is published after the focus change is handled.
     fn wait_for_focus(engine: &EngineHandle, exe: &str, capturing: bool) {
         wait_for(engine, |e| {
             matches!(e, EngineEvent::Status(s)
-                if s.game.as_deref() == Some(exe) && s.capturing == capturing)
+                if s.game.as_deref() == Some(exe_name(exe)) && s.capturing == capturing)
         });
     }
 
