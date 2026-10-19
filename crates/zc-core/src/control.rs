@@ -65,6 +65,16 @@ pub enum EngineEvent {
         /// Whether the window was reduced to respect the RAM ceiling.
         clamped: bool,
     },
+    /// The tracked game died unexpectedly. The DVR buffer was dumped to `path`; the user
+    /// should be asked whether to keep or discard it.
+    RecoveryReady {
+        /// The rescued clip.
+        path: PathBuf,
+        /// Executable of the game that died.
+        game: String,
+        /// How much footage the rescue holds.
+        duration: Hns,
+    },
     /// Something the user should know about, but not an error.
     Warning(String),
     /// Something failed.
@@ -110,4 +120,7 @@ pub struct EngineStatus {
     pub watchdog: WatchdogState,
     /// Executable of the focused game, if any.
     pub game: Option<String>,
+    /// Executable file names that had focus recently and have no profile, newest first,
+    /// at most 8.
+    pub recent_games: Vec<String>,
 }

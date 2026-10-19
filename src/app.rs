@@ -176,6 +176,13 @@ impl ZeroClipApp {
                         format!("{exe}: keeping the last {}{note}", ui::human_duration(window)),
                     );
                 }
+                // P4.12 replaces this notice with the keep-or-discard prompt.
+                EngineEvent::RecoveryReady { path, .. } => {
+                    self.notify(
+                        NoticeLevel::Warning,
+                        format!("Rescued footage: {}", path.display()),
+                    );
+                }
                 EngineEvent::Warning(text) => self.notify(NoticeLevel::Warning, text),
                 EngineEvent::Error(text) => self.notify(NoticeLevel::Error, text),
                 EngineEvent::NotImplemented { feature, phase } => self.notify(
