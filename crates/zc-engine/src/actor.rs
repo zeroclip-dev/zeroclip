@@ -16,9 +16,11 @@ use zc_core::hotkey::{Binding, ChordMatcher, HotkeyEvent, Trigger};
 use zc_core::media::{TrackId, TrackInfo, TrackKind};
 use zc_core::ports::{
     AudioSource, AudioStart, CaptureTarget, Emit, InputSource, LockMemory, OsEvent, SeekPenalty,
-    SourceError, VideoSource, VideoStart,
+    SourceError, TotalMemory, VideoSource, VideoStart,
 };
-use zc_core::profile::{GameProfile, ProfileSet, WindowClamp, clamp_window, exe_name};
+use zc_core::profile::{
+    GameProfile, ProfileSet, WindowClamp, clamp_window, effective_ram_ceiling, exe_name,
+};
 use zc_core::settings::{CaptureMode, MicMode, Settings};
 use zc_core::sink::{SharedSink, SinkId};
 use zc_core::watchdog::HealthEvent;
@@ -52,6 +54,9 @@ pub struct Ports {
     pub seek_penalty: Option<SeekPenalty>,
     /// Pins the DVR rings in RAM (`zc-win`, P3.25). Without it the rings can be paged out.
     pub lock_memory: Option<LockMemory>,
+    /// Reports the machine's physical RAM (`zc-win`, P4.20). Without it the settings' RAM ceiling
+    /// stands unchanged (D32).
+    pub total_memory: Option<TotalMemory>,
 }
 
 impl fmt::Debug for Ports {
@@ -65,6 +70,7 @@ impl fmt::Debug for Ports {
             .field("input", &self.input.is_some())
             .field("seek_penalty", &self.seek_penalty.is_some())
             .field("lock_memory", &self.lock_memory.is_some())
+            .field("total_memory", &self.total_memory.is_some())
             .finish()
     }
 }
@@ -109,8 +115,11 @@ impl Engine {
     ) -> Result<EngineHandle, EngineError> {
         let (inbox, rx) = mpsc::channel();
         let (events_tx, events) = mpsc::channel();
-        let (dvr, _) = dvr_config(&config.settings);
+        // Read once: the machine's RAM doesn't change while the engine runs.
+        let total_mib = ports.total_memory.and_then(|total| total());
+        let (dvr, _) = dvr_config(&config.settings, total_mib);
         let actor = Actor {
+            total_mib,
             output_dir: config
                 .settings
                 .recording
@@ -231,6 +240,8 @@ const MASTER_CATCH_UP: Duration = Duration::from_millis(300);
 /// State owned by the engine thread.
 struct Actor {
     settings: Settings,
+    /// The machine's physical RAM in MiB, if the port could read it (D32).
+    total_mib: Option<u64>,
     output_dir: PathBuf,
     ports: Ports,
     /// Our own inbox, for the emitters handed to sources.
@@ -387,9 +398,10 @@ fn bindings(settings: &Settings) -> Vec<Binding<HotkeyAction>> {
 /// Sizes the DVR for these settings, and says how the RAM ceiling clamped the window the
 /// profile asks for (DESIGN §7). With the DVR off, both rings are zero bytes, which
 /// `DvrBuffer` treats as off.
-fn dvr_config(settings: &Settings) -> (DvrConfig, WindowClamp) {
+fn dvr_config(settings: &Settings, total_mib: Option<u64>) -> (DvrConfig, WindowClamp) {
     let max_video_bps = u64::from(settings.video.max_bitrate_kbps) * 1_000;
-    let clamp = clamp_for(settings, &settings.profiles.default);
+    let ram = effective_ram_ceiling(settings.dvr.ram_ceiling_mib, total_mib);
+    let clamp = clamp_for(settings, &settings.profiles.default, ram.mib);
     let config = if settings.dvr.enabled {
         let audio_bps = u64::from(settings.audio.bitrate_kbps) * 1_000;
         DvrConfig::for_window(clamp.window, max_video_bps, audio_bps)
@@ -399,10 +411,11 @@ fn dvr_config(settings: &Settings) -> (DvrConfig, WindowClamp) {
     (config, clamp)
 }
 
-/// The DVR window a profile asks for, limited by the RAM ceiling at the video bitrate.
-fn clamp_for(settings: &Settings, profile: &GameProfile) -> WindowClamp {
+/// The DVR window a profile asks for, limited by the effective RAM ceiling (`ram_ceiling_mib`, the
+/// output of [`effective_ram_ceiling`]) at the video bitrate.
+fn clamp_for(settings: &Settings, profile: &GameProfile, ram_ceiling_mib: u32) -> WindowClamp {
     let max_video_bps = u64::from(settings.video.max_bitrate_kbps) * 1_000;
-    let ram_ceiling = u64::from(settings.dvr.ram_ceiling_mib) << 20;
+    let ram_ceiling = u64::from(ram_ceiling_mib) << 20;
     clamp_window(profile.buffer(), max_video_bps, ram_ceiling)
 }
 
@@ -530,12 +543,14 @@ impl Actor {
             }
             _ => &self.settings.profiles.default,
         };
-        let clamp = clamp_for(&self.settings, profile);
+        let ram = effective_ram_ceiling(self.settings.dvr.ram_ceiling_mib, self.total_mib);
+        let clamp = clamp_for(&self.settings, profile, ram.mib);
         self.status.buffer_window = clamp.window;
         if clamp.clamped {
+            let source = if ram.from_system_ram { ", set from available RAM," } else { "" };
             self.emit(EngineEvent::Warning(format!(
-                "The {} MiB DVR memory limit cuts the buffer to {:.0} s.",
-                self.settings.dvr.ram_ceiling_mib,
+                "The {} MiB DVR memory limit{source} cuts the buffer to {:.0} s.",
+                ram.mib,
                 clamp.window.as_secs_f64(),
             )));
         }
@@ -1898,13 +1913,24 @@ mod tests {
         let mut settings = Settings::default();
         settings.profiles.default.buffer_secs = 600;
         settings.dvr.ram_ceiling_mib = 64;
-        let (config, clamp) = dvr_config(&settings);
+        let (config, clamp) = dvr_config(&settings, None);
         assert!(clamp.clamped);
         assert_eq!(config, DvrConfig::for_window(clamp.window, 20_000_000, 192_000));
 
         settings.dvr.enabled = false;
-        let (config, _) = dvr_config(&settings);
+        let (config, _) = dvr_config(&settings, None);
         assert_eq!(config, DvrConfig { video_bytes: 0, audio_bytes: 0 });
+    }
+
+    #[test]
+    fn the_system_ram_share_caps_the_window_when_it_is_smaller() {
+        // 4 GiB of RAM: the 5% share (204 MiB) is under the 1024 MiB setting, so a 10 min window
+        // at 20 Mbps (1500 MB) is cut to what 204 MiB holds.
+        let mut settings = Settings::default();
+        settings.profiles.default.buffer_secs = 600;
+        let (_, clamp) = dvr_config(&settings, Some(4_096));
+        assert!(clamp.clamped);
+        assert_eq!(clamp.window, clamp_window(Hns::from_secs(600), 20_000_000, 204 << 20).window);
     }
 
     #[test]

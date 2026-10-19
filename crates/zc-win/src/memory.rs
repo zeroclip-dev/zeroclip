@@ -16,6 +16,7 @@ use std::ptr;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Memory::{VirtualLock, VirtualUnlock};
+use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetProcessWorkingSetSize, SetProcessWorkingSetSize,
 };
@@ -76,6 +77,23 @@ pub fn lock(region: &[u8]) -> Result<PageLock, SourceError> {
     Ok(PageLock { ptr, len: region.len() })
 }
 
+/// This machine's physical RAM in MiB, or `None` if Windows doesn't say. The engine caps the DVR's
+/// RAM ceiling at a share of it (D32).
+///
+/// Reads `ullTotalPhys` from
+/// [`GlobalMemoryStatusEx`](https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-globalmemorystatusex).
+#[must_use]
+pub fn total_physical_mib() -> Option<u64> {
+    let mut status = MEMORYSTATUSEX {
+        dwLength: u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).ok()?,
+        ..MEMORYSTATUSEX::default()
+    };
+    // SAFETY: `status` is a live local for the whole call, and `dwLength` holds its size, which is
+    // the only field the API reads before it writes the struct.
+    unsafe { GlobalMemoryStatusEx(&raw mut status) }.ok()?;
+    Some(status.ullTotalPhys >> 20)
+}
+
 /// The working-set raise a region of `len` bytes needs.
 fn raise_for(len: usize) -> usize {
     len.saturating_add(PAGE_SLACK)
@@ -131,5 +149,11 @@ mod tests {
         let pin = lock(&buf).expect("a 1 MiB buffer should lock");
         drop(pin);
         assert_eq!(working_set().expect("query the working set"), before);
+    }
+
+    #[test]
+    fn total_memory_is_reported() {
+        let mib = total_physical_mib().expect("Windows reports physical memory");
+        assert!(mib >= 256, "{mib} MiB is implausibly little RAM");
     }
 }

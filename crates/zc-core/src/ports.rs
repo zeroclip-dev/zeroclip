@@ -198,3 +198,7 @@ pub type SeekPenalty = fn(&Path) -> Result<Option<bool>, SourceError>;
 /// keeps the region pinned, and dropping it unpins the region. The engine calls this on the DVR
 /// rings, so the guard must be dropped before the memory is freed.
 pub type LockMemory = fn(&[u8]) -> Result<Box<dyn Send>, SourceError>;
+
+/// Reports this machine's physical RAM in MiB (`zc-win`, P4.20). `None` means the OS didn't say.
+/// The engine caps the DVR's RAM ceiling at a share of it (D32).
+pub type TotalMemory = fn() -> Option<u64>;
