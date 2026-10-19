@@ -117,5 +117,5 @@ and P5.14.
 ## Portfolio polish (any time)
 
 - [ ] Publish the repo; add the CI badge to the README
-- [ ] GitHub Sponsors (`.github/FUNDING.yml`) — ten minutes, no downside
+- [x] GitHub Sponsors (`.github/FUNDING.yml`) — ten minutes, no downside
 - [ ] Screenshots / a short GIF of saving a clip
