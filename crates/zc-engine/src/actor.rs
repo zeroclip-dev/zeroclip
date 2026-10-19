@@ -547,7 +547,7 @@ impl Actor {
         let clamp = clamp_for(&self.settings, profile, ram.mib);
         self.status.buffer_window = clamp.window;
         if clamp.clamped {
-            let source = if ram.from_system_ram { ", set from available RAM," } else { "" };
+            let source = if ram.from_system_ram { ", set from your system RAM," } else { "" };
             self.emit(EngineEvent::Warning(format!(
                 "The {} MiB DVR memory limit{source} cuts the buffer to {:.0} s.",
                 ram.mib,
