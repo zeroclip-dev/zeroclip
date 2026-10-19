@@ -175,6 +175,15 @@ pub enum OsEvent {
         /// Full path of its executable.
         exe: String,
     },
+    /// A process passed to [`InputSource::watch_process`] ended. `exit_code` is
+    /// `GetExitCodeProcess`'s value: 0 is a clean quit; Task Manager and `taskkill` give 1;
+    /// a crash gives an NTSTATUS such as `0xC0000005`.
+    ProcessExited {
+        /// The process that ended.
+        pid: u32,
+        /// Its exit code.
+        exit_code: u32,
+    },
 }
 
 /// The OS input thread: Raw Input hotkeys plus foreground tracking (DESIGN §7, §8).
@@ -187,6 +196,16 @@ pub trait InputSource: Send {
 
     /// Stops the input thread. Idempotent.
     fn stop(&mut self);
+
+    /// Reports [`OsEvent::ProcessExited`] when `pid` ends (crash rescue, DESIGN §8).
+    /// Default: ignored.
+    ///
+    /// # Errors
+    /// See [`SourceError`].
+    fn watch_process(&mut self, pid: u32) -> Result<(), SourceError> {
+        let _ = pid;
+        Ok(())
+    }
 }
 
 /// The drive-type probe the app injects: whether the drive holding a path has a seek penalty,

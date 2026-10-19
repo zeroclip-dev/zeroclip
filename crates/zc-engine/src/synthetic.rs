@@ -6,14 +6,15 @@
 //! lets the recording modes and the watchdog be tested deterministically, on any
 //! OS, instead of by hoping a real crash happens while you're watching.
 
+use std::fmt;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use zc_core::media::{Codec, TrackId, TrackInfo, TrackKind};
-use zc_core::ports::{Emit, SourceError, VideoSource, VideoStart};
+use zc_core::ports::{Emit, InputSource, OsEvent, SourceError, VideoSource, VideoStart};
 use zc_core::sink::SharedSink;
 use zc_core::testing::SyntheticStream;
 use zc_core::watchdog::HealthEvent;
@@ -171,10 +172,65 @@ impl VideoSource for SyntheticVideoSource {
     }
 }
 
+/// A fake OS input thread (DESIGN §12): the test injects [`OsEvent`]s the way Raw Input and
+/// the foreground hook would. Clones share state, so the test keeps one clone and gives the
+/// engine another.
+#[derive(Clone, Default)]
+pub struct SyntheticInput {
+    /// The engine's emitter, set by `start` and cleared by `stop`.
+    emit: Arc<Mutex<Option<Emit<OsEvent>>>>,
+    /// Pids passed to `watch_process`, in order.
+    watched: Arc<Mutex<Vec<u32>>>,
+}
+
+impl SyntheticInput {
+    /// Sends `event` to the engine as if the OS had produced it. Returns `false` if the
+    /// source isn't started.
+    pub fn inject(&self, event: OsEvent) -> bool {
+        // Clone the emitter out, so the lock isn't held while the engine handles the event.
+        let emit = self.emit.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        match emit {
+            Some(emit) => {
+                emit(event);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The pids passed to `watch_process` so far, in order.
+    #[must_use]
+    pub fn watched(&self) -> Vec<u32> {
+        self.watched.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+}
+
+impl InputSource for SyntheticInput {
+    fn start(&mut self, events: Emit<OsEvent>) -> Result<(), SourceError> {
+        *self.emit.lock().unwrap_or_else(PoisonError::into_inner) = Some(events);
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        *self.emit.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    fn watch_process(&mut self, pid: u32) -> Result<(), SourceError> {
+        self.watched.lock().unwrap_or_else(PoisonError::into_inner).push(pid);
+        Ok(())
+    }
+}
+
+// Manual, because the emitter is a closure and has no `Debug`.
+impl fmt::Debug for SyntheticInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SyntheticInput").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicU32;
-    use std::sync::{Mutex, PoisonError};
     use std::time::Duration;
 
     use zc_core::media::PacketRef;

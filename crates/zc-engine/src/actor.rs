@@ -1141,6 +1141,10 @@ impl Actor {
                 self.status.game = Some(exe);
                 self.publish_status();
             }
+            // P4.7 implements the crash rescue that acts on this.
+            OsEvent::ProcessExited { pid, exit_code } => {
+                tracing::debug!(pid, exit_code, "process exited");
+            }
         }
     }
 
@@ -1188,7 +1192,7 @@ mod tests {
 
     use zc_core::hotkey::Key;
 
-    use crate::synthetic::SyntheticVideoSource;
+    use crate::synthetic::{SyntheticInput, SyntheticVideoSource};
 
     use super::*;
 
@@ -1740,6 +1744,18 @@ mod tests {
         let state = game.0.lock().unwrap();
         assert_eq!(state.0, 1, "started once");
         assert_eq!(state.1, [Some(42)]);
+    }
+
+    #[test]
+    fn synthetic_input_reaches_the_engine() {
+        let input = SyntheticInput::default();
+        let ports = Ports { input: Some(Box::new(input.clone())), ..Ports::default() };
+        let (engine, _) = spawn(ports);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        let injected =
+            input.inject(OsEvent::Foreground { pid: 1, hwnd: 1, exe: r"C:\x\cs2.exe".into() });
+        assert!(injected, "the engine started the input source");
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.game.is_some()));
     }
 
     /// Waits until the status names `exe` as the focused app, with capture `capturing`. That status
