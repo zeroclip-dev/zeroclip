@@ -77,7 +77,7 @@ Measured 2026-10-05 with `spike-phase2`: every track within ±11 ms of its minut
 
 - [x] Specs: `Watchdog::on_event`, `ProfileSet`, `clamp_window` (`clamp_window` done early, in Phase 3: P3.16)
 - [x] `zc-store` (rusqlite, bundled) and the migrations
-- [ ] Profile engine on foreground change, with safe buffer resizing
+- [x] Profile engine on foreground change, with safe buffer resizing
 - [ ] Watchdog wiring and the `synthetic_harness` recovery spec; crash rescue (`recovery.tmp` + prompt)
 - [ ] Flight recorder: in-memory ring of recent events, dumped with crash rescue
 - [ ] System tray; close-to-tray; start with Windows
