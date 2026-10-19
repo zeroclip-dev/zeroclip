@@ -99,6 +99,13 @@ pub fn dvr_megabytes(secs: u32, max_kbps: u32) -> u64 {
     u64::from(max_kbps) * 1_000 / 8 * u64::from(secs) / 1_000_000
 }
 
+/// The DVR memory limit the engine really runs under: the setting, capped at a share of this
+/// machine's RAM (D32, P4.20). The engine and the UI must agree on it, or the Profiles tab shows
+/// windows the engine then cuts.
+pub fn effective_ceiling(setting_mib: u32) -> zc_core::profile::RamCeiling {
+    zc_core::profile::effective_ram_ceiling(setting_mib, zc_win::memory::total_physical_mib())
+}
+
 pub fn notice_color(level: NoticeLevel) -> Color32 {
     match level {
         NoticeLevel::Info => Color32::GRAY,

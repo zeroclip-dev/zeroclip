@@ -12,8 +12,11 @@ use zc_engine::{Engine, EngineConfig, EngineHandle, Ports};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The output folder [`engine_with`] uses, under the temp dir.
-const HARNESS_DIR: &str = "zeroclip-harness";
+/// The output folder [`engine_with`] uses, under the temp dir. It carries the process id so two
+/// test runs at once (another `cargo test`, a second worktree) never delete each other's clips.
+fn harness_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("zeroclip-harness-{}", std::process::id()))
+}
 
 /// The default settings in Screen mode: these specs drive a synthetic screen, not a game.
 fn screen_settings() -> Settings {
@@ -23,10 +26,7 @@ fn screen_settings() -> Settings {
 }
 
 fn engine_with(video: SyntheticVideoSource) -> EngineHandle {
-    let config = EngineConfig {
-        settings: screen_settings(),
-        default_output_dir: std::env::temp_dir().join(HARNESS_DIR),
-    };
+    let config = EngineConfig { settings: screen_settings(), default_output_dir: harness_dir() };
     let ports = Ports { video: Some(Box::new(video)), ..Ports::default() };
     Engine::spawn(config, ports, Arc::new(|()| {})).expect("spawn")
 }
@@ -52,7 +52,7 @@ impl Drop for ScratchDir {
 
 #[test]
 fn saving_a_clip_writes_a_file() {
-    let _scratch = ScratchDir(std::env::temp_dir().join(HARNESS_DIR));
+    let _scratch = ScratchDir(harness_dir());
     let engine = engine_with(SyntheticVideoSource::new().realtime(true));
     std::thread::sleep(Duration::from_secs(3));
     engine.send(Command::SaveClip).unwrap();

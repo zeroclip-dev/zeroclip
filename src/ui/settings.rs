@@ -242,6 +242,13 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
                 ui.label("Memory limit");
                 ui.add(DragValue::new(&mut dvr.ram_ceiling_mib).range(64..=16_384).suffix(" MiB"));
             });
+            let ceiling = super::effective_ceiling(dvr.ram_ceiling_mib);
+            if ceiling.from_system_ram {
+                ui.weak(format!(
+                    "Your RAM caps this at {} MiB (5% of the total), so that is the limit in use.",
+                    ceiling.mib
+                ));
+            }
             ui.weak(format!(
                 "Buffer length is set per game on the Profiles tab. The default ({}) needs about {} MB at the maximum bitrate.",
                 human_duration(window),
