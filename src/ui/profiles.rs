@@ -20,7 +20,9 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
     ui.add_space(8.0);
 
     let max_kbps = app.draft.settings.video.max_bitrate_kbps;
-    let ceiling_mb = u64::from(app.draft.settings.dvr.ram_ceiling_mib) * 1_048_576 / 1_000_000;
+    let ceiling_mb =
+        u64::from(super::effective_ceiling(app.draft.settings.dvr.ram_ceiling_mib).mib) * 1_048_576
+            / 1_000_000;
     let profiles = &mut app.draft.settings.profiles;
     let tracks = &mut app.draft.settings.audio.app_tracks;
     let open_apps_list = &mut app.open_apps;
