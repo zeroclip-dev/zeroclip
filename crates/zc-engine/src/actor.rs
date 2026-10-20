@@ -294,6 +294,12 @@ struct GameCapture {
 struct Tracked {
     pid: u32,
     exe: String,
+    /// The tee slot of the session recording this game's profile started (P4.7). Kept so the
+    /// game's exit stops that recording, and not a manual one the user started after stopping it.
+    session: Option<SinkId>,
+    /// The profile wants a session but the recording slot was still finishing the previous
+    /// session's file; [`Engine::on_recording_ended`] starts it once the slot is free.
+    session_pending: bool,
 }
 
 /// How many recently focused games without a profile the status keeps.
@@ -596,7 +602,10 @@ impl Actor {
     /// keeps the current profile (sticky, D33), so alt-tabbing to Discord or opening Task Manager
     /// can't shrink the buffer before a crash rescue. Such an app is listed as a recent game
     /// instead.
-    fn on_profile_focus(&mut self, pid: u32, exe: &str) {
+    ///
+    /// Returns whether this focus started tracking a game, so the caller can start its session
+    /// recording once capture is running.
+    fn on_profile_focus(&mut self, pid: u32, exe: &str) -> bool {
         let name = exe_name(exe);
         let Some(profile) = self.settings.profiles.find(exe).cloned() else {
             let is_tracked =
@@ -604,12 +613,16 @@ impl Actor {
             if !name.is_empty() && !is_shell(exe) && !is_tracked && pid != std::process::id() {
                 self.remember_recent(name);
             }
-            return;
+            return false;
         };
         if self.tracked.as_ref().is_some_and(|tracked| tracked.pid == pid) {
-            return;
+            return false;
         }
-        self.tracked = Some(Tracked { pid, exe: name.to_owned() });
+        // The previous game's session ends with its tracking: only the tracked game's exit is
+        // acted on, so nothing else would ever stop it.
+        self.stop_session();
+        self.tracked =
+            Some(Tracked { pid, exe: name.to_owned(), session: None, session_pending: false });
         if let Some(input) = self.ports.input.as_mut()
             && let Err(error) = input.watch_process(pid)
         {
@@ -619,6 +632,69 @@ impl Actor {
             audio.set_target_process(Some(pid));
         }
         self.apply_profile(&profile, name, true);
+        true
+    }
+
+    /// Starts the tracked game's session recording when its profile asks for one (P4.7, formerly
+    /// P3.26). It takes the one recording slot (D20), so it gets the same `.partial` + repair
+    /// robustness as a manual recording, and the DVR keeps buffering alongside it. A recording
+    /// already running is left alone: the user started it, so it isn't ours to replace.
+    fn start_session(&mut self) {
+        let Some(tracked) = self.tracked.as_ref() else { return };
+        let wanted = self.settings.profiles.find(&tracked.exe).is_some_and(|p| p.session_recording);
+        if !wanted {
+            return;
+        }
+        if let Some(recording) = self.recording.as_ref() {
+            // `id` is None once a stop was asked for: the file is only being finished, so the
+            // session can start as soon as the slot frees up.
+            if recording.id.is_none() {
+                if let Some(tracked) = self.tracked.as_mut() {
+                    tracked.session_pending = true;
+                }
+            } else {
+                tracing::debug!("session recording skipped: a recording is already running");
+            }
+            return;
+        }
+        self.start_recording("session");
+        let id = self.recording.as_ref().and_then(|recording| recording.id);
+        if let Some(tracked) = self.tracked.as_mut() {
+            tracked.session = id;
+        }
+    }
+
+    /// Stops the tracked game's session recording, if it is still the one running. The IO thread
+    /// finishes the file and reports `RecordingStopped`, as for a manual stop.
+    fn stop_session(&mut self) {
+        let Some(id) = self.tracked.as_mut().and_then(|tracked| tracked.session.take()) else {
+            return;
+        };
+        if self.recording.as_ref().is_some_and(|recording| recording.id == Some(id)) {
+            self.stop_recording();
+        }
+    }
+
+    /// A watched process ended (P4.7). Only the tracked game's exit matters: its session
+    /// recording stops, game audio lets go of its process, and the default profile applies again.
+    /// Any other pid is a game tracked earlier, whose profile has already been replaced.
+    fn on_process_exited(&mut self, pid: u32, exit_code: u32) {
+        if self.tracked.as_ref().is_none_or(|tracked| tracked.pid != pid) {
+            tracing::debug!(pid, exit_code, "an untracked process exited");
+            return;
+        }
+        tracing::info!(pid, exit_code, "the tracked game exited");
+        // P4.11: the crash-rescue dump goes here, before anything below. Reverting to the
+        // default profile can shrink the buffer and drop the footage the rescue exists to save.
+        self.stop_session();
+        if let Some(audio) = self.ports.game_audio.as_mut() {
+            audio.set_target_process(None);
+        }
+        self.tracked = None;
+        self.status.game = None;
+        let default = self.settings.profiles.default.clone();
+        self.apply_profile(&default, "*", false);
+        self.publish_status();
     }
 
     /// Moves `exe` to the front of the recent games, dropping an older entry for it, and keeps
@@ -1083,6 +1159,9 @@ impl Actor {
         }
         self.status.recording = false;
         self.publish_status();
+        if self.tracked.as_mut().is_some_and(|t| std::mem::take(&mut t.session_pending)) {
+            self.start_session();
+        }
         match result {
             Ok((path, duration)) => {
                 tracing::info!(path = %path.display(), "recording saved");
@@ -1203,16 +1282,18 @@ impl Actor {
             }
             OsEvent::Foreground { pid, hwnd, exe } => {
                 tracing::debug!(pid, exe, "foreground changed");
-                self.on_profile_focus(pid, &exe);
+                let newly_tracked = self.on_profile_focus(pid, &exe);
                 self.on_capture_focus(Focus { pid, hwnd, exe: &exe });
+                // After capture focus: in Game mode the encoder starts there, and a recording
+                // needs its video track.
+                if newly_tracked {
+                    self.start_session();
+                }
                 // The status holds the file name, not the full path (P4.6).
                 self.status.game = Some(exe_name(&exe).to_owned());
                 self.publish_status();
             }
-            // P4.7 implements the crash rescue that acts on this.
-            OsEvent::ProcessExited { pid, exit_code } => {
-                tracing::debug!(pid, exit_code, "process exited");
-            }
+            OsEvent::ProcessExited { pid, exit_code } => self.on_process_exited(pid, exit_code),
         }
     }
 
@@ -1898,6 +1979,75 @@ mod tests {
         engine.shutdown();
     }
 
+    #[test]
+    fn game_exit_reverts_to_the_default_window() {
+        let (engine, input) = spawn_with_input(screen_settings());
+        input.inject(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into() });
+        wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }));
+        input.inject(OsEvent::ProcessExited { pid: 42, exit_code: 0 });
+        let EngineEvent::Status(status) =
+            wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.game.is_none()))
+        else {
+            unreachable!()
+        };
+        assert_eq!(status.buffer_window, Hns::from_secs(60), "back to the default profile");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn exit_of_an_untracked_process_is_ignored() {
+        let (engine, input) = spawn_with_input(screen_settings());
+        input.inject(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into() });
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.game.is_some()));
+        input.inject(OsEvent::ProcessExited { pid: 7, exit_code: 1 });
+        // Give cs2 a window no status published so far has, so only a status made after the exit
+        // was handled (one inbox, in order) can show it. It needs cs2 to still be tracked.
+        let mut settings = screen_settings();
+        for game in &mut settings.profiles.games {
+            if game.exe.eq_ignore_ascii_case("cs2.exe") {
+                game.buffer_secs = 150;
+            }
+        }
+        engine.send(Command::ApplySettings(Box::new(settings))).unwrap();
+        let EngineEvent::Status(status) = wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Status(s) if s.buffer_window == Hns::from_secs(150)),
+        ) else {
+            unreachable!()
+        };
+        assert_eq!(status.game.as_deref(), Some("cs2.exe"), "cs2 is still tracked");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn session_profile_records_for_the_life_of_the_game() {
+        let dir = std::env::temp_dir().join(format!("zeroclip-session-{}", std::process::id()));
+        let mut settings = screen_settings();
+        settings.recording.output_dir = Some(dir.clone());
+        let input = SyntheticInput::default();
+        let ports = Ports {
+            video: Some(Box::new(SyntheticVideoSource::new().realtime(true))),
+            input: Some(Box::new(input.clone())),
+            ..Ports::default()
+        };
+        let (engine, _) = spawn_in(settings, ports);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.capturing));
+
+        // cs2's default profile has session recording on.
+        input.inject(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into() });
+        let EngineEvent::RecordingStarted { path } =
+            wait_for(&engine, |e| matches!(e, EngineEvent::RecordingStarted { .. }))
+        else {
+            unreachable!()
+        };
+        assert!(path.to_string_lossy().contains("session"), "{}", path.display());
+
+        input.inject(OsEvent::ProcessExited { pid: 42, exit_code: 0 });
+        wait_for(&engine, |e| matches!(e, EngineEvent::RecordingStopped { .. }));
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Waits until the status names `exe` (by file name) as the focused app, with capture
     /// `capturing`. That status is published after the focus change is handled.
     fn wait_for_focus(engine: &EngineHandle, exe: &str, capturing: bool) {
@@ -1916,7 +2066,10 @@ mod tests {
             video: Some(Box::new(video)),
             ..Ports::default()
         };
-        let (engine, _) = spawn(ports);
+        // No session recording: the fake video pushes nothing, so it would leave an empty file.
+        let mut settings = Settings::default();
+        settings.profiles.games.iter_mut().for_each(|game| game.session_recording = false);
+        let (engine, _) = spawn_in(settings, ports);
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
         assert!(targets.lock().unwrap().is_empty(), "nothing is captured before a game");
 
