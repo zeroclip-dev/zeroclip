@@ -1,17 +1,18 @@
 use std::fmt;
+use std::fs::File;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use time::OffsetDateTime;
 use time::macros::format_description;
 
 use zc_core::control::{Command, EngineEvent, EngineStatus, MicState};
-use zc_core::dvr::{DvrConfig, DvrError};
+use zc_core::dvr::{DvrClip, DvrConfig, DvrError};
 use zc_core::hotkey::{Binding, ChordMatcher, HotkeyEvent, Trigger};
 use zc_core::media::{TrackId, TrackInfo, TrackKind};
 use zc_core::ports::{
@@ -149,6 +150,7 @@ impl Engine {
             video_config: None,
             flushing: false,
             pace_dumps: false,
+            rescue_waiting: None,
         };
         let thread =
             thread::Builder::new().name("zc-engine".into()).spawn(move || actor.run(&rx))?;
@@ -163,8 +165,9 @@ enum Msg {
     Health(HealthEvent),
     /// The recording's IO thread has finished: the saved file and its duration, or why it failed.
     RecordingEnded(io::Result<(PathBuf, Hns)>),
-    /// The clip's IO thread has finished: the saved file and its duration, or why there isn't one.
-    ClipWritten(Result<(PathBuf, Hns), ClipError>),
+    /// The clip's IO thread has finished: which dump it wrote, and the saved file and its
+    /// duration, or why there isn't one.
+    ClipWritten(Dump, Result<(PathBuf, Hns), ClipError>),
 }
 
 /// A handle to a running engine. Dropping it shuts the engine down.
@@ -185,7 +188,7 @@ impl fmt::Debug for Msg {
             Self::Os(e) => write!(f, "Os({e:?})"),
             Self::Health(e) => write!(f, "Health({e:?})"),
             Self::RecordingEnded(result) => write!(f, "RecordingEnded({result:?})"),
-            Self::ClipWritten(result) => write!(f, "ClipWritten({result:?})"),
+            Self::ClipWritten(dump, result) => write!(f, "ClipWritten({dump:?}, {result:?})"),
         }
     }
 }
@@ -298,6 +301,26 @@ struct Actor {
     /// The watchdog saw a slow disk: dumps are paced at the HDD rate whatever the drive probe
     /// said (DESIGN §8: pace the writes, don't re-init).
     pace_dumps: bool,
+    /// A crash rescue that found the dump slot busy (D29). It runs when that dump ends, before a
+    /// flush waiting there too, because the flush ends in RESUMING, which clears the buffer.
+    rescue_waiting: Option<WaitingRescue>,
+}
+
+/// A tracked game that died while another dump was being written: what its rescue needs once the
+/// slot is free (D34).
+struct WaitingRescue {
+    pid: u32,
+    game: String,
+    exit_code: u32,
+}
+
+/// What a clip IO thread writes, which decides what its end reports.
+#[derive(Debug)]
+enum Dump {
+    /// A clip: the user's save, or the watchdog's flush (`Actor::flushing` tells them apart).
+    Clip,
+    /// The tracked game died: its window, rescued to a `recovery-*.tmp` file (P4.11, D34).
+    Rescue { game: String, exit_code: u32 },
 }
 
 /// The game window capture follows, and its exe file name.
@@ -387,11 +410,13 @@ struct ActiveRecording {
 }
 
 /// Why a DVR save produced no clip, as its IO thread reports it.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 enum ClipError {
     /// The DVR buffer holds no video yet.
+    #[error("nothing is buffered yet")]
     NothingBuffered,
     /// The snapshot or the file write failed. The text says why.
+    #[error("{0}")]
     Failed(String),
 }
 
@@ -516,7 +541,34 @@ fn save_clip_file(
     })?;
     let (path, file) = output::create_file(&cfg.dir, label, cfg.format.extension())
         .map_err(|e| ClipError::Failed(e.to_string()))?;
-    output::write_clip(&clip, file, tracks, cfg).map_err(|e| ClipError::Failed(e.to_string()))?;
+    write_dump(&clip, path, file, tracks, cfg)
+}
+
+/// Writes a crash rescue that was already copied out of the DVR to `path`, a new file (P4.11).
+/// Runs on the clip's IO thread. `create_new` means an unanswered rescue is never overwritten.
+fn save_rescue_file(
+    clip: &DvrClip,
+    path: PathBuf,
+    cfg: &OutputConfig,
+    tracks: &[TrackInfo],
+) -> Result<(PathBuf, Hns), ClipError> {
+    let failed = |e: io::Error| ClipError::Failed(e.to_string());
+    // The folder exists from startup, but the user may have removed it since.
+    std::fs::create_dir_all(&cfg.dir).map_err(failed)?;
+    let file = File::create_new(&path).map_err(failed)?;
+    write_dump(clip, path, file, tracks, cfg)
+}
+
+/// Writes `clip` into `file` at `path` and syncs it (DurableFile::dump, then `sync_all`), so the
+/// file is complete on disk before its event goes out.
+fn write_dump(
+    clip: &DvrClip,
+    path: PathBuf,
+    file: File,
+    tracks: &[TrackInfo],
+    cfg: &OutputConfig,
+) -> Result<(PathBuf, Hns), ClipError> {
+    output::write_clip(clip, file, tracks, cfg).map_err(|e| ClipError::Failed(e.to_string()))?;
     // The clip still plays without its length in the mehd, so a failure to set it is only logged.
     if let Err(error) = zc_mux::repair::set_fragment_duration(&path) {
         tracing::warn!(error = %error, "could not set a clip's length");
@@ -553,19 +605,30 @@ impl Actor {
                 Msg::Os(event) => self.on_os_event(event),
                 Msg::Health(event) => self.on_health(event),
                 Msg::RecordingEnded(result) => self.on_recording_ended(result),
-                Msg::ClipWritten(result) => self.on_clip_written(result),
+                Msg::ClipWritten(dump, result) => self.on_clip_written(dump, result),
             }
         }
         self.stop_sources();
         self.finish_recording();
-        // A clip being saved finishes first: quitting right after Alt+F10 must not cut it short.
-        if let Some(thread) = self.saving.take() {
-            tracing::info!("finishing the clip being saved before exiting");
-            if thread.join().is_err() {
-                tracing::error!("clip thread panicked");
-            }
-        }
+        self.finish_dumps();
         tracing::info!("engine stopped");
+    }
+
+    /// At shutdown, waits for the dump being written, then writes a crash rescue that was waiting
+    /// for it. Quitting right after Alt+F10 must not cut the clip short, and quitting right after a
+    /// game crash must not lose the rescue: its file stays for the next start's scan (P4.12).
+    fn finish_dumps(&mut self) {
+        loop {
+            if let Some(thread) = self.saving.take() {
+                tracing::info!("finishing the clip being saved before exiting");
+                if thread.join().is_err() {
+                    tracing::error!("clip thread panicked");
+                }
+            }
+            // The slot is free now, so the rescue starts at once and the loop joins it.
+            let Some(waiting) = self.rescue_waiting.take() else { break };
+            self.run_waiting_rescue(waiting);
+        }
     }
 
     fn emit(&self, event: EngineEvent) {
@@ -692,17 +755,91 @@ impl Actor {
         }
     }
 
-    /// A watched process ended (P4.7). Only the tracked game's exit matters: its session
-    /// recording stops, game audio lets go of its process, and the default profile applies again.
-    /// Any other pid is a game tracked earlier, whose profile has already been replaced.
+    /// A watched process ended (P4.7). Only the tracked game's exit matters: an unexpected exit
+    /// rescues the buffer first (P4.11), then its session recording stops, game audio lets go of
+    /// its process, and the default profile applies again. Any other pid is a game tracked
+    /// earlier, whose profile has already been replaced.
     fn on_process_exited(&mut self, pid: u32, exit_code: u32) {
-        if self.tracked.as_ref().is_none_or(|tracked| tracked.pid != pid) {
+        let Some(game) =
+            self.tracked.as_ref().filter(|tracked| tracked.pid == pid).map(|t| t.exe.clone())
+        else {
             tracing::debug!(pid, exit_code, "an untracked process exited");
             return;
-        }
+        };
         tracing::info!(pid, exit_code, "the tracked game exited");
-        // P4.11: the crash-rescue dump goes here, before anything below. Reverting to the
-        // default profile can shrink the buffer and drop the footage the rescue exists to save.
+        // 0 is a clean quit. Task Manager's End task (Details tab) and `taskkill` report 1, and a
+        // crash reports its NTSTATUS, such as 0xC0000005 for an access violation. So anything but
+        // 0 is unexpected (D34).
+        if exit_code != 0 {
+            // One dump at a time (D29). The game stays tracked while the rescue waits, so its
+            // profile keeps the buffer at the game's window; `on_clip_written` comes back for it.
+            if self.saving.is_some() {
+                tracing::info!(pid, "crash rescue waits for the dump being written");
+                self.rescue_waiting = Some(WaitingRescue { pid, game, exit_code });
+                return;
+            }
+            // Before anything below: the default profile can shrink the buffer and drop the
+            // footage the rescue exists to save.
+            self.rescue(&game, exit_code);
+        }
+        self.release_game();
+    }
+
+    /// Runs a rescue that waited for the dump slot, then lets go of its game, unless another
+    /// profiled game took over while it waited. That game's focus already replaced the tracking,
+    /// and its buffer is what the rescue gets. A different game's focus skips the Game-mode clear
+    /// (D31) while a rescue waits, so the dead game's footage is still there.
+    fn run_waiting_rescue(&mut self, waiting: WaitingRescue) {
+        self.rescue(&waiting.game, waiting.exit_code);
+        if self.tracked.as_ref().is_some_and(|tracked| tracked.pid == waiting.pid) {
+            self.release_game();
+        }
+    }
+
+    /// Crash rescue (P4.11, D34): copies the game's window out of the DVR and starts the clip IO
+    /// thread writing it to `recovery-<unix_ms>.<ext>.tmp` in the output folder. The file stays
+    /// there so Keep is a same-volume rename, and `.tmp` keeps it out of the Clips list until the
+    /// user answers (P4.12). `RecoveryReady` goes out once the file is on disk.
+    ///
+    /// The copy runs here, not on the IO thread as a save's does (D29): the caller reverts to the
+    /// default profile right after, and a resize under a copy in progress would fail it
+    /// (`DvrError::Changed`). It is a few short lock holds (D29), once per crash. The caller
+    /// checks the dump slot is free, so this is the only copy of the window.
+    fn rescue(&mut self, game: &str, exit_code: u32) {
+        if !self.settings.dvr.enabled {
+            tracing::info!(game, exit_code, "game exited unexpectedly; the DVR buffer is off");
+            return;
+        }
+        let snapshot = match self.video_track.clone() {
+            Some(video) => self.recorder.snapshot(self.status.buffer_window).map(|c| (video, c)),
+            None => Err(DvrError::Empty),
+        };
+        let (video, clip) = match snapshot {
+            Ok(found) => found,
+            Err(DvrError::Empty) => {
+                self.emit(EngineEvent::Warning(format!(
+                    "{game} closed unexpectedly, but nothing was buffered yet."
+                )));
+                return;
+            }
+            Err(error) => {
+                tracing::error!(game, %error, "crash rescue: the buffer couldn't be copied");
+                self.emit(EngineEvent::Error(format!("Couldn't rescue {game}'s footage: {error}")));
+                return;
+            }
+        };
+        let (tracks, cfg) = self.dump_output(video);
+        // Milliseconds, so two rescues never share a name. `create_new` still refuses a name in
+        // use rather than overwrite an unanswered rescue.
+        let unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        let path = cfg.dir.join(format!("recovery-{unix_ms}.{}.tmp", cfg.format.extension()));
+        let dump = Dump::Rescue { game: game.to_owned(), exit_code };
+        self.spawn_dump(dump, move || save_rescue_file(&clip, path, &cfg, &tracks));
+    }
+
+    /// Lets go of the tracked game after it exited: its session recording stops, game audio
+    /// releases its process, and the default profile applies again.
+    fn release_game(&mut self) {
         self.stop_session();
         if let Some(audio) = self.ports.game_audio.as_mut() {
             audio.set_target_process(None);
@@ -996,7 +1133,9 @@ impl Actor {
                 if active {
                     self.stop_capture();
                 }
-                if clear_buffer {
+                // A rescue waiting for the dump slot still needs the dead game's footage, so it
+                // isn't cleared. Trade-off: the new game's first clips can hold the old game too.
+                if clear_buffer && self.rescue_waiting.is_none() {
                     self.recorder.clear();
                 }
                 let exe = exe_name(focus.exe).to_owned();
@@ -1246,14 +1385,7 @@ impl Actor {
     /// new `label` file, then reports `Msg::ClipWritten`. Returns whether the thread started; if
     /// not, the error has been reported.
     fn spawn_clip(&mut self, label: &'static str, window: Hns, video: TrackInfo) -> bool {
-        let tracks: Vec<TrackInfo> =
-            std::iter::once(video).chain(self.audio_tracks.iter().cloned()).collect();
-        let mut cfg =
-            OutputConfig::from_settings(&self.settings, self.output_dir.clone(), self.drive);
-        if self.pace_dumps {
-            let hdd_rate = u64::from(self.settings.storage.hdd_write_mb_per_sec) * 1_000_000;
-            cfg.pacer = WritePacer::limited(hdd_rate);
-        }
+        let (tracks, cfg) = self.dump_output(video);
         // The clip ends at the press. The Master mix trails real time (D30), so when it runs the
         // copy waits until the mix has reached that point.
         let end = self.recorder.video_end();
@@ -1263,18 +1395,43 @@ impl Actor {
             Duration::ZERO
         };
         let recorder = Arc::clone(&self.recorder);
+        self.spawn_dump(Dump::Clip, move || {
+            if !catch_up.is_zero() {
+                thread::sleep(catch_up);
+            }
+            save_clip_file(&recorder, window, end, &cfg, &tracks, label)
+        })
+    }
+
+    /// The tracks and output settings for a dump whose video track is `video`. Dumps come in
+    /// bursts, so they are paced on a spinning disk, and always once the watchdog saw a slow one.
+    fn dump_output(&self, video: TrackInfo) -> (Vec<TrackInfo>, OutputConfig) {
+        let tracks: Vec<TrackInfo> =
+            std::iter::once(video).chain(self.audio_tracks.iter().cloned()).collect();
+        let mut cfg =
+            OutputConfig::from_settings(&self.settings, self.output_dir.clone(), self.drive);
+        if self.pace_dumps {
+            let hdd_rate = u64::from(self.settings.storage.hdd_write_mb_per_sec) * 1_000_000;
+            cfg.pacer = WritePacer::limited(hdd_rate);
+        }
+        (tracks, cfg)
+    }
+
+    /// Starts the clip IO thread on `job`, which writes one dump, and reports what it returns as
+    /// `Msg::ClipWritten` with `dump`. Takes the one dump slot (`saving`, D29), so callers check
+    /// it is free. Returns whether the thread started; if not, the error has been reported.
+    fn spawn_dump(
+        &mut self,
+        dump: Dump,
+        job: impl FnOnce() -> Result<(PathBuf, Hns), ClipError> + Send + 'static,
+    ) -> bool {
         let inbox = self.inbox.clone();
         let spawned = thread::Builder::new().name("zc-io-clip".into()).spawn(move || {
             // A panic must still report back, or `saving` stays set and refuses every later save.
-            let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                if !catch_up.is_zero() {
-                    thread::sleep(catch_up);
-                }
-                save_clip_file(&recorder, window, end, &cfg, &tracks, label)
-            }))
-            .unwrap_or_else(|_| Err(ClipError::Failed("the clip thread panicked".into())));
+            let result = panic::catch_unwind(AssertUnwindSafe(job))
+                .unwrap_or_else(|_| Err(ClipError::Failed("the clip thread panicked".into())));
             // Fails only while the engine is shutting down, when nobody needs the result.
-            let _ = inbox.send(Msg::ClipWritten(result));
+            let _ = inbox.send(Msg::ClipWritten(dump, result));
         });
         match spawned {
             // The result comes back through the inbox; the handle is joined then, or at shutdown.
@@ -1310,8 +1467,9 @@ impl Actor {
         }
     }
 
-    /// The clip's IO thread has finished, or given up. Clears `saving`, so the next press is taken.
-    fn on_clip_written(&mut self, result: Result<(PathBuf, Hns), ClipError>) {
+    /// The clip's IO thread has finished, or given up. Clears `saving`, so the next press is taken,
+    /// and starts a rescue or a flush that was waiting for it.
+    fn on_clip_written(&mut self, dump: Dump, result: Result<(PathBuf, Hns), ClipError>) {
         // The thread sends this just before it exits, so the join returns at once.
         if let Some(thread) = self.saving.take()
             && thread.join().is_err()
@@ -1319,6 +1477,53 @@ impl Actor {
             tracing::error!("clip thread panicked");
         }
         let flushed = std::mem::take(&mut self.flushing);
+        if let Dump::Rescue { game, exit_code } = dump {
+            self.on_rescue_written(game, exit_code, result);
+        } else {
+            self.on_dump_written(flushed, result);
+        }
+        // The rescue first: a flush moving on below ends in RESUMING, which clears the buffer.
+        // The flush then waits behind the rescue's write, and starts at its end.
+        if let Some(waiting) = self.rescue_waiting.take() {
+            self.run_waiting_rescue(waiting);
+        }
+        if flushed {
+            // Even a failed flush moves on: staying stuck in FLUSHING would end capture for good.
+            self.on_health(HealthEvent::Flushed);
+        } else if self.watchdog.as_ref().is_some_and(|w| w.state() == WatchdogState::Flushing)
+            && let Some(event) = self.start_flush()
+        {
+            // The flush was waiting behind this save. `start_flush` found nothing to write.
+            self.on_health(event);
+        }
+    }
+
+    /// Reports a written rescue: the prompt's `RecoveryReady`, or why there is no file.
+    fn on_rescue_written(
+        &mut self,
+        game: String,
+        exit_code: u32,
+        result: Result<(PathBuf, Hns), ClipError>,
+    ) {
+        match result {
+            Ok((path, duration)) => {
+                tracing::warn!(
+                    game,
+                    exit_code,
+                    path = %path.display(),
+                    "game exited unexpectedly; buffer rescued"
+                );
+                self.emit(EngineEvent::RecoveryReady { path, game, duration });
+            }
+            Err(error) => {
+                tracing::error!(game, exit_code, %error, "crash rescue failed");
+                self.emit(EngineEvent::Error(format!("Couldn't rescue {game}'s footage: {error}")));
+            }
+        }
+    }
+
+    /// Reports a written clip or flush.
+    fn on_dump_written(&mut self, flushed: bool, result: Result<(PathBuf, Hns), ClipError>) {
         match result {
             Ok((path, duration)) => {
                 tracing::info!(path = %path.display(), "clip saved");
@@ -1339,15 +1544,6 @@ impl Actor {
                 tracing::error!(error = %reason, "clip save failed");
                 self.emit(EngineEvent::Error(format!("Couldn't save the clip: {reason}")));
             }
-        }
-        if flushed {
-            // Even a failed flush moves on: staying stuck in FLUSHING would end capture for good.
-            self.on_health(HealthEvent::Flushed);
-        } else if self.watchdog.as_ref().is_some_and(|w| w.state() == WatchdogState::Flushing)
-            && let Some(event) = self.start_flush()
-        {
-            // The flush was waiting behind this save. `start_flush` found nothing to write.
-            self.on_health(event);
         }
     }
 
