@@ -264,3 +264,18 @@ rings the same way; it logs its duration.
 Costs: an unprofiled game can't get its own window length while a profiled game is tracked; the
 profile stays in effect after the user has left the game, until another profiled game takes focus
 or the game exits.
+
+### D34 · Crash rescue trigger and files (builds on D19, D29, D33)
+The tracked game exiting with a non-zero code is "unexpected": 0 is a clean quit, Task Manager's
+End task and `taskkill` report 1, crashes report an NTSTATUS. On such an exit the engine copies the
+profile window out of the DVR before the default profile is restored (a resize would drop the
+footage) and writes it on the clip IO thread to `recovery-<unix_ms>.<ext>.tmp` in the output folder,
+created with `create_new` so a second rescue never overwrites an unanswered one. The file is synced
+before `RecoveryReady` is emitted. `.tmp` keeps it out of the Clips list; Keep is a same-volume
+rename (P4.12). One dump at a time (D29): if a save or flush is being written, the rescue waits for
+it (the game stays tracked, so its window holds) and runs first when that dump ends, ahead of a
+waiting watchdog flush, whose RESUMING clears the buffer. At shutdown the waiting rescue is still
+written. A different game focused while a rescue waits does not clear the buffer (D31), so the
+rescue still gets the dead game's footage. Costs: the copy of the window runs on the engine thread, so
+besides the short lock holds of D29 it stalls the engine thread (hotkeys, health, status) for the
+whole copy, about 750 MB for a 5 min window (Q4); the new game's first clips can hold the old game too.
