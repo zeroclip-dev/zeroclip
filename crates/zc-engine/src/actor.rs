@@ -972,11 +972,13 @@ impl Actor {
     /// Starts, pauses or keeps capture for the window that took focus (D31).
     fn on_capture_focus(&mut self, focus: Focus<'_>) {
         let kept = self.game_capture.as_ref().map(|game| (game.hwnd, game.exe.as_str()));
+        // `status.capturing` is false mid-recovery, but the capture session is still alive.
+        let active = self.status.capturing || self.watchdog.is_some();
         let decision = capture_decision(
             self.settings.video.capture_mode,
             &self.settings.profiles,
             kept,
-            self.status.capturing,
+            active,
             std::process::id(),
             focus,
         );
@@ -991,7 +993,7 @@ impl Actor {
                 }
             }
             CaptureDecision::Start { hwnd, clear_buffer } => {
-                if self.status.capturing {
+                if active {
                     self.stop_capture();
                 }
                 if clear_buffer {
@@ -1024,6 +1026,9 @@ impl Actor {
         // A recovery cut short here must not restart the encoder later (a pending flush's
         // `Flushed` then finds no watchdog and is dropped).
         self.watchdog = None;
+        // A flush still writing ends through `on_clip_written`; its `Flushed` must not reach a
+        // watchdog created later.
+        self.flushing = false;
         self.status.watchdog = WatchdogState::Running;
         tracing::info!(stats = ?self.recorder.stats(), "recorder totals");
         self.status.capturing = false;
@@ -1465,6 +1470,14 @@ impl Actor {
             Ok(actual) => {
                 tracing::info!(codec = actual.name(), "encoder re-initialised");
                 self.status.codec = Some(actual);
+                // The tee would keep writing the new encoder's packets under the old track
+                // header, as `restart_capture` avoids.
+                if self.recording.as_ref().is_some_and(|r| r.id.is_some()) {
+                    self.stop_recording();
+                    self.emit(EngineEvent::Warning(
+                        "The encoder restarted, so the recording was stopped.".into(),
+                    ));
+                }
                 // A step down the ladder changes the track; the buffer is cleared at RESUMING,
                 // so later clips hold only the new format.
                 self.video_track = video.format();
