@@ -139,8 +139,10 @@ impl Recorder {
         self.lock().dvr.buffered()
     }
 
-    /// Empties the DVR buffer, for when the video format changes: GOPs from the old encoder
-    /// can't share a clip with the new one (DESIGN §8, "buffer restarts from empty").
+    /// Empties the DVR buffer, for when the video format changes or the watchdog resumes after a
+    /// re-init: GOPs from the old encoder can't share a clip with the new one (DESIGN §8, "buffer
+    /// restarts from empty"). The [`MasterClock`] stays anchored, so the new encoder's packets
+    /// carry on the session timeline instead of starting again at zero.
     pub fn clear(&self) {
         self.lock().dvr.clear();
     }
