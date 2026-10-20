@@ -23,7 +23,7 @@ use zc_core::profile::{
 };
 use zc_core::settings::{CaptureMode, MicMode, Settings};
 use zc_core::sink::{SharedSink, SinkId};
-use zc_core::watchdog::HealthEvent;
+use zc_core::watchdog::{HealthEvent, Watchdog, WatchdogAction, WatchdogConfig, WatchdogState};
 use zc_core::{Codec, Hns};
 use zc_mux::pacing::{DriveKind, WritePacer};
 
@@ -145,6 +145,10 @@ impl Engine {
             game_capture: None,
             tracked: None,
             audio_running: false,
+            watchdog: None,
+            video_config: None,
+            flushing: false,
+            pace_dumps: false,
         };
         let thread =
             thread::Builder::new().name("zc-engine".into()).spawn(move || actor.run(&rx))?;
@@ -282,6 +286,18 @@ struct Actor {
     tracked: Option<Tracked>,
     /// Whether the audio sources are running. Set by `start_audio`, cleared by `stop_capture`.
     audio_running: bool,
+    /// Decides the encoder recovery sequence (DESIGN §8). Created when the video source starts
+    /// and dropped when capture stops, so it is `Some` exactly while video is meant to run, also
+    /// mid-recovery when the encoder itself is down.
+    watchdog: Option<Watchdog>,
+    /// What the video source was last started with, so a watchdog re-init rebuilds the same
+    /// capture, only with the codec the watchdog picks.
+    video_config: Option<VideoStart>,
+    /// The clip being written is the watchdog's flush, so its end moves recovery on (`Flushed`).
+    flushing: bool,
+    /// The watchdog saw a slow disk: dumps are paced at the HDD rate whatever the drive probe
+    /// said (DESIGN §8: pace the writes, don't re-init).
+    pace_dumps: bool,
 }
 
 /// The game window capture follows, and its exe file name.
@@ -492,12 +508,13 @@ fn save_clip_file(
     end: Hns,
     cfg: &OutputConfig,
     tracks: &[TrackInfo],
+    label: &str,
 ) -> Result<(PathBuf, Hns), ClipError> {
     let clip = recorder.snapshot_until(window, end).map_err(|e| match e {
         DvrError::Empty => ClipError::NothingBuffered,
         other => ClipError::Failed(other.to_string()),
     })?;
-    let (path, file) = output::create_file(&cfg.dir, "clip", cfg.format.extension())
+    let (path, file) = output::create_file(&cfg.dir, label, cfg.format.extension())
         .map_err(|e| ClipError::Failed(e.to_string()))?;
     output::write_clip(&clip, file, tracks, cfg).map_err(|e| ClipError::Failed(e.to_string()))?;
     // The clip still plays without its length in the mehd, so a failure to set it is only logged.
@@ -904,6 +921,10 @@ impl Actor {
         match self.ports.video.as_mut().map(|video| video.start(&config, sink, health)) {
             Some(Ok(codec)) => {
                 tracing::info!(codec = codec.name(), ?target, "capture started");
+                // A fresh start is a healthy pipeline, so any recovery in progress is over.
+                self.watchdog = Some(Watchdog::new(WatchdogConfig::default(), codec));
+                self.video_config = Some(config);
+                self.status.watchdog = WatchdogState::Running;
                 self.status.capturing = true;
                 self.status.codec = Some(codec);
                 self.video_track = self.ports.video.as_ref().and_then(|video| video.format());
@@ -962,7 +983,9 @@ impl Actor {
         match decision {
             CaptureDecision::Keep => {}
             CaptureDecision::Pause => {
-                if self.status.capturing {
+                // Not `status.capturing`: that is false mid-recovery, and a recovery left running
+                // would restart the encoder while the user is in another app.
+                if self.watchdog.is_some() {
                     tracing::info!("focus left the game; capture paused");
                     self.stop_capture();
                 }
@@ -998,6 +1021,10 @@ impl Actor {
         if let Some(video) = video {
             video.stop();
         }
+        // A recovery cut short here must not restart the encoder later (a pending flush's
+        // `Flushed` then finds no watchdog and is dropped).
+        self.watchdog = None;
+        self.status.watchdog = WatchdogState::Running;
         tracing::info!(stats = ?self.recorder.stats(), "recorder totals");
         self.status.capturing = false;
         self.audio_running = false;
@@ -1207,10 +1234,21 @@ impl Actor {
             self.emit(EngineEvent::Warning("Nothing to save yet: capture hasn't started.".into()));
             return;
         };
+        self.spawn_clip("clip", self.status.buffer_window, video);
+    }
+
+    /// Starts the clip IO thread, which snapshots the last `window` of the DVR and writes it to a
+    /// new `label` file, then reports `Msg::ClipWritten`. Returns whether the thread started; if
+    /// not, the error has been reported.
+    fn spawn_clip(&mut self, label: &'static str, window: Hns, video: TrackInfo) -> bool {
         let tracks: Vec<TrackInfo> =
             std::iter::once(video).chain(self.audio_tracks.iter().cloned()).collect();
-        let cfg = OutputConfig::from_settings(&self.settings, self.output_dir.clone(), self.drive);
-        let window = self.status.buffer_window;
+        let mut cfg =
+            OutputConfig::from_settings(&self.settings, self.output_dir.clone(), self.drive);
+        if self.pace_dumps {
+            let hdd_rate = u64::from(self.settings.storage.hdd_write_mb_per_sec) * 1_000_000;
+            cfg.pacer = WritePacer::limited(hdd_rate);
+        }
         // The clip ends at the press. The Master mix trails real time (D30), so when it runs the
         // copy waits until the mix has reached that point.
         let end = self.recorder.video_end();
@@ -1227,7 +1265,7 @@ impl Actor {
                 if !catch_up.is_zero() {
                     thread::sleep(catch_up);
                 }
-                save_clip_file(&recorder, window, end, &cfg, &tracks)
+                save_clip_file(&recorder, window, end, &cfg, &tracks, label)
             }))
             .unwrap_or_else(|_| Err(ClipError::Failed("the clip thread panicked".into())));
             // Fails only while the engine is shutting down, when nobody needs the result.
@@ -1235,8 +1273,35 @@ impl Actor {
         });
         match spawned {
             // The result comes back through the inbox; the handle is joined then, or at shutdown.
-            Ok(thread) => self.saving = Some(thread),
-            Err(e) => self.emit(EngineEvent::Error(format!("Couldn't save the clip: {e}"))),
+            Ok(thread) => {
+                self.saving = Some(thread);
+                true
+            }
+            Err(e) => {
+                self.emit(EngineEvent::Error(format!("Couldn't save the clip: {e}")));
+                false
+            }
+        }
+    }
+
+    /// The watchdog's FLUSHING step (DESIGN §8): writes everything the DVR holds to its own
+    /// `recovered` file, because the buffer restarts empty when capture resumes. It is a normal
+    /// dump on the clip IO thread, so `Flushed` comes from [`on_clip_written`](Self::on_clip_written)
+    /// and the actor never waits on the disk. Returns `Flushed` at once when there is nothing to
+    /// write, and `None` while the write (or a save it waits behind) runs.
+    fn start_flush(&mut self) -> Option<HealthEvent> {
+        // One dump at a time (D29): a save already running finishes first, and its end starts this.
+        if self.saving.is_some() {
+            return None;
+        }
+        match self.video_track.clone() {
+            Some(video) if self.settings.dvr.enabled => {
+                // The whole buffer, not the profile's window: the ring may hold more, and all of
+                // it is about to be cleared.
+                self.flushing = self.spawn_clip("recovered", Hns(i64::MAX), video);
+                (!self.flushing).then_some(HealthEvent::Flushed)
+            }
+            _ => Some(HealthEvent::Flushed),
         }
     }
 
@@ -1248,11 +1313,20 @@ impl Actor {
         {
             tracing::error!("clip thread panicked");
         }
+        let flushed = std::mem::take(&mut self.flushing);
         match result {
             Ok((path, duration)) => {
                 tracing::info!(path = %path.display(), "clip saved");
+                if flushed {
+                    self.emit(EngineEvent::Warning(format!(
+                        "The encoder failed and is restarting; the footage so far was saved to {}.",
+                        path.display()
+                    )));
+                }
                 self.emit(EngineEvent::ClipSaved { path, duration });
             }
+            // An empty buffer has nothing to rescue, so the flush says nothing about it.
+            Err(ClipError::NothingBuffered) if flushed => {}
             Err(ClipError::NothingBuffered) => {
                 self.emit(EngineEvent::Warning("Nothing to save yet.".into()));
             }
@@ -1260,6 +1334,15 @@ impl Actor {
                 tracing::error!(error = %reason, "clip save failed");
                 self.emit(EngineEvent::Error(format!("Couldn't save the clip: {reason}")));
             }
+        }
+        if flushed {
+            // Even a failed flush moves on: staying stuck in FLUSHING would end capture for good.
+            self.on_health(HealthEvent::Flushed);
+        } else if self.watchdog.as_ref().is_some_and(|w| w.state() == WatchdogState::Flushing)
+            && let Some(event) = self.start_flush()
+        {
+            // The flush was waiting behind this save. `start_flush` found nothing to write.
+            self.on_health(event);
         }
     }
 
@@ -1297,9 +1380,101 @@ impl Actor {
         }
     }
 
-    fn on_health(&mut self, event: HealthEvent) {
-        // Phase 4: `Watchdog::on_event` decides; carry out the action it returns.
+    /// Feeds a health signal to the watchdog and carries out what it decides (DESIGN §8). Most
+    /// steps finish at once and answer with the next event, which goes straight back in. The
+    /// flush and the first IDR come back later through the inbox. Without a watchdog (video not
+    /// started, or capture paused) the signal is dropped.
+    fn on_health(&mut self, mut event: HealthEvent) {
         tracing::trace!(?event, "health");
+        loop {
+            let Some(watchdog) = self.watchdog.as_mut() else { return };
+            let before = watchdog.state();
+            let action = watchdog.on_event(event);
+            let after = watchdog.state();
+            if after != before {
+                tracing::info!(?before, ?after, ?action, "watchdog");
+                self.status.watchdog = after;
+                // RESUMING has a running encoder again; only the first IDR is still to come.
+                self.status.capturing =
+                    matches!(after, WatchdogState::Running | WatchdogState::Resuming);
+                self.publish_status();
+            }
+            match self.perform(action) {
+                Some(next) => event = next,
+                None => return,
+            }
+        }
+    }
+
+    /// Carries out one watchdog step. Returns the health event that answers it when the step is
+    /// done already, or `None` when nothing follows or the answer comes later.
+    fn perform(&mut self, action: WatchdogAction) -> Option<HealthEvent> {
+        match action {
+            WatchdogAction::None => None,
+            WatchdogAction::Drain => {
+                // `VideoSource::stop` drains the encoder's in-flight samples into the sink and
+                // releases the device, so once it returns the buffer holds everything encoded.
+                if let Some(video) = self.ports.video.as_mut() {
+                    video.stop();
+                }
+                Some(HealthEvent::Drained)
+            }
+            WatchdogAction::FlushToDisk => self.start_flush(),
+            WatchdogAction::Reinit { codec } => Some(self.reinit(codec)),
+            WatchdogAction::Resume => {
+                // The old GOPs are in the flushed file. `clear` keeps the master clock anchored,
+                // so PTS carries on from before the fault rather than from zero (DESIGN §8). The
+                // DVR skips frames until the IDR asked for here, which the source reports.
+                self.recorder.clear();
+                if let Some(video) = self.ports.video.as_mut() {
+                    video.request_keyframe();
+                }
+                None
+            }
+            WatchdogAction::PaceDiskWrites => {
+                if !self.pace_dumps {
+                    self.pace_dumps = true;
+                    self.emit(EngineEvent::Warning(
+                        "The disk is slow; clips will be written more gently.".into(),
+                    ));
+                }
+                None
+            }
+            WatchdogAction::GiveUp => {
+                tracing::error!("watchdog gave up: no codec could be re-initialised");
+                self.status.capturing = false;
+                self.emit(EngineEvent::Error(
+                    "Capture stopped: no hardware encoder could be restarted. Update the GPU \
+                     driver or restart ZeroClip."
+                        .into(),
+                ));
+                None
+            }
+        }
+    }
+
+    /// The watchdog's REINIT step: starts the video source again as it was last started, with
+    /// `codec`, which is lower on the ladder after repeated failures (DESIGN §3, §8).
+    fn reinit(&mut self, codec: Codec) -> HealthEvent {
+        let Some(config) = self.video_config else { return HealthEvent::ReinitFailed };
+        let config = VideoStart { codec, ..config };
+        let sink: SharedSink = self.recorder.clone();
+        let health = self.health_emitter();
+        let Some(video) = self.ports.video.as_mut() else { return HealthEvent::ReinitFailed };
+        match video.start(&config, sink, health) {
+            Ok(actual) => {
+                tracing::info!(codec = actual.name(), "encoder re-initialised");
+                self.status.codec = Some(actual);
+                // A step down the ladder changes the track; the buffer is cleared at RESUMING,
+                // so later clips hold only the new format.
+                self.video_track = video.format();
+                HealthEvent::ReinitSucceeded
+            }
+            Err(error) => {
+                tracing::warn!(codec = codec.name(), %error, "encoder re-init failed");
+                HealthEvent::ReinitFailed
+            }
+        }
     }
 
     /// Runs once a second while no message arrives. Refreshes the buffered span on the
@@ -1665,7 +1840,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("zeroclip-clip-empty-{}", std::process::id()));
         let cfg = OutputConfig::from_settings(&Settings::default(), dir.clone(), DriveKind::Ssd);
         let recorder = Recorder::new(DvrConfig { video_bytes: 10_000_000, audio_bytes: 1_000_000 });
-        let result = save_clip_file(&recorder, Hns::from_secs(60), Hns::from_secs(60), &cfg, &[]);
+        let result =
+            save_clip_file(&recorder, Hns::from_secs(60), Hns::from_secs(60), &cfg, &[], "clip");
         assert!(matches!(result, Err(ClipError::NothingBuffered)));
         assert!(!dir.exists(), "the file is only created once there is a clip to write");
     }
