@@ -11,8 +11,12 @@
 //!
 //! Both are turned into [`OsEvent`](zc_core::ports::OsEvent)s for the engine,
 //! where the hotkey matcher and the profile engine live.
+//!
+//! - **Process watch** ([`process_watch`]): one parked thread per watched game reports its
+//!   exit code, so the engine can tell a crash from a clean quit (DESIGN §8).
 
 pub mod foreground;
+pub mod process_watch;
 pub mod raw_input;
 mod source;
 
