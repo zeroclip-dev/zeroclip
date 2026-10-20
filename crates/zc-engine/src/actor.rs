@@ -297,6 +297,9 @@ struct Tracked {
     /// The tee slot of the session recording this game's profile started (P4.7). Kept so the
     /// game's exit stops that recording, and not a manual one the user started after stopping it.
     session: Option<SinkId>,
+    /// The profile wants a session but the recording slot was still finishing the previous
+    /// session's file; [`Engine::on_recording_ended`] starts it once the slot is free.
+    session_pending: bool,
 }
 
 /// How many recently focused games without a profile the status keeps.
@@ -618,7 +621,8 @@ impl Actor {
         // The previous game's session ends with its tracking: only the tracked game's exit is
         // acted on, so nothing else would ever stop it.
         self.stop_session();
-        self.tracked = Some(Tracked { pid, exe: name.to_owned(), session: None });
+        self.tracked =
+            Some(Tracked { pid, exe: name.to_owned(), session: None, session_pending: false });
         if let Some(input) = self.ports.input.as_mut()
             && let Err(error) = input.watch_process(pid)
         {
@@ -638,7 +642,19 @@ impl Actor {
     fn start_session(&mut self) {
         let Some(tracked) = self.tracked.as_ref() else { return };
         let wanted = self.settings.profiles.find(&tracked.exe).is_some_and(|p| p.session_recording);
-        if !wanted || self.recording.is_some() {
+        if !wanted {
+            return;
+        }
+        if let Some(recording) = self.recording.as_ref() {
+            // `id` is None once a stop was asked for: the file is only being finished, so the
+            // session can start as soon as the slot frees up.
+            if recording.id.is_none() {
+                if let Some(tracked) = self.tracked.as_mut() {
+                    tracked.session_pending = true;
+                }
+            } else {
+                tracing::debug!("session recording skipped: a recording is already running");
+            }
             return;
         }
         self.start_recording("session");
@@ -1143,6 +1159,9 @@ impl Actor {
         }
         self.status.recording = false;
         self.publish_status();
+        if self.tracked.as_mut().is_some_and(|t| std::mem::take(&mut t.session_pending)) {
+            self.start_session();
+        }
         match result {
             Ok((path, duration)) => {
                 tracing::info!(path = %path.display(), "recording saved");
@@ -1979,18 +1998,24 @@ mod tests {
     fn exit_of_an_untracked_process_is_ignored() {
         let (engine, input) = spawn_with_input(screen_settings());
         input.inject(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into() });
-        wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }));
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.game.is_some()));
         input.inject(OsEvent::ProcessExited { pid: 7, exit_code: 1 });
-        // Re-applying settings re-resolves the tracked game's profile and publishes a status, after
-        // the exit above was handled (one inbox, in order).
-        engine.send(Command::ApplySettings(Box::new(screen_settings()))).unwrap();
-        let EngineEvent::Status(status) =
-            wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)))
-        else {
+        // Give cs2 a window no status published so far has, so only a status made after the exit
+        // was handled (one inbox, in order) can show it. It needs cs2 to still be tracked.
+        let mut settings = screen_settings();
+        for game in &mut settings.profiles.games {
+            if game.exe.eq_ignore_ascii_case("cs2.exe") {
+                game.buffer_secs = 150;
+            }
+        }
+        engine.send(Command::ApplySettings(Box::new(settings))).unwrap();
+        let EngineEvent::Status(status) = wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Status(s) if s.buffer_window == Hns::from_secs(150)),
+        ) else {
             unreachable!()
         };
-        assert_eq!(status.game.as_deref(), Some("cs2.exe"));
-        assert_eq!(status.buffer_window, Hns::from_secs(120), "cs2 is still tracked");
+        assert_eq!(status.game.as_deref(), Some("cs2.exe"), "cs2 is still tracked");
         engine.shutdown();
     }
 
