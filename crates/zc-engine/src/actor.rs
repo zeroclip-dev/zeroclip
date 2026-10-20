@@ -1469,6 +1469,7 @@ impl Actor {
         match video.start(&config, sink, health) {
             Ok(actual) => {
                 tracing::info!(codec = actual.name(), "encoder re-initialised");
+                let format = video.format();
                 self.status.codec = Some(actual);
                 // The tee would keep writing the new encoder's packets under the old track
                 // header, as `restart_capture` avoids.
@@ -1480,7 +1481,7 @@ impl Actor {
                 }
                 // A step down the ladder changes the track; the buffer is cleared at RESUMING,
                 // so later clips hold only the new format.
-                self.video_track = video.format();
+                self.video_track = format;
                 HealthEvent::ReinitSucceeded
             }
             Err(error) => {
