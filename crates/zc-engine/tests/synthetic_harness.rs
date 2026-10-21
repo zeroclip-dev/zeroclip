@@ -93,7 +93,12 @@ fn start_game(engine: &EngineHandle, input: &SyntheticInput) {
     // The first status comes after the sources started, the input among them; an event injected
     // earlier would be dropped.
     wait_for(engine, |e| matches!(e, EngineEvent::Status(s) if s.capturing));
-    input.inject(OsEvent::Foreground { pid: GAME_PID, hwnd: 100, exe: r"C:\Games\cs2.exe".into() });
+    input.inject(OsEvent::Foreground {
+        pid: GAME_PID,
+        hwnd: 100,
+        exe: r"C:\Games\cs2.exe".into(),
+        fullscreen: false,
+    });
     wait_for(engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }));
     wait_for(engine, |e| matches!(e, EngineEvent::Status(s) if s.buffered > Hns::ZERO));
 }

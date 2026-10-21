@@ -252,7 +252,7 @@ never grown; a crash leaves the ring on disk, which P4.11 rescue can read; clips
 part are slower to dump than RAM-only.
 The ring defaults to a different drive than the recordings folder when one exists, so session writes and ring writes don't compete.
 
-### D33 · Game profiles are sticky: only a profiled game changes the profile (builds on D21, D27, D31)
+### D33 · Game profiles are sticky: only a profiled game changes the profile (builds on D21, D27, D31; first sentence amended by D35)
 A profiled game becomes the tracked game when it takes focus. Its profile stays in effect until
 another profiled game takes focus, or its process exits (P4.7). Apps without a profile never change
 it, so alt-tabbing to Discord or opening Task Manager can't shrink the buffer before a crash rescue.
@@ -279,3 +279,23 @@ written. A different game focused while a rescue waits does not clear the buffer
 rescue still gets the dead game's footage. Costs: the copy of the window runs on the engine thread, so
 besides the short lock holds of D29 it stalls the engine thread (hotkeys, health, status) for the
 whole copy, about 750 MB for a 5 min window (Q4); the new game's first clips can hold the old game too.
+
+### D35 · A second game asks before it takes over the tracked game (amends D33, D27)
+While a game is tracked, another game taking focus does not change the tracked game by itself. A
+candidate is another profiled game, or an unprofiled app that is fullscreen or borderless on its monitor
+(zc-input reports this with the focus event). Other unprofiled apps (Discord, browsers, the shell) never
+prompt and stay in `recent_games`. After the candidate has kept focus for 3 s (so alt-tab flicks don't prompt), the engine emits
+`EngineEvent::FocusPrompt { current, candidate }` and the app shows a non-modal banner in the window:
+"Clipping {current}. {candidate} is in focus." Options: **Keep {current}** (default), **Switch to {candidate}**
+(the candidate's profile applies, as D33 describes), **Clip desktop** (capture mode goes to Screen, D31).
+Clip both in one buffer is not in this decision (see Costs). The banner never steals focus, so it does
+not force the window forward during fullscreen play. Each (current, candidate) pair prompts at most once per
+session, and the banner stays until the user picks an option or the candidate loses focus. No prompt is
+shown when nothing is tracked (desktop focus): the candidate is tracked directly, as in D33.
+The user's choice holds until the next prompt or the tracked game exits. The exit rules of D33 and P4.7
+still apply, and the crash-rescue rules of D34 are unchanged.
+This resolves D33's open Screen-mode side effect: an unprofiled game gets game audio only when the user
+picks it or picks Clip desktop, so the engine never retargets audio on its own.
+Costs: while a game is tracked, a game the user didn't pick keeps no buffer and no audio until they
+answer. "Clip both in one buffer" needs one ring per game and a two-track dump, a new output format; deferred.
+A workaround is saving both clips at once on a hotkey, which covers most of the need.
