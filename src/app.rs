@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 
 use eframe::egui;
-use zc_core::control::{Command, EngineEvent, EngineStatus};
-use zc_core::settings::Settings;
+use zc_core::control::{Command, EngineEvent, EngineStatus, FocusChoice};
+use zc_core::settings::{CaptureMode, Settings};
 use zc_engine::{Engine, EngineConfig, EngineHandle};
 use zc_mux::repair::{Repaired, repair_partial};
 
@@ -54,6 +54,8 @@ pub struct ZeroClipApp {
     pub notices: VecDeque<Notice>,
     pub clips: ui::clips::ClipList,
     pub open_apps: ui::components::open_apps::OpenAppsList,
+    /// The focus prompt on screen, if a second game asked to take over (D35).
+    pub focus_prompt: Option<ui::focus_prompt::FocusPrompt>,
     /// Results from the startup repair thread, moved into `notices` as they arrive.
     repairs: mpsc::Receiver<Notice>,
 }
@@ -92,6 +94,7 @@ impl ZeroClipApp {
             notices: VecDeque::new(),
             clips: ui::clips::ClipList::default(),
             open_apps: Default::default(),
+            focus_prompt: None,
             repairs,
         })
     }
@@ -125,6 +128,11 @@ impl ZeroClipApp {
                 return;
             }
         };
+        self.apply_settings(settings);
+    }
+
+    /// Writes `settings` to disk, then applies them to the engine and the draft.
+    fn apply_settings(&mut self, settings: Settings) {
         if let Err(e) = crate::settings_store::save(&self.paths.settings_file, &settings) {
             self.notify(NoticeLevel::Error, format!("Couldn't save settings: {e:#}"));
             return;
@@ -136,6 +144,18 @@ impl ZeroClipApp {
         self.notify(NoticeLevel::Info, "Settings saved.");
     }
 
+    /// The focus prompt's "Clip desktop" (D35): the capture mode becomes the whole screen, the
+    /// same as choosing it in Settings.
+    pub fn clip_desktop(&mut self) {
+        let mut settings = self.settings.clone();
+        settings.video.capture_mode = CaptureMode::Screen;
+        // apply_settings replaces the draft; keep the user's unsaved Settings-tab edits.
+        let draft = self.draft.clone();
+        self.apply_settings(settings);
+        self.draft = draft;
+        self.draft.settings.video.capture_mode = CaptureMode::Screen;
+    }
+
     /// Moves the startup repair's notices into the activity feed.
     fn drain_repair_notices(&mut self) {
         while let Ok(notice) = self.repairs.try_recv() {
@@ -143,11 +163,26 @@ impl ZeroClipApp {
         }
     }
 
-    fn drain_engine_events(&mut self) {
+    /// Answers the focus prompt (D35). Keep and Switch tell the engine; Clip desktop changes the
+    /// capture mode. Any answer closes the banner.
+    pub fn answer_focus_prompt(&mut self, choice: FocusChoice) {
+        self.focus_prompt = None;
+        self.send(Command::FocusChoice(choice));
+    }
+
+    fn drain_engine_events(&mut self, ctx: &egui::Context) {
         let events: Vec<EngineEvent> = self.engine.poll_events().collect();
         for event in events {
             match event {
                 EngineEvent::Status(status) => self.status = status,
+                EngineEvent::FocusPrompt { current, candidate } => {
+                    self.focus_prompt = Some(ui::focus_prompt::FocusPrompt { current, candidate });
+                    // The taskbar flashes so a fullscreen user sees it after alt-tabbing. The
+                    // window is never raised or activated (D35).
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                        egui::UserAttentionType::Informational,
+                    ));
+                }
                 EngineEvent::ClipSaved { path, duration } => {
                     self.clips.invalidate();
                     self.notify(
@@ -196,7 +231,7 @@ impl ZeroClipApp {
 
 impl eframe::App for ZeroClipApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.drain_engine_events();
+        self.drain_engine_events(ui.ctx());
         self.drain_repair_notices();
         ui::show(self, ui);
     }
