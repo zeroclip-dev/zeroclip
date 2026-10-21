@@ -3,6 +3,7 @@
 
 use eframe::egui;
 use zc_core::control::FocusChoice;
+use zc_core::focus_prompt::is_shell;
 
 use crate::app::ZeroClipApp;
 
@@ -14,13 +15,16 @@ pub struct FocusPrompt {
 }
 
 /// Drops the prompt once its candidate is no longer the focused app. The engine's status names
-/// the focused app, so the banner clears when focus moves on. Focus on ZeroClip itself doesn't
-/// send a foreground event, so it never clears the banner.
+/// the focused app, so the banner clears when focus moves on. Focus on the shell (taskbar, Start,
+/// alt-tab) never clears it (D35): that is the way back to ZeroClip. Focus on ZeroClip itself
+/// doesn't send a foreground event, so it never clears the banner either.
 pub fn clear_if_left(app: &mut ZeroClipApp) {
-    let left = app
-        .focus_prompt
-        .as_ref()
-        .is_some_and(|prompt| app.status.game.as_deref() != Some(prompt.candidate.as_str()));
+    let on_shell = app.status.game.as_deref().is_some_and(is_shell);
+    let left = !on_shell
+        && app
+            .focus_prompt
+            .as_ref()
+            .is_some_and(|prompt| app.status.game.as_deref() != Some(prompt.candidate.as_str()));
     if left {
         app.focus_prompt = None;
     }

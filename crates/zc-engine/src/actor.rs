@@ -769,8 +769,12 @@ impl Actor {
     }
 
     /// A focus change to `exe` ends a candidate's wait and its prompt, unless `exe` is that
-    /// candidate (D35). The tracked game is unchanged either way.
+    /// candidate (D35). The tracked game is unchanged either way. The shell never ends them: a
+    /// fullscreen player reaches ZeroClip through the taskbar or alt-tab (D35).
     fn settle_candidates(&mut self, exe: &str) {
+        if is_shell(exe) {
+            return;
+        }
         let name = exe_name(exe);
         if self.focus_pending.as_ref().is_some_and(|(c, _)| !focus_prompt::same_game(&c.exe, name))
         {
@@ -2705,6 +2709,37 @@ mod tests {
             unreachable!()
         };
         assert_eq!(exe, "RainbowSix.exe", "Switch applies the candidate's profile");
+        assert!(input.watched().contains(&77), "and watches its process");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn the_shell_keeps_the_prompt_and_switch_still_tracks_the_candidate() {
+        const EXPLORER: &str = r"C:\Windows\explorer.exe";
+        let (engine, input) = spawn_with_input(screen_settings());
+        focus_app(&engine, &input, 42, 100, CS2, false);
+        input.inject(OsEvent::Foreground { pid: 77, hwnd: 300, exe: R6.into(), fullscreen: false });
+        wait_for(&engine, |e| matches!(e, EngineEvent::FocusPrompt { .. }));
+
+        // The taskbar takes focus while the banner is up: the prompt must survive it.
+        input.inject(OsEvent::Foreground {
+            pid: 5,
+            hwnd: 50,
+            exe: EXPLORER.into(),
+            fullscreen: false,
+        });
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Status(s) if s.game.as_deref() == Some("explorer.exe")),
+        );
+
+        engine.send(Command::FocusChoice(FocusChoice::Switch)).unwrap();
+        let EngineEvent::ProfileApplied { exe, .. } =
+            wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(exe, "RainbowSix.exe", "Switch still applies the candidate's profile");
         assert!(input.watched().contains(&77), "and watches its process");
         engine.shutdown();
     }
