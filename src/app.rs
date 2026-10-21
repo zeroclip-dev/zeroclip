@@ -149,7 +149,11 @@ impl ZeroClipApp {
     pub fn clip_desktop(&mut self) {
         let mut settings = self.settings.clone();
         settings.video.capture_mode = CaptureMode::Screen;
+        // apply_settings replaces the draft; keep the user's unsaved Settings-tab edits.
+        let draft = self.draft.clone();
         self.apply_settings(settings);
+        self.draft = draft;
+        self.draft.settings.video.capture_mode = CaptureMode::Screen;
     }
 
     /// Moves the startup repair's notices into the activity feed.
