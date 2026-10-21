@@ -3,6 +3,7 @@
 
 pub mod clips;
 pub mod components;
+pub mod focus_prompt;
 pub mod home;
 pub mod profiles;
 pub mod settings;
@@ -16,7 +17,11 @@ use crate::app::{NoticeLevel, Tab, ZeroClipApp};
 use components::mic_indicator::MicIndicator;
 
 pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
+    focus_prompt::clear_if_left(app);
     egui::Panel::top("top_bar").show(ui, |ui| top_bar(app, ui));
+    if app.focus_prompt.is_some() {
+        egui::Panel::top("focus_prompt").show(ui, |ui| focus_prompt::banner(app, ui));
+    }
     egui::Panel::bottom("status_bar").show(ui, |ui| status_bar(app, ui));
     egui::CentralPanel::default().show(ui, |ui| match app.tab {
         Tab::Home => home::show(app, ui),

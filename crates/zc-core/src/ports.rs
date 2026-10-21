@@ -174,6 +174,9 @@ pub enum OsEvent {
         hwnd: isize,
         /// Full path of its executable.
         exe: String,
+        /// The window covers its monitor, or is borderless on it (D35: a fullscreen app can
+        /// prompt the user even without a profile).
+        fullscreen: bool,
     },
     /// A process passed to [`InputSource::watch_process`] ended. `exit_code` is
     /// `GetExitCodeProcess`'s value: 0 is a clean quit; Task Manager and `taskkill` give 1;

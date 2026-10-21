@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::File;
 use std::io;
@@ -11,8 +12,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::macros::format_description;
 
-use zc_core::control::{Command, EngineEvent, EngineStatus, MicState};
+use zc_core::control::{Command, EngineEvent, EngineStatus, FocusChoice, MicState};
 use zc_core::dvr::{DvrClip, DvrConfig, DvrError};
+use zc_core::focus_prompt::{self, DEBOUNCE, FocusAction, Focused, is_shell, pair_key};
 use zc_core::hotkey::{Binding, ChordMatcher, HotkeyEvent, Trigger};
 use zc_core::media::{TrackId, TrackInfo, TrackKind};
 use zc_core::ports::{
@@ -151,6 +153,9 @@ impl Engine {
             flushing: false,
             pace_dumps: false,
             rescue_waiting: None,
+            focus_pending: None,
+            focus_prompt: None,
+            prompted: HashSet::new(),
         };
         let thread =
             thread::Builder::new().name("zc-engine".into()).spawn(move || actor.run(&rx))?;
@@ -304,6 +309,23 @@ struct Actor {
     /// A crash rescue that found the dump slot busy (D29). It runs when that dump ends, before a
     /// flush waiting there too, because the flush ends in RESUMING, which clears the buffer.
     rescue_waiting: Option<WaitingRescue>,
+    /// An app that is a candidate for a prompt and has focus, waiting out the debounce (D35). Its
+    /// due time says when the prompt is emitted.
+    focus_pending: Option<(Candidate, Instant)>,
+    /// The candidate the user was asked about. Switch applies to it; it is dropped once focus
+    /// moves to another app (D35).
+    focus_prompt: Option<Candidate>,
+    /// (tracked, candidate) pairs already prompted this session, by lowercase file name (D35).
+    prompted: HashSet<(String, String)>,
+}
+
+/// An app that could take over the tracked game (D35): what a switch needs.
+#[derive(Clone, Debug)]
+struct Candidate {
+    pid: u32,
+    hwnd: isize,
+    /// The executable's file name.
+    exe: String,
 }
 
 /// A tracked game that died while another dump was being written: what its rescue needs once the
@@ -363,21 +385,19 @@ enum CaptureDecision {
     Keep,
 }
 
-/// The taskbar, Start menu and desktop belong to explorer.exe. Focusing them changes neither the
-/// game being captured nor the game's audio.
-fn is_shell(exe: &str) -> bool {
-    exe_name(exe).eq_ignore_ascii_case("explorer.exe")
-}
-
-/// Decides what a focus change does to capture (D31). `kept` is the game whose buffer is held
-/// (window, exe file name), and `capturing` says whether its window is being captured now.
+/// Decides what a focus change does to capture (D31). `tracked` is the game with a profile in
+/// effect, if any, and `kept` is the game whose buffer is held (window, exe file name), and
+/// `capturing` says whether its window is being captured now.
 ///
 /// In Screen mode nothing changes. In Game mode, a profiled game starts capture (or moves it to
-/// its new window), and any other app pauses it. ZeroClip's own windows and the shell are ignored,
-/// so opening ZeroClip or the Start menu mid-game doesn't pause capture.
+/// its new window), and any other app pauses it. While a game is tracked, another profiled game
+/// doesn't move capture: it is a candidate for a prompt (D35), so it pauses like any other app.
+/// ZeroClip's own windows and the shell are ignored, so opening ZeroClip or the Start menu
+/// mid-game doesn't pause capture.
 fn capture_decision(
     mode: CaptureMode,
     profiles: &ProfileSet,
+    tracked: Option<&str>,
     kept: Option<(isize, &str)>,
     capturing: bool,
     own_pid: u32,
@@ -387,6 +407,9 @@ fn capture_decision(
         return CaptureDecision::Keep;
     }
     if profiles.find(focus.exe).is_none() {
+        return CaptureDecision::Pause;
+    }
+    if tracked.is_some_and(|game| !focus_prompt::same_game(game, focus.exe)) {
         return CaptureDecision::Pause;
     }
     let same_game =
@@ -593,7 +616,13 @@ impl Actor {
                 self.on_tick();
                 next_tick = now + STATUS_INTERVAL;
             }
-            let msg = match rx.recv_timeout(next_tick.saturating_duration_since(now)) {
+            if self.focus_pending.as_ref().is_some_and(|(_, due)| now >= *due) {
+                self.on_focus_settled();
+            }
+            // Wake for the next tick, or for a candidate's debounce if that comes first (D35).
+            let wake =
+                self.focus_pending.as_ref().map_or(next_tick, |(_, due)| next_tick.min(*due));
+            let msg = match rx.recv_timeout(wake.saturating_duration_since(now)) {
                 Ok(msg) => msg,
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -677,27 +706,52 @@ impl Actor {
         self.apply_profile(&profile, "", false);
     }
 
-    /// Handles a focus change for profiles (P4.6). A profiled game becomes the tracked game: its
-    /// profile applies, and its process gets the input watch and the game audio. Any other app
-    /// keeps the current profile (sticky, D33), so alt-tabbing to Discord or opening Task Manager
-    /// can't shrink the buffer before a crash rescue. Such an app is listed as a recent game
-    /// instead.
+    /// Handles a focus change for profiles (P4.6). A profiled game becomes the tracked game when
+    /// nothing is tracked: its profile applies, and its process gets the input watch and the game
+    /// audio. Any other app keeps the current profile (sticky, D33), so alt-tabbing to Discord or
+    /// opening Task Manager can't shrink the buffer before a crash rescue. Such an app is listed
+    /// as a recent game instead. A second game, or a fullscreen app without a profile, is a
+    /// candidate: after the debounce the user is asked (D35), and nothing moves until they answer.
     ///
     /// Returns whether this focus started tracking a game, so the caller can start its session
     /// recording once capture is running.
-    fn on_profile_focus(&mut self, pid: u32, exe: &str) -> bool {
+    fn on_profile_focus(&mut self, pid: u32, hwnd: isize, exe: &str, fullscreen: bool) -> bool {
         let name = exe_name(exe);
-        let Some(profile) = self.settings.profiles.find(exe).cloned() else {
-            let is_tracked =
-                self.tracked.as_ref().is_some_and(|t| t.exe.eq_ignore_ascii_case(name));
-            if !name.is_empty() && !is_shell(exe) && !is_tracked && pid != std::process::id() {
-                self.remember_recent(name);
-            }
-            return false;
+        let ours = pid == std::process::id();
+        let is_tracked = self.tracked.as_ref().is_some_and(|t| t.exe.eq_ignore_ascii_case(name));
+        let focused =
+            Focused { exe, profiled: self.settings.profiles.find(exe).is_some(), fullscreen, ours };
+        let action = {
+            let tracked = self.tracked.as_ref().map(|t| t.exe.as_str());
+            let asked = tracked.is_some_and(|t| self.prompted.contains(&pair_key(t, name)));
+            focus_prompt::on_focus(tracked, focused, asked)
         };
-        if self.tracked.as_ref().is_some_and(|tracked| tracked.pid == pid) {
-            return false;
+        if !focused.profiled && !is_tracked && !is_shell(exe) && !ours && !name.is_empty() {
+            self.remember_recent(name);
         }
+        match action {
+            FocusAction::Ignore => false,
+            FocusAction::Track => {
+                if self.tracked.as_ref().is_some_and(|tracked| tracked.pid == pid) {
+                    return false;
+                }
+                self.track_game(pid, exe);
+                true
+            }
+            FocusAction::Ask => {
+                let candidate = Candidate { pid, hwnd, exe: name.to_owned() };
+                self.focus_pending = Some((candidate, Instant::now() + DEBOUNCE));
+                false
+            }
+        }
+    }
+
+    /// Makes the app behind `pid` the tracked game (D33): its process gets the input watch and
+    /// the game audio, and its profile (the default for an app without one) applies. Used for a
+    /// profiled game when nothing is tracked, and for a switch the user picked (D35).
+    fn track_game(&mut self, pid: u32, exe: &str) {
+        let name = exe_name(exe);
+        let profile = self.settings.profiles.resolve(exe).clone();
         // The previous game's session ends with its tracking: only the tracked game's exit is
         // acted on, so nothing else would ever stop it.
         self.stop_session();
@@ -712,7 +766,45 @@ impl Actor {
             audio.set_target_process(Some(pid));
         }
         self.apply_profile(&profile, name, true);
-        true
+    }
+
+    /// A focus change to `exe` ends a candidate's wait and its prompt, unless `exe` is that
+    /// candidate (D35). The tracked game is unchanged either way.
+    fn settle_candidates(&mut self, exe: &str) {
+        let name = exe_name(exe);
+        if self.focus_pending.as_ref().is_some_and(|(c, _)| !focus_prompt::same_game(&c.exe, name))
+        {
+            self.focus_pending = None;
+        }
+        if self.focus_prompt.as_ref().is_some_and(|c| !focus_prompt::same_game(&c.exe, name)) {
+            self.focus_prompt = None;
+        }
+    }
+
+    /// The candidate kept focus for the debounce (D35): ask the user, once per pair per session.
+    fn on_focus_settled(&mut self) {
+        let Some((candidate, _)) = self.focus_pending.take() else { return };
+        let Some(current) = self.tracked.as_ref().map(|t| t.exe.clone()) else { return };
+        self.prompted.insert(pair_key(&current, &candidate.exe));
+        self.emit(EngineEvent::FocusPrompt { current, candidate: candidate.exe.clone() });
+        self.focus_prompt = Some(candidate);
+    }
+
+    /// The user's answer to the focus prompt (D35). Switch tracks the candidate as a profiled
+    /// focus would (D33), and starts its capture. Keep, or a prompt that already went away, does
+    /// nothing to the tracked game.
+    fn on_focus_choice(&mut self, choice: FocusChoice) {
+        let Some(candidate) = self.focus_prompt.take() else { return };
+        if choice == FocusChoice::Switch {
+            self.track_game(candidate.pid, &candidate.exe);
+            self.on_capture_focus(Focus {
+                pid: candidate.pid,
+                hwnd: candidate.hwnd,
+                exe: &candidate.exe,
+            });
+            self.start_session();
+        }
+        self.publish_status();
     }
 
     /// Starts the tracked game's session recording when its profile asks for one (P4.7, formerly
@@ -845,6 +937,9 @@ impl Actor {
             audio.set_target_process(None);
         }
         self.tracked = None;
+        // A prompt about the game that just exited has nothing left to switch away from (D35).
+        self.focus_pending = None;
+        self.focus_prompt = None;
         self.status.game = None;
         let default = self.settings.profiles.default.clone();
         self.apply_profile(&default, "*", false);
@@ -1111,9 +1206,11 @@ impl Actor {
         let kept = self.game_capture.as_ref().map(|game| (game.hwnd, game.exe.as_str()));
         // `status.capturing` is false mid-recovery, but the capture session is still alive.
         let active = self.status.capturing || self.watchdog.is_some();
+        let tracked = self.tracked.as_ref().map(|t| t.exe.as_str());
         let decision = capture_decision(
             self.settings.video.capture_mode,
             &self.settings.profiles,
+            tracked,
             kept,
             active,
             std::process::id(),
@@ -1179,6 +1276,7 @@ impl Actor {
     fn on_command(&mut self, command: Command) {
         match command {
             Command::SaveClip => self.save_clip(),
+            Command::FocusChoice(choice) => self.on_focus_choice(choice),
             Command::ToggleRecording => self.toggle_recording(),
             Command::Screenshot => self.take_screenshot(),
             Command::PushToTalk(down) => {
@@ -1564,9 +1662,10 @@ impl Actor {
                 };
                 self.on_command(command);
             }
-            OsEvent::Foreground { pid, hwnd, exe } => {
+            OsEvent::Foreground { pid, hwnd, exe, fullscreen } => {
                 tracing::debug!(pid, exe, "foreground changed");
-                let newly_tracked = self.on_profile_focus(pid, &exe);
+                self.settle_candidates(&exe);
+                let newly_tracked = self.on_profile_focus(pid, hwnd, &exe, fullscreen);
                 self.on_capture_focus(Focus { pid, hwnd, exe: &exe });
                 // After capture focus: in Game mode the encoder starts there, and a recording
                 // needs its video track.
@@ -1909,6 +2008,7 @@ mod tests {
             CaptureMode::Screen,
             &ProfileSet::default(),
             None,
+            None,
             true,
             1,
             focus(9, 5, DISCORD),
@@ -1921,6 +2021,7 @@ mod tests {
         let decision = capture_decision(
             CaptureMode::Game,
             &ProfileSet::default(),
+            Some("cs2.exe"),
             None,
             false,
             1,
@@ -1934,6 +2035,7 @@ mod tests {
         let decision = capture_decision(
             CaptureMode::Game,
             &ProfileSet::default(),
+            Some("cs2.exe"),
             Some((100, "cs2.exe")),
             true,
             1,
@@ -1947,6 +2049,7 @@ mod tests {
         let decision = capture_decision(
             CaptureMode::Game,
             &ProfileSet::default(),
+            Some("cs2.exe"),
             Some((100, "cs2.exe")),
             false,
             1,
@@ -1956,10 +2059,27 @@ mod tests {
     }
 
     #[test]
-    fn a_different_game_clears_the_buffer() {
+    fn a_candidate_game_does_not_move_capture_while_one_is_tracked() {
+        // D35: the prompt decides, so capture stays off the second game and keeps its buffer.
         let decision = capture_decision(
             CaptureMode::Game,
             &ProfileSet::default(),
+            Some("cs2.exe"),
+            Some((100, "cs2.exe")),
+            true,
+            1,
+            focus(77, 300, r"D:\Games\RainbowSix.exe"),
+        );
+        assert_eq!(decision, CaptureDecision::Pause);
+    }
+
+    #[test]
+    fn a_different_game_clears_the_buffer_when_none_is_tracked() {
+        // After the tracked game exited, the next game is tracked at once and takes the buffer.
+        let decision = capture_decision(
+            CaptureMode::Game,
+            &ProfileSet::default(),
+            None,
             Some((100, "cs2.exe")),
             false,
             1,
@@ -1973,6 +2093,7 @@ mod tests {
         let decision = capture_decision(
             CaptureMode::Game,
             &ProfileSet::default(),
+            Some("cs2.exe"),
             Some((100, "cs2.exe")),
             true,
             1,
@@ -1986,6 +2107,7 @@ mod tests {
         let decision = capture_decision(
             CaptureMode::Game,
             &ProfileSet::default(),
+            Some("cs2.exe"),
             Some((100, "cs2.exe")),
             true,
             1,
@@ -1997,12 +2119,20 @@ mod tests {
     #[test]
     fn zeroclip_and_the_shell_never_pause_capture() {
         let (profiles, kept) = (ProfileSet::default(), Some((100, "cs2.exe")));
-        let own =
-            capture_decision(CaptureMode::Game, &profiles, kept, true, 1, focus(1, 5, DISCORD));
+        let own = capture_decision(
+            CaptureMode::Game,
+            &profiles,
+            Some("cs2.exe"),
+            kept,
+            true,
+            1,
+            focus(1, 5, DISCORD),
+        );
         assert_eq!(own, CaptureDecision::Keep, "our own window is ignored");
         let shell = capture_decision(
             CaptureMode::Game,
             &profiles,
+            Some("cs2.exe"),
             kept,
             true,
             1,
@@ -2019,13 +2149,13 @@ mod tests {
             CaptureMode::Game,
             &settings.profiles,
             None,
+            None,
             false,
             1,
             focus(42, 100, CS2),
         );
         assert_eq!(decision, CaptureDecision::Pause, "without a profile, the game is not captured");
     }
-
     #[test]
     fn file_stamp_is_sortable_and_has_no_colons() {
         let t = time::macros::datetime!(2023-11-14 22:13:20.5 UTC);
@@ -2269,10 +2399,15 @@ mod tests {
         let (engine, _) = spawn_in(screen_settings(), ports);
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
         let emit = input.0.lock().unwrap().clone().expect("input started");
-        emit(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into() });
+        emit(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into(), fullscreen: false });
         // Clicking the taskbar and alt-tabbing to an app without a profile must not take the audio.
-        emit(OsEvent::Foreground { pid: 7, hwnd: 200, exe: r"C:\Windows\Explorer.EXE".into() });
-        emit(OsEvent::Foreground { pid: 9, hwnd: 300, exe: DISCORD.into() });
+        emit(OsEvent::Foreground {
+            pid: 7,
+            hwnd: 200,
+            exe: r"C:\Windows\Explorer.EXE".into(),
+            fullscreen: false,
+        });
+        emit(OsEvent::Foreground { pid: 9, hwnd: 300, exe: DISCORD.into(), fullscreen: false });
         wait_for_focus(&engine, "Discord.exe", false);
         let state = game.0.lock().unwrap();
         assert_eq!(state.0, 1, "started once");
@@ -2285,8 +2420,12 @@ mod tests {
         let ports = Ports { input: Some(Box::new(input.clone())), ..Ports::default() };
         let (engine, _) = spawn(ports);
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
-        let injected =
-            input.inject(OsEvent::Foreground { pid: 1, hwnd: 1, exe: r"C:\x\cs2.exe".into() });
+        let injected = input.inject(OsEvent::Foreground {
+            pid: 1,
+            hwnd: 1,
+            exe: r"C:\x\cs2.exe".into(),
+            fullscreen: false,
+        });
         assert!(injected, "the engine started the input source");
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.game.is_some()));
     }
@@ -2303,7 +2442,12 @@ mod tests {
     #[test]
     fn foreground_game_applies_its_profile() {
         let (engine, input) = spawn_with_input(screen_settings());
-        input.inject(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into() });
+        input.inject(OsEvent::Foreground {
+            pid: 42,
+            hwnd: 100,
+            exe: CS2.into(),
+            fullscreen: false,
+        });
         let EngineEvent::ProfileApplied { exe, window, clamped } =
             wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }))
         else {
@@ -2317,12 +2461,18 @@ mod tests {
     #[test]
     fn unknown_apps_keep_the_current_profile() {
         let (engine, input) = spawn_with_input(screen_settings());
-        input.inject(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into() });
+        input.inject(OsEvent::Foreground {
+            pid: 42,
+            hwnd: 100,
+            exe: CS2.into(),
+            fullscreen: false,
+        });
         wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }));
         input.inject(OsEvent::Foreground {
             pid: 9,
             hwnd: 300,
             exe: r"C:\Windows\notepad.exe".into(),
+            fullscreen: false,
         });
         // Collect what the engine says up to the status for the new focus.
         let mut events = Vec::new();
@@ -2354,6 +2504,7 @@ mod tests {
             pid: 42,
             hwnd: 100,
             exe: r"C:\Games\RainbowSix.exe".into(),
+            fullscreen: false,
         });
         let EngineEvent::ProfileApplied { window, clamped, .. } =
             wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }))
@@ -2368,7 +2519,12 @@ mod tests {
     #[test]
     fn game_exit_reverts_to_the_default_window() {
         let (engine, input) = spawn_with_input(screen_settings());
-        input.inject(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into() });
+        input.inject(OsEvent::Foreground {
+            pid: 42,
+            hwnd: 100,
+            exe: CS2.into(),
+            fullscreen: false,
+        });
         wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }));
         input.inject(OsEvent::ProcessExited { pid: 42, exit_code: 0 });
         let EngineEvent::Status(status) =
@@ -2383,7 +2539,12 @@ mod tests {
     #[test]
     fn exit_of_an_untracked_process_is_ignored() {
         let (engine, input) = spawn_with_input(screen_settings());
-        input.inject(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into() });
+        input.inject(OsEvent::Foreground {
+            pid: 42,
+            hwnd: 100,
+            exe: CS2.into(),
+            fullscreen: false,
+        });
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.game.is_some()));
         input.inject(OsEvent::ProcessExited { pid: 7, exit_code: 1 });
         // Give cs2 a window no status published so far has, so only a status made after the exit
@@ -2420,7 +2581,12 @@ mod tests {
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.capturing));
 
         // cs2's default profile has session recording on.
-        input.inject(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into() });
+        input.inject(OsEvent::Foreground {
+            pid: 42,
+            hwnd: 100,
+            exe: CS2.into(),
+            fullscreen: false,
+        });
         let EngineEvent::RecordingStarted { path } =
             wait_for(&engine, |e| matches!(e, EngineEvent::RecordingStarted { .. }))
         else {
@@ -2460,25 +2626,153 @@ mod tests {
         assert!(targets.lock().unwrap().is_empty(), "nothing is captured before a game");
 
         let emit = input.0.lock().unwrap().clone().expect("input started");
-        emit(OsEvent::Foreground { pid: 7, hwnd: 900, exe: DISCORD.into() });
+        emit(OsEvent::Foreground { pid: 7, hwnd: 900, exe: DISCORD.into(), fullscreen: false });
         wait_for_focus(&engine, DISCORD, false);
-        emit(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into() });
+        emit(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into(), fullscreen: false });
         wait_for_focus(&engine, CS2, true);
         assert_eq!(*targets.lock().unwrap(), [CaptureTarget::Window(100)]);
 
-        emit(OsEvent::Foreground { pid: 7, hwnd: 900, exe: DISCORD.into() });
+        emit(OsEvent::Foreground { pid: 7, hwnd: 900, exe: DISCORD.into(), fullscreen: false });
         wait_for_focus(&engine, DISCORD, false);
         // Alt+F10 still saves while capture is paused: the buffer is kept, so the save is only
         // "nothing buffered yet", not "capture hasn't started".
         engine.send(Command::SaveClip).unwrap();
         wait_for(&engine, |e| matches!(e, EngineEvent::Warning(m) if m == "Nothing to save yet."));
 
-        emit(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into() });
+        emit(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into(), fullscreen: false });
         wait_for_focus(&engine, CS2, true);
         assert_eq!(targets.lock().unwrap().len(), 2, "the same game resumes on its window");
         engine.shutdown();
     }
 
+    /// Focus `exe` as `pid` on the synthetic input, and wait until the engine has handled it.
+    fn focus_app(
+        engine: &EngineHandle,
+        input: &SyntheticInput,
+        pid: u32,
+        hwnd: isize,
+        exe: &str,
+        fullscreen: bool,
+    ) {
+        input.inject(OsEvent::Foreground { pid, hwnd, exe: exe.into(), fullscreen });
+        let name = exe_name(exe).to_owned();
+        wait_for(
+            engine,
+            move |e| matches!(e, EngineEvent::Status(s) if s.game.as_deref() == Some(name.as_str())),
+        );
+    }
+
+    /// Collects events for `period` and reports whether any of them is a focus prompt.
+    fn a_focus_prompt_within(engine: &EngineHandle, period: Duration) -> bool {
+        let deadline = Instant::now() + period;
+        while let Some(event) =
+            engine.wait_event(deadline.saturating_duration_since(Instant::now()))
+        {
+            if matches!(event, EngineEvent::FocusPrompt { .. }) {
+                return true;
+            }
+        }
+        false
+    }
+
+    const R6: &str = r"D:\Games\RainbowSix.exe";
+    const WINDOWED: &str = r"E:\Games\Windowed.exe";
+
+    #[test]
+    fn a_second_game_waits_for_the_user_before_it_takes_over() {
+        let (engine, input) = spawn_with_input(screen_settings());
+        input.inject(OsEvent::Foreground {
+            pid: 42,
+            hwnd: 100,
+            exe: CS2.into(),
+            fullscreen: false,
+        });
+        wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }));
+
+        input.inject(OsEvent::Foreground { pid: 77, hwnd: 300, exe: R6.into(), fullscreen: false });
+        let EngineEvent::FocusPrompt { current, candidate } =
+            wait_for(&engine, |e| matches!(e, EngineEvent::FocusPrompt { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!((current.as_str(), candidate.as_str()), ("cs2.exe", "RainbowSix.exe"));
+        assert!(!input.watched().contains(&77), "the candidate is not tracked before the answer");
+
+        engine.send(Command::FocusChoice(FocusChoice::Switch)).unwrap();
+        let EngineEvent::ProfileApplied { exe, .. } =
+            wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(exe, "RainbowSix.exe", "Switch applies the candidate's profile");
+        assert!(input.watched().contains(&77), "and watches its process");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_quick_alt_tab_and_an_ordinary_app_never_prompt() {
+        let (engine, input) = spawn_with_input(screen_settings());
+        input.inject(OsEvent::Foreground {
+            pid: 42,
+            hwnd: 100,
+            exe: CS2.into(),
+            fullscreen: false,
+        });
+        wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }));
+
+        // Flick through a second game, then leave it before the debounce ends.
+        input.inject(OsEvent::Foreground { pid: 77, hwnd: 300, exe: R6.into(), fullscreen: false });
+        input.inject(OsEvent::Foreground {
+            pid: 9,
+            hwnd: 900,
+            exe: DISCORD.into(),
+            fullscreen: false,
+        });
+        // A windowed app without a profile is never a candidate.
+        assert!(!a_focus_prompt_within(&engine, Duration::from_millis(3_500)));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_fullscreen_app_without_a_profile_is_a_candidate() {
+        let (engine, input) = spawn_with_input(screen_settings());
+        input.inject(OsEvent::Foreground {
+            pid: 42,
+            hwnd: 100,
+            exe: CS2.into(),
+            fullscreen: false,
+        });
+        wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }));
+
+        input.inject(OsEvent::Foreground {
+            pid: 55,
+            hwnd: 500,
+            exe: WINDOWED.into(),
+            fullscreen: true,
+        });
+        let EngineEvent::FocusPrompt { candidate, .. } =
+            wait_for(&engine, |e| matches!(e, EngineEvent::FocusPrompt { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(candidate, "Windowed.exe");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_pair_prompts_once_per_session() {
+        let (engine, input) = spawn_with_input(screen_settings());
+        focus_app(&engine, &input, 42, 100, CS2, false);
+        input.inject(OsEvent::Foreground { pid: 77, hwnd: 300, exe: R6.into(), fullscreen: false });
+        wait_for(&engine, |e| matches!(e, EngineEvent::FocusPrompt { .. }));
+        engine.send(Command::FocusChoice(FocusChoice::Keep)).unwrap();
+
+        // Back to the tracked game, then to the candidate again: the pair has been asked.
+        focus_app(&engine, &input, 42, 100, CS2, false);
+        input.inject(OsEvent::Foreground { pid: 77, hwnd: 300, exe: R6.into(), fullscreen: false });
+        assert!(!a_focus_prompt_within(&engine, Duration::from_millis(3_500)));
+        engine.shutdown();
+    }
     #[test]
     fn screen_mode_records_the_primary_monitor_from_the_start() {
         let targets = Arc::new(Mutex::new(Vec::new()));
