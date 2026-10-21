@@ -13,7 +13,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
 use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_SYSTEM_FOREGROUND, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
-    OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    IsZoomed, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 use windows::core::PWSTR;
 use zc_core::ports::{OsEvent, SourceError};
@@ -42,12 +42,18 @@ fn report(hwnd: HWND) {
 }
 
 /// Whether the window covers its whole monitor: fullscreen, or borderless on it (D35). A
-/// maximised window stops at the taskbar, short of the monitor edge, so it doesn't count.
-/// Compares [GetWindowRect](https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-getwindowrect)
+/// maximised window doesn't count, even when it overshoots the monitor by its frame (no taskbar
+/// on that monitor, or an auto-hide taskbar): it is checked with
+/// [IsZoomed](https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-iszoomed) first.
+/// Otherwise compares [GetWindowRect](https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-getwindowrect)
 /// with the monitor's `rcMonitor` from [MONITORINFO](https://learn.microsoft.com/windows/win32/api/winuser/ns-winuser-monitorinfo).
 /// `false` when either can't be read (the window closed already).
 #[must_use]
 pub fn covers_its_monitor(hwnd: HWND) -> bool {
+    // SAFETY: plain FFI call; a bad handle gives FALSE.
+    if unsafe { IsZoomed(hwnd) }.as_bool() {
+        return false;
+    }
     let mut window = RECT::default();
     // SAFETY: `window` is a valid out-parameter for the call; it is only read on success.
     if unsafe { GetWindowRect(hwnd, &mut window) }.is_err() {
