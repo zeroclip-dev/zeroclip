@@ -7,10 +7,12 @@ use eframe::egui::{self, Button, ComboBox, DragValue, Grid, Slider, TextEdit};
 use zc_audio::MicDevice;
 use zc_core::hotkey::Chord;
 use zc_core::media::{Codec, ContainerFormat};
-use zc_core::settings::{AAC_BITRATES_KBPS, CaptureMode, MIX_GAIN_DB, MicMode, Settings};
+use zc_core::settings::{
+    AAC_BITRATES_KBPS, CaptureMode, DvrStorage, MIX_GAIN_DB, MicMode, Settings,
+};
 use zc_video::capture::MonitorInfo;
 
-use super::{dvr_megabytes, human_duration};
+use super::{dvr_megabytes, dvr_ring_megabytes, human_duration};
 use crate::app::ZeroClipApp;
 
 const MIC_POLL: Duration = Duration::from_secs(2);
@@ -30,6 +32,9 @@ pub struct Draft {
     mics_listed: Instant,
     /// Displays Windows reports. Listed when the draft is made, and by the Refresh button.
     monitors: Vec<MonitorInfo>,
+    /// Whether the ring folder named here (as typed) is on a spinning disk. Probed when the folder
+    /// changes, not on every frame.
+    ring_drive: Option<(String, bool)>,
     /// Problems from the last save attempt.
     pub problems: Vec<String>,
 }
@@ -52,6 +57,7 @@ impl Draft {
             mics: zc_audio::list_microphones(),
             mics_listed: Instant::now(),
             monitors: zc_video::capture::list_monitors(),
+            ring_drive: None,
             problems: Vec::new(),
         }
     }
@@ -239,21 +245,71 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
             let dvr = &mut draft.settings.dvr;
             ui.checkbox(&mut dvr.enabled, "Keep a rolling buffer of recent gameplay");
             ui.horizontal(|ui| {
-                ui.label("Memory limit");
-                ui.add(DragValue::new(&mut dvr.ram_ceiling_mib).range(64..=16_384).suffix(" MiB"));
+                ui.label("Keep the buffer in");
+                ComboBox::from_id_salt("dvr_storage")
+                    .selected_text(storage_label(dvr.storage))
+                    .show_ui(ui, |ui| {
+                        for option in [DvrStorage::Ram, DvrStorage::Disk] {
+                            ui.selectable_value(&mut dvr.storage, option, storage_label(option));
+                        }
+                    });
             });
-            let ceiling = super::effective_ceiling(dvr.ram_ceiling_mib);
-            if ceiling.from_system_ram {
+            if dvr.storage == DvrStorage::Disk {
+                let dir = dvr.ring_dir.as_ref().map_or_else(
+                    || if draft.output_dir.trim().is_empty() { default_dir.clone() } else { draft.output_dir.trim().to_owned() },
+                    |dir| dir.display().to_string(),
+                );
+                let on_hdd = match &draft.ring_drive {
+                    Some((probed, hdd)) if *probed == dir => *hdd,
+                    _ => {
+                        let hdd = zc_win::drive::seek_penalty(std::path::Path::new(&dir))
+                            .ok()
+                            .flatten()
+                            .unwrap_or(false);
+                        draft.ring_drive = Some((dir.clone(), hdd));
+                        hdd
+                    }
+                };
+                // The engine sizes the file once, for the longest profile.
+                let profiles = &draft.settings.profiles;
+                let longest = profiles
+                    .games
+                    .iter()
+                    .map(|game| game.buffer_secs)
+                    .chain([profiles.default.buffer_secs])
+                    .max()
+                    .unwrap_or_default();
                 ui.weak(format!(
-                    "Your RAM caps this at {} MiB (5% of the total), so that is the limit in use.",
-                    ceiling.mib
+                    "The ring file, sized for your longest profile ({}), takes about {} MB in {dir}, and the buffer uses almost no RAM. It applies when ZeroClip restarts.",
+                    human_duration(zc_core::Hns::from_secs(i64::from(longest))),
+                    dvr_ring_megabytes(longest, max_kbps, draft.settings.audio.bitrate_kbps),
+                ));
+                if on_hdd {
+                    ui.colored_label(
+                        super::notice_color(super::NoticeLevel::Warning),
+                        "That folder is on a hard disk. Constant buffer writes can make games stutter; pick an SSD.",
+                    );
+                }
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label("Memory limit");
+                    ui.add(
+                        DragValue::new(&mut dvr.ram_ceiling_mib).range(64..=16_384).suffix(" MiB"),
+                    );
+                });
+                let ceiling = super::effective_ceiling(dvr.ram_ceiling_mib);
+                if ceiling.from_system_ram {
+                    ui.weak(format!(
+                        "Your RAM caps this at {} MiB (5% of the total), so that is the limit in use.",
+                        ceiling.mib
+                    ));
+                }
+                ui.weak(format!(
+                    "Buffer length is set per game on the Profiles tab. The default ({}) needs about {} MB at the maximum bitrate.",
+                    human_duration(window),
+                    dvr_megabytes(draft.settings.profiles.default.buffer_secs, max_kbps),
                 ));
             }
-            ui.weak(format!(
-                "Buffer length is set per game on the Profiles tab. The default ({}) needs about {} MB at the maximum bitrate.",
-                human_duration(window),
-                dvr_megabytes(draft.settings.profiles.default.buffer_secs, max_kbps),
-            ));
         });
 
         section(ui, "Audio", |ui| {
@@ -398,6 +454,13 @@ fn container_label(container: ContainerFormat) -> &'static str {
     match container {
         ContainerFormat::FragmentedMp4 => "Fragmented MP4 (.mp4)",
         ContainerFormat::Matroska => "Matroska (.mkv)",
+    }
+}
+
+fn storage_label(storage: DvrStorage) -> &'static str {
+    match storage {
+        DvrStorage::Ram => "RAM",
+        DvrStorage::Disk => "Disk (SSD recommended, uses almost no RAM)",
     }
 }
 
