@@ -14,7 +14,9 @@ use zc_core::dvr::DvrConfig;
 use zc_core::media::PacketRef;
 use zc_core::sink::{PacketSink, PacketWriter, SinkError};
 use zc_core::testing::SyntheticStream;
+use zc_engine::disk_dvr::{DiskRing, Persister};
 use zc_engine::recorder::{Recorder, RecorderStats};
+use zc_mux::pacing::WritePacer;
 
 struct CountingAllocator;
 
@@ -99,6 +101,32 @@ fn recorder_push_never_allocates() {
     // Guard against a vacuous pass: every packet must really have been stored and teed.
     assert_eq!(recorder.stats(), RecorderStats::default());
     assert!(written.load(Ordering::Relaxed) > 0, "the tee never reached its writer");
+}
+
+/// Disk mode (P4.21): the hot path still only copies into the staging area, while the persister
+/// thread writes GOPs to the ring file at the same time. Only the pushing thread is counted.
+#[test]
+fn recorder_push_never_allocates_in_disk_mode() {
+    let dir = std::env::temp_dir().join(format!("zc-no-alloc-ring-{}", std::process::id()));
+    let ring = Arc::new(DiskRing::create(&dir, 1_000_000).expect("ring file"));
+    let recorder =
+        Arc::new(Recorder::new(DvrConfig { video_bytes: 300_000, audio_bytes: 100_000 }));
+    let persister = Persister::start(&recorder, &ring, WritePacer::unlimited()).expect("thread");
+    let mut stream = SyntheticStream::new();
+    for p in stream.take_secs(10) {
+        recorder.push(p.view());
+    }
+    let mut batch = stream.take_secs(4);
+    batch.truncate(600);
+    let allocations = allocations_during(|| {
+        for p in &batch {
+            recorder.push(p.view());
+        }
+    });
+    drop(persister);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(allocations, 0, "Recorder::push allocated {allocations} times in disk mode");
+    assert_eq!(recorder.stats(), RecorderStats::default());
 }
 
 #[test]

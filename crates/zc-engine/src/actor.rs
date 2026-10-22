@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs::File;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
@@ -16,7 +16,7 @@ use zc_core::control::{Command, EngineEvent, EngineStatus, FocusChoice, MicState
 use zc_core::dvr::{DvrClip, DvrConfig, DvrError};
 use zc_core::focus_prompt::{self, DEBOUNCE, FocusAction, Focused, is_shell, pair_key};
 use zc_core::hotkey::{Binding, ChordMatcher, HotkeyEvent, Trigger};
-use zc_core::media::{TrackId, TrackInfo, TrackKind};
+use zc_core::media::{PacketRef, TrackId, TrackInfo, TrackKind};
 use zc_core::ports::{
     AudioSource, AudioStart, CaptureTarget, Emit, InputSource, LockMemory, OsEvent, SeekPenalty,
     SourceError, TotalMemory, VideoSource, VideoStart,
@@ -24,14 +24,15 @@ use zc_core::ports::{
 use zc_core::profile::{
     GameProfile, ProfileSet, WindowClamp, clamp_window, effective_ram_ceiling, exe_name,
 };
-use zc_core::settings::{CaptureMode, MicMode, Settings};
+use zc_core::settings::{CaptureMode, DvrStorage, MicMode, Settings};
 use zc_core::sink::{SharedSink, SinkId};
 use zc_core::watchdog::{HealthEvent, Watchdog, WatchdogAction, WatchdogConfig, WatchdogState};
 use zc_core::{Codec, Hns};
 use zc_mux::pacing::{DriveKind, WritePacer};
 
+use crate::disk_dvr::{self, DiskRing, Persister, STAGING_BYTES};
 use crate::output::{self, OutputConfig};
-use crate::recorder::{Recorder, RecorderStats};
+use crate::recorder::{Copied, Recorder, RecorderStats};
 use crate::spool;
 
 /// The platform adapters the engine drives. Every one is optional: the app runs,
@@ -121,8 +122,11 @@ impl Engine {
         // Read once: the machine's RAM doesn't change while the engine runs.
         let total_mib = ports.total_memory.and_then(|total| total());
         let (dvr, _) = dvr_config(&config.settings, total_mib);
+        let storage = config.settings.dvr.storage;
         let actor = Actor {
             total_mib,
+            storage,
+            persister: None,
             output_dir: config
                 .settings
                 .recording
@@ -255,6 +259,11 @@ struct Actor {
     settings: Settings,
     /// The machine's physical RAM in MiB, if the port could read it (D32).
     total_mib: Option<u64>,
+    /// Where the DVR buffer really lives this run. Starts as the setting; `start_ring` drops it to
+    /// RAM if the ring file can't be made, and a change in settings applies at the next start.
+    storage: DvrStorage,
+    /// The thread that writes finished GOPs to the ring file, in disk mode (P4.21).
+    persister: Option<Persister>,
     output_dir: PathBuf,
     ports: Ports,
     /// Our own inbox, for the emitters handed to sources.
@@ -480,16 +489,32 @@ fn bindings(settings: &Settings) -> Vec<Binding<HotkeyAction>> {
 
 /// Sizes the DVR for these settings, and says how the RAM ceiling clamped the window the
 /// profile asks for (DESIGN §7). With the DVR off, both rings are zero bytes, which
-/// `DvrBuffer` treats as off.
+/// `DvrBuffer` treats as off. In disk mode the buffer is only the staging area, and the window
+/// isn't limited by RAM (D32, P4.21).
 fn dvr_config(settings: &Settings, total_mib: Option<u64>) -> (DvrConfig, WindowClamp) {
-    let ram = effective_ram_ceiling(settings.dvr.ram_ceiling_mib, total_mib);
-    let clamp = clamp_for(settings, &settings.profiles.default, ram.mib);
-    let config = if settings.dvr.enabled {
-        dvr_for(settings, clamp.window)
+    let disk = settings.dvr.storage == DvrStorage::Disk;
+    let ceiling = if disk {
+        u32::MAX
     } else {
-        DvrConfig { video_bytes: 0, audio_bytes: 0 }
+        effective_ram_ceiling(settings.dvr.ram_ceiling_mib, total_mib).mib
+    };
+    let clamp = clamp_for(settings, &settings.profiles.default, ceiling);
+    let config = match (settings.dvr.enabled, disk) {
+        (false, _) => DvrConfig { video_bytes: 0, audio_bytes: 0 },
+        (true, true) => staging_config(settings),
+        (true, false) => dvr_for(settings, clamp.window),
     };
     (config, clamp)
+}
+
+/// The RAM disk mode keeps: four GOPs at the worst-case bitrate, and at least `STAGING_BYTES`.
+fn staging_config(settings: &Settings) -> DvrConfig {
+    let window = Hns(settings.video.keyframe_interval().ticks().saturating_mul(4));
+    let config = dvr_for(settings, window);
+    DvrConfig {
+        video_bytes: config.video_bytes.max(STAGING_BYTES),
+        audio_bytes: config.audio_bytes.max(STAGING_BYTES / 16),
+    }
 }
 
 /// The DVR rings for a `window` at the bitrates in these settings.
@@ -547,9 +572,12 @@ fn file_stamp(t: OffsetDateTime) -> String {
     t.format(format).unwrap_or_else(|_| t.unix_timestamp().to_string())
 }
 
-/// Snapshots the DVR window that ends at `end` and writes it to a new clip file. Runs on the
-/// clip's IO thread, so the snapshot's short lock holds and the paced disk write both stay off
-/// the actor (D29).
+/// How many times a save starts over when the ring file is overwritten under it (P4.21).
+const RING_RETRIES: u32 = 2;
+
+/// Copies the DVR window that ends at `end` and writes it to a new clip file. Runs on the clip's
+/// IO thread, so the copy's short lock holds, the ring reads and the paced disk write all stay
+/// off the actor (D29).
 fn save_clip_file(
     recorder: &Recorder,
     window: Hns,
@@ -558,28 +586,79 @@ fn save_clip_file(
     tracks: &[TrackInfo],
     label: &str,
 ) -> Result<(PathBuf, Hns), ClipError> {
-    let clip = recorder.snapshot_until(window, end).map_err(|e| match e {
-        DvrError::Empty => ClipError::NothingBuffered,
-        other => ClipError::Failed(other.to_string()),
-    })?;
-    let (path, file) = output::create_file(&cfg.dir, label, cfg.format.extension())
-        .map_err(|e| ClipError::Failed(e.to_string()))?;
-    write_dump(&clip, path, file, tracks, cfg)
+    let copied = recorder
+        .plan_clip(window, Some(end))
+        .and_then(|plan| recorder.copy_plan(plan))
+        .map_err(|e| match e {
+            DvrError::Empty => ClipError::NothingBuffered,
+            other => ClipError::Failed(other.to_string()),
+        })?;
+    let create = || output::create_file(&cfg.dir, label, cfg.format.extension());
+    write_copied(copied, create, tracks, cfg)
 }
 
 /// Writes a crash rescue that was already copied out of the DVR to `path`, a new file (P4.11).
 /// Runs on the clip's IO thread. `create_new` means an unanswered rescue is never overwritten.
 fn save_rescue_file(
-    clip: &DvrClip,
+    copied: Copied,
     path: PathBuf,
     cfg: &OutputConfig,
     tracks: &[TrackInfo],
 ) -> Result<(PathBuf, Hns), ClipError> {
-    let failed = |e: io::Error| ClipError::Failed(e.to_string());
     // The folder exists from startup, but the user may have removed it since.
-    std::fs::create_dir_all(&cfg.dir).map_err(failed)?;
-    let file = File::create_new(&path).map_err(failed)?;
-    write_dump(clip, path, file, tracks, cfg)
+    std::fs::create_dir_all(&cfg.dir).map_err(|e| ClipError::Failed(e.to_string()))?;
+    let create = || File::create_new(&path).map(|file| (path.clone(), file));
+    write_copied(copied, create, tracks, cfg)
+}
+
+/// Writes a copied clip to the new file `create` makes. A clip in RAM is written as it is. A
+/// disk-mode clip is streamed from the ring file (see [`write_streamed`]).
+fn write_copied(
+    copied: Copied,
+    mut create: impl FnMut() -> io::Result<(PathBuf, File)>,
+    tracks: &[TrackInfo],
+    cfg: &OutputConfig,
+) -> Result<(PathBuf, Hns), ClipError> {
+    match copied {
+        Copied::Ram(clip) => {
+            let (path, file) = create().map_err(|e| ClipError::Failed(e.to_string()))?;
+            write_dump(&clip, path, file, tracks, cfg)
+        }
+        Copied::Disk(mut clip) => write_streamed(create, tracks, cfg, |attempt, write| {
+            if attempt > 0 {
+                clip.replan();
+            }
+            clip.stream(write)
+        }),
+    }
+}
+
+/// Writes the packets `stream` hands to its writer into a new file. `stream` gets the attempt
+/// number, 0 first. If it fails with [`disk_dvr::Lapped`], some of the clip was overwritten after
+/// packets were written: the partial file is removed and `stream` runs again into a fresh file,
+/// at most [`RING_RETRIES`] more times. It returns the clip's length.
+fn write_streamed(
+    mut create: impl FnMut() -> io::Result<(PathBuf, File)>,
+    tracks: &[TrackInfo],
+    cfg: &OutputConfig,
+    mut stream: impl FnMut(u32, &mut dyn FnMut(PacketRef<'_>) -> io::Result<()>) -> io::Result<Hns>,
+) -> Result<(PathBuf, Hns), ClipError> {
+    let failed = |e: io::Error| ClipError::Failed(e.to_string());
+    for attempt in 0..=RING_RETRIES {
+        let (path, file) = create().map_err(failed)?;
+        match output::write_clip_with(file, tracks, cfg, |write| stream(attempt, write)) {
+            Ok(duration) => return Ok(finish_dump(path, duration)),
+            Err(e) if disk_dvr::is_lapped(&e) => {
+                tracing::debug!(attempt, "DVR ring overwritten while saving");
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(e) => return Err(failed(e)),
+        }
+    }
+    Err(ClipError::Failed(
+        "The DVR ring file was overwritten while saving, every time it was tried. The disk may          be too slow for the buffer; try again."
+            .into(),
+    ))
 }
 
 /// Writes `clip` into `file` at `path` and syncs it (DurableFile::dump, then `sync_all`), so the
@@ -592,16 +671,23 @@ fn write_dump(
     cfg: &OutputConfig,
 ) -> Result<(PathBuf, Hns), ClipError> {
     output::write_clip(clip, file, tracks, cfg).map_err(|e| ClipError::Failed(e.to_string()))?;
-    // The clip still plays without its length in the mehd, so a failure to set it is only logged.
+    Ok(finish_dump(path, clip.duration()))
+}
+
+/// The clip is written. It still plays without its length in the mehd, so a failure to set it is
+/// only logged.
+fn finish_dump(path: PathBuf, duration: Hns) -> (PathBuf, Hns) {
     if let Err(error) = zc_mux::repair::set_fragment_duration(&path) {
         tracing::warn!(error = %error, "could not set a clip's length");
     }
-    Ok((path, clip.duration()))
+    (path, duration)
 }
 
 impl Actor {
     fn run(mut self, rx: &Receiver<Msg>) {
         tracing::info!(output_dir = %self.output_dir.display(), "engine started");
+        // Before the profile: it sizes the ring file or the RAM buffer, whichever this run uses.
+        self.start_ring();
         self.reapply_profile();
         self.detect_drive();
         // Before the sources start: pinning holds the recorder lock while Windows commits the
@@ -640,6 +726,8 @@ impl Actor {
         self.stop_sources();
         self.finish_recording();
         self.finish_dumps();
+        // After the dumps: a clip being written may still read the ring. The file stays on disk.
+        drop(self.persister.take());
         tracing::info!("engine stopped");
     }
 
@@ -672,9 +760,26 @@ impl Actor {
     /// window, so there is only one copy of it to go stale.
     fn apply_profile(&mut self, profile: &GameProfile, exe: &str, announce: bool) {
         let ram = effective_ram_ceiling(self.settings.dvr.ram_ceiling_mib, self.total_mib);
-        let clamp = clamp_for(&self.settings, profile, ram.mib);
+        let disk = self.storage == DvrStorage::Disk;
+        let clamp = clamp_for(&self.settings, profile, if disk { u32::MAX } else { ram.mib });
         if clamp.window != self.status.buffer_window && self.settings.dvr.enabled {
-            self.recorder.resize(dvr_for(&self.settings, clamp.window));
+            let config = dvr_for(&self.settings, clamp.window);
+            if disk {
+                // Sized at start for the largest saved window, so this is a no-op unless a
+                // settings change since then asked for more (and then it keeps the footage).
+                match self.recorder.grow_ring(config.ring_file_bytes()) {
+                    Ok(true) => tracing::info!(window = ?clamp.window, "DVR ring file grown"),
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "DVR ring file not grown");
+                        self.emit(EngineEvent::Warning(format!(
+                            "Couldn't grow the DVR ring file ({error}). The buffer keeps its old size."
+                        )));
+                    }
+                }
+            } else {
+                self.recorder.resize(config);
+            }
         }
         self.status.buffer_window = clamp.window;
         if clamp.clamped {
@@ -901,16 +1006,25 @@ impl Actor {
     /// default profile right after, and a resize under a copy in progress would fail it
     /// (`DvrError::Changed`). It is a few short lock holds (D29), once per crash. The caller
     /// checks the dump slot is free, so this is the only copy of the window.
+    ///
+    /// In disk mode only the staged part is copied here (at most the staging area). The older
+    /// footage is streamed from the ring file on the IO thread, like a save's: reading a whole
+    /// ring here would block the actor and fill the RAM. The profile switch doesn't touch the
+    /// ring (it is sized for the largest window), so the file is still there when it is read.
     fn rescue(&mut self, game: &str, exit_code: u32) {
         if !self.settings.dvr.enabled {
             tracing::info!(game, exit_code, "game exited unexpectedly; the DVR buffer is off");
             return;
         }
         let snapshot = match self.video_track.clone() {
-            Some(video) => self.recorder.snapshot(self.status.buffer_window).map(|c| (video, c)),
+            Some(video) => self
+                .recorder
+                .plan_clip(self.status.buffer_window, None)
+                .and_then(|plan| self.recorder.copy_plan(plan))
+                .map(|copied| (video, copied)),
             None => Err(DvrError::Empty),
         };
-        let (video, clip) = match snapshot {
+        let (video, copied) = match snapshot {
             Ok(found) => found,
             Err(DvrError::Empty) => {
                 self.emit(EngineEvent::Warning(format!(
@@ -930,7 +1044,7 @@ impl Actor {
         let unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
         let path = cfg.dir.join(format!("recovery-{unix_ms}.{}.tmp", cfg.format.extension()));
         let dump = Dump::Rescue { game: game.to_owned(), exit_code };
-        self.spawn_dump(dump, move || save_rescue_file(&clip, path, &cfg, &tracks));
+        self.spawn_dump(dump, move || save_rescue_file(copied, path, &cfg, &tracks));
     }
 
     /// Lets go of the tracked game after it exited: its session recording stops, game audio
@@ -989,13 +1103,69 @@ impl Actor {
         }
     }
 
+    /// Disk mode (P4.21): creates the ring file and starts the thread that fills it. If the file
+    /// can't be created or sized (disk full, no permission), says so and keeps the buffer in RAM
+    /// for this run: `apply_profile` then sizes the RAM buffer as it always does.
+    fn start_ring(&mut self) {
+        if self.storage != DvrStorage::Disk || !self.settings.dvr.enabled {
+            return;
+        }
+        let dir = self.settings.dvr.ring_dir.clone().unwrap_or_else(|| self.output_dir.clone());
+        // The largest window of any profile, so a profile switch never needs a bigger file (RAM
+        // isn't the limit here, and a switch must not wipe the footage a rescue is about to read).
+        let profiles = &self.settings.profiles;
+        let window = std::iter::once(&profiles.default)
+            .chain(&profiles.games)
+            .map(GameProfile::buffer)
+            .max()
+            .unwrap_or(Hns::ZERO);
+        let bytes = dvr_for(&self.settings, window).ring_file_bytes();
+        let started = Instant::now();
+        let started_ring = DiskRing::create(&dir, bytes).and_then(|ring| {
+            Persister::start(&self.recorder, &Arc::new(ring), self.ring_pacer(&dir))
+        });
+        match started_ring {
+            Ok(persister) => {
+                self.persister = Some(persister);
+                tracing::info!(
+                    dir = %dir.display(),
+                    mib = bytes >> 20,
+                    took = ?started.elapsed(),
+                    "DVR ring file ready",
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, dir = %dir.display(), "DVR ring file not created");
+                self.storage = DvrStorage::Ram;
+                self.emit(EngineEvent::Warning(format!(
+                    "Couldn't create the DVR ring file in {} ({error}). The buffer is kept in RAM \
+                     for this run.",
+                    dir.display(),
+                )));
+            }
+        }
+    }
+
+    /// Ring writes are paced like dumps on a spinning disk (P3.24). The ring may sit on another
+    /// drive than the clips, so it asks the probe about its own folder.
+    fn ring_pacer(&self, dir: &Path) -> WritePacer {
+        let storage = &self.settings.storage;
+        if !storage.pace_hdd_writes {
+            return WritePacer::unlimited();
+        }
+        let answer = self.ports.seek_penalty.and_then(|probe| probe(dir).ok()).flatten();
+        let rate = u64::from(storage.hdd_write_mb_per_sec) * 1_000_000;
+        WritePacer::for_drive(DriveKind::from_seek_penalty(answer), rate)
+    }
+
     /// Pins the DVR rings of the tracks that have a source: video, and each audio source this run
     /// was built with (P3.25, DESIGN §4). The other audio slots stay unpinned (pitfall 26). Runs
     /// once, before the sources start; a video restart keeps the same rings, so their pins stay.
     /// A ring that can't be pinned is reported once, and recording goes on unpinned.
     fn page_lock_dvr(&mut self) {
         let Some(lock) = self.ports.lock_memory else { return };
-        if !self.settings.dvr.enabled {
+        // Disk mode keeps almost nothing in RAM, so there is nothing worth pinning (P4.21).
+        if !self.settings.dvr.enabled || self.storage == DvrStorage::Disk {
             return;
         }
         let video = self.ports.video.is_some().then_some(TrackId::Video);
@@ -1808,6 +1978,12 @@ impl Actor {
                     .into(),
             ));
         }
+        if stats.ring_errors > self.stats_seen.ring_errors {
+            self.emit(EngineEvent::Warning(
+                "The DVR ring file couldn't be written; the buffer is not keeping older footage."
+                    .into(),
+            ));
+        }
         // Only a recording still attached can overflow its spool. After a stop, or after its
         // IO thread gave up, a rise in the count is from a spool nobody reads, so it isn't news.
         let attached = self.recording.as_ref().is_some_and(|recording| recording.id.is_some());
@@ -2188,6 +2364,53 @@ mod tests {
             save_clip_file(&recorder, Hns::from_secs(60), Hns::from_secs(60), &cfg, &[], "clip");
         assert!(matches!(result, Err(ClipError::NothingBuffered)));
         assert!(!dir.exists(), "the file is only created once there is a clip to write");
+    }
+
+    #[test]
+    fn a_save_starts_over_when_the_ring_is_lapped_and_gives_up_after_the_retries() {
+        let dir = std::env::temp_dir().join(format!("zeroclip-clip-lapped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = OutputConfig::from_settings(&Settings::default(), dir.clone(), DriveKind::Ssd);
+        let video = TrackInfo {
+            track: TrackId::Video,
+            label: "Video".into(),
+            kind: TrackKind::Video { codec: Codec::H264, width: 1920, height: 1080, fps: 60 },
+            codec_private: Vec::new(),
+        };
+        let packets = zc_core::testing::SyntheticStream::new().take_secs(2);
+        let create = || output::create_file(&dir, "clip", "mp4");
+        let lapped = || io::Error::other(disk_dvr::Lapped);
+        let files = || std::fs::read_dir(&dir).map_or(0, Iterator::count);
+
+        // Lapped twice, after packets were written: each partial file is removed, the third
+        // attempt is kept.
+        let mut attempts = Vec::new();
+        let (path, length) =
+            write_streamed(create, std::slice::from_ref(&video), &cfg, |attempt, write| {
+                attempts.push(attempt);
+                for packet in packets.iter().filter(|p| p.meta.track == TrackId::Video) {
+                    write(packet.view())?;
+                }
+                if attempt < 2 { Err(lapped()) } else { Ok(Hns::from_secs(2)) }
+            })
+            .unwrap();
+        assert_eq!(attempts, [0, 1, 2]);
+        assert_eq!(length, Hns::from_secs(2));
+        assert_eq!(files(), 1, "only the last file is left");
+        assert!(path.is_file());
+        std::fs::remove_file(path).unwrap();
+
+        // Lapped every time: a clear error, and no partial file.
+        let mut attempts = 0;
+        let result = write_streamed(create, std::slice::from_ref(&video), &cfg, |_, write| {
+            attempts += 1;
+            write(packets[0].view())?;
+            Err(lapped())
+        });
+        assert!(matches!(result, Err(ClipError::Failed(m)) if m.contains("overwritten")));
+        assert_eq!(attempts, RING_RETRIES + 1);
+        assert_eq!(files(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2944,6 +3167,55 @@ mod tests {
         settings.dvr.enabled = false;
         let (config, _) = dvr_config(&settings, None);
         assert_eq!(config, DvrConfig { video_bytes: 0, audio_bytes: 0 });
+    }
+
+    #[test]
+    fn disk_mode_keeps_only_staging_in_ram_and_ignores_the_ram_ceiling() {
+        let mut settings = Settings::default();
+        settings.profiles.default.buffer_secs = 600;
+        settings.dvr.ram_ceiling_mib = 64;
+        settings.dvr.storage = DvrStorage::Disk;
+        let (config, clamp) = dvr_config(&settings, Some(4_096));
+        assert!(!clamp.clamped);
+        assert_eq!(clamp.window, Hns::from_secs(600));
+        assert_eq!(config, staging_config(&settings));
+        assert!(config.video_bytes < 64 << 20, "{config:?}");
+    }
+
+    #[test]
+    fn the_ring_file_is_sized_once_for_the_largest_profile() {
+        let dir = std::env::temp_dir().join(format!("zeroclip-ring-size-{}", std::process::id()));
+        let mut settings = Settings::default();
+        settings.dvr.storage = DvrStorage::Disk;
+        settings.dvr.ring_dir = Some(dir.clone());
+        settings.profiles.default.buffer_secs = 30;
+        settings.profiles.games[0].buffer_secs = 900;
+        let biggest = dvr_for(&settings, Hns::from_secs(900)).ring_file_bytes();
+        let default = dvr_for(&settings, Hns::from_secs(30)).ring_file_bytes();
+        assert!(biggest > default);
+
+        let (engine, _) = spawn_in(settings, Ports::default());
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        let ring = dir.join(disk_dvr::RING_FILE_NAME);
+        assert_eq!(std::fs::metadata(&ring).unwrap().len(), biggest);
+        engine.shutdown();
+        assert!(ring.is_file(), "the ring file stays after a clean shutdown");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unusable_ring_folder_falls_back_to_ram_with_a_warning() {
+        // A file where the folder should be: the ring file can't be created under it.
+        let blocker =
+            std::env::temp_dir().join(format!("zeroclip-ring-blocker-{}", std::process::id()));
+        std::fs::write(&blocker, b"x").unwrap();
+        let mut settings = Settings::default();
+        settings.dvr.storage = DvrStorage::Disk;
+        settings.dvr.ring_dir = Some(blocker.clone());
+        let (engine, _) = spawn_in(settings, Ports::default());
+        wait_for(&engine, |e| matches!(e, EngineEvent::Warning(m) if m.contains("ring file")));
+        engine.shutdown();
+        let _ = std::fs::remove_file(blocker);
     }
 
     #[test]

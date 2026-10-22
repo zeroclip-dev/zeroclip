@@ -13,7 +13,7 @@
 //! pre-allocated, and disk writers only copy into the recording spool (the IO
 //! thread does the actual writes).
 
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use zc_core::dvr::{DvrBuffer, DvrClip, DvrConfig, DvrError, SnapshotCopy, SnapshotPlan};
@@ -21,6 +21,8 @@ use zc_core::media::{PacketMeta, PacketRef, TrackId};
 use zc_core::ports::{LockMemory, SourceError};
 use zc_core::sink::{PacketSink, PacketWriter, SinkId, Tee};
 use zc_core::time::{Hns, MasterClock};
+
+use crate::disk_dvr::{DiskClip, DiskPlan, DiskRing};
 
 /// Payload copied per lock hold by [`Recorder::snapshot`]. Each hold stays well under the
 /// 5 ms target from D29, so encoder and audio threads never wait long for the lock.
@@ -36,6 +38,8 @@ pub struct RecorderStats {
     pub dvr_errors: u64,
     /// Failed writes to disk writers.
     pub writer_errors: u64,
+    /// Failed writes to the DVR ring file (disk mode, P4.21).
+    pub ring_errors: u64,
 }
 
 struct State {
@@ -45,9 +49,54 @@ struct State {
     /// The last page-lock request, so a resize can pin the new rings the same way (P4.6).
     pin: Option<(LockMemory, Vec<TrackId>)>,
     clock: MasterClock,
+    /// The whole buffer in RAM mode. In disk mode only the staging area in front of `disk`.
     dvr: DvrBuffer,
+    /// The ring file that holds the older footage, in disk mode (P4.21).
+    disk: Option<Arc<DiskRing>>,
     tee: Tee,
     stats: RecorderStats,
+}
+
+/// What a clip copies: the staged part from RAM and, in disk mode, the older records from the
+/// ring file. Chosen under the lock by [`Recorder::plan_clip`].
+pub(crate) struct ClipPlan {
+    staged: SnapshotPlan,
+    disk: Option<(Arc<DiskRing>, DiskPlan)>,
+    /// Where the clip ends, if it isn't at the newest frame.
+    until: Option<Hns>,
+}
+
+/// A planned clip after its staged part was copied.
+pub(crate) enum Copied {
+    /// All of it is in RAM: RAM mode, or a window that staging holds.
+    Ram(DvrClip),
+    /// The older part is still in the ring file and is read as the clip is written.
+    Disk(DiskClip),
+}
+
+impl Copied {
+    /// The whole clip in RAM, reading the ring part in too. For [`Recorder::snapshot`]: a save
+    /// writes a [`DiskClip`] as a stream instead, so a long window doesn't fill the RAM.
+    pub(crate) fn into_clip(self) -> Result<DvrClip, DvrError> {
+        match self {
+            Self::Ram(clip) => Ok(clip),
+            Self::Disk(clip) => clip.collect(),
+        }
+    }
+}
+
+/// The oldest GOP the ring file doesn't have yet, copied out of the staging area.
+pub(crate) enum GopCopy {
+    Ready {
+        clip: DvrClip,
+        end: Hns,
+        epoch: u64,
+    },
+    /// The copy failed (the writer lapped it, or the buffer was cleared). The GOP is skipped.
+    Lost {
+        end: Hns,
+        epoch: u64,
+    },
 }
 
 /// Owns the DVR buffer, the master clock and the disk-writer tee.
@@ -71,6 +120,7 @@ impl Recorder {
                 pin: None,
                 clock: MasterClock::new(),
                 dvr: DvrBuffer::new(config),
+                disk: None,
                 tee: Tee::new(),
                 stats: RecorderStats::default(),
             }),
@@ -88,7 +138,7 @@ impl Recorder {
     /// [`DvrError::Empty`] if nothing has been recorded yet, and [`DvrError::Changed`] if
     /// the buffer was cleared or resized during the copy.
     pub fn snapshot(&self, window: Hns) -> Result<DvrClip, DvrError> {
-        self.copy_out(|dvr| dvr.plan_snapshot(window))
+        self.copy_out(window, None)
     }
 
     /// [`snapshot`](Self::snapshot) for a clip that ends at `end`, cut on every track (see
@@ -97,7 +147,7 @@ impl Recorder {
     /// # Errors
     /// As for [`snapshot`](Self::snapshot).
     pub fn snapshot_until(&self, window: Hns, end: Hns) -> Result<DvrClip, DvrError> {
-        self.copy_out(|dvr| dvr.plan_snapshot_until(window, end))
+        self.copy_out(window, Some(end))
     }
 
     /// Where a clip cut now would end: the end of the newest video frame. Zero when the buffer
@@ -108,15 +158,30 @@ impl Recorder {
     }
 
     /// Plans a clip under the lock and copies it out in short holds.
-    fn copy_out(
-        &self,
-        make_plan: impl FnOnce(&DvrBuffer) -> Result<SnapshotPlan, DvrError>,
-    ) -> Result<DvrClip, DvrError> {
+    fn copy_out(&self, window: Hns, until: Option<Hns>) -> Result<DvrClip, DvrError> {
+        self.copy_plan(self.plan_clip(window, until)?)?.into_clip()
+    }
+
+    /// The first half of a copy: decides, under the lock, what the clip is made of.
+    pub(crate) fn plan_clip(&self, window: Hns, until: Option<Hns>) -> Result<ClipPlan, DvrError> {
+        let (plan, held) = self.held(|state| state.plan_clip(window, until));
+        tracing::trace!(?held, "DVR clip planned");
+        plan
+    }
+
+    /// The second half: copies the staged footage out in short lock holds (D29). That is all of
+    /// it in RAM mode. In disk mode the older footage stays in the ring file for the caller to
+    /// stream, so this copies at most the staging area, and the ring isn't read at all here.
+    /// A packet the writer laps during the copy is left out, and the clip starts at the next
+    /// keyframe.
+    pub(crate) fn copy_plan(&self, plan: ClipPlan) -> Result<Copied, DvrError> {
         let started = Instant::now();
-        let (plan, held) = self.held(|state| make_plan(&state.dvr));
-        let mut longest_hold = held;
+        let ClipPlan { staged, disk, until } = plan;
+        let first_staged = staged.packets.iter().find(|p| p.meta.track == TrackId::Video);
+        let first_staged = first_staged.map(|p| p.meta.pts);
+        let mut longest_hold = Duration::ZERO;
         // Allocating (and pre-faulting) the clip's buffers happens outside the lock.
-        let mut copy = SnapshotCopy::new(plan?);
+        let mut copy = SnapshotCopy::new(staged);
         while !copy.is_done() {
             let (result, held) =
                 self.held(|state| copy.copy_chunk(&state.dvr, SNAPSHOT_CHUNK_BYTES));
@@ -130,13 +195,76 @@ impl Recorder {
             packets = clip.packets.len(),
             "DVR snapshot copied in short lock holds"
         );
-        Ok(clip)
+        // If the staged part lost its oldest GOP, the ring's footage would end before the clip
+        // resumes. Leave it out rather than cut a clip with a hole in it.
+        let staged_whole = clip.video().next().map(|p| p.meta.pts) == first_staged;
+        Ok(match disk {
+            Some((ring, plan)) if staged_whole && !plan.is_empty() => {
+                Copied::Disk(DiskClip::new(clip, ring, plan, until))
+            }
+            _ => Copied::Ram(clip),
+        })
     }
 
-    /// Span of video the DVR buffer holds, for the status bar (see [`DvrBuffer::buffered`]).
+    /// Disk mode: the oldest finished GOP at or after `after` that the ring file doesn't have,
+    /// once `lag` of newer video has arrived for its audio to catch up. The persister calls this.
+    pub(crate) fn next_gop(&self, after: Option<Hns>, lag: Hns) -> Option<GopCopy> {
+        let (planned, _) = self.held(|state| {
+            let epoch = state.disk.as_ref()?.epoch();
+            let mut starts = state.dvr.gop_starts().filter(|&s| after.is_none_or(|a| s >= a));
+            let (start, end) = (starts.next()?, starts.next()?);
+            (state.dvr.newest_video_end() >= end + lag).then_some(())?;
+            // The window counted back from `end` reaches exactly to the keyframe at `start`.
+            let plan = state.dvr.plan_snapshot_until(end - start, end).ok()?;
+            Some((plan, start, end, epoch))
+        });
+        let (plan, start, end, epoch) = planned?;
+        let mut copy = SnapshotCopy::new(plan);
+        let mut whole = true;
+        while !copy.is_done() {
+            let (result, _) = self.held(|state| copy.copy_chunk(&state.dvr, SNAPSHOT_CHUNK_BYTES));
+            if result.is_err() {
+                whole = false;
+                break;
+            }
+        }
+        let clip = copy.finish();
+        let intact = whole && clip.video().next().is_some_and(|p| p.meta.pts == start);
+        Some(if intact {
+            GopCopy::Ready { clip, end, epoch }
+        } else {
+            GopCopy::Lost { end, epoch }
+        })
+    }
+
+    /// Switches to disk mode: `ring` holds the footage older than the staging area (P4.21).
+    /// [`Persister::start`](crate::disk_dvr::Persister::start) calls this and starts the thread
+    /// that fills the ring.
+    pub(crate) fn attach_ring(&self, ring: Arc<DiskRing>) {
+        self.lock().disk = Some(ring);
+    }
+
+    /// Grows the ring file in disk mode to `bytes`, if it is smaller (see [`DiskRing::grow`]).
+    /// Returns whether it grew. Does nothing in RAM mode.
+    ///
+    /// # Errors
+    /// The file couldn't be resized. The old size stays.
+    pub fn grow_ring(&self, bytes: u64) -> std::io::Result<bool> {
+        let ring = self.lock().disk.clone();
+        ring.map_or(Ok(false), |ring| ring.grow(bytes))
+    }
+
+    /// Span of video the DVR buffer holds, for the status bar (see [`DvrBuffer::buffered`]). In
+    /// disk mode it counts from the oldest record in the ring, not just the staging area.
     #[must_use]
     pub fn buffered(&self) -> Hns {
-        self.lock().dvr.buffered()
+        let state = self.lock();
+        let staged = state.dvr.buffered();
+        // Recorder lock, then the ring's index lock: the order `clear` and `next_gop` take them.
+        match state.disk.as_ref().and_then(|ring| ring.oldest_start()) {
+            Some(oldest) => staged.max(state.dvr.newest_video_end().saturating_sub(oldest)),
+            None => staged,
+        }
     }
 
     /// Empties the DVR buffer, for when the video format changes or the watchdog resumes after a
@@ -144,7 +272,12 @@ impl Recorder {
     /// restarts from empty"). The [`MasterClock`] stays anchored, so the new encoder's packets
     /// carry on the session timeline instead of starting again at zero.
     pub fn clear(&self) {
-        self.lock().dvr.clear();
+        let mut state = self.lock();
+        state.dvr.clear();
+        // Under the same lock, so the persister can't copy fresh footage and then lose it.
+        if let Some(ring) = &state.disk {
+            ring.clear();
+        }
     }
 
     /// Pins the DVR rings of `tracks` in RAM with `lock` (P3.25, DESIGN §4). Replaces any pins
@@ -207,7 +340,9 @@ impl Recorder {
     /// Hot-path counters.
     #[must_use]
     pub fn stats(&self) -> RecorderStats {
-        self.lock().stats
+        let state = self.lock();
+        let ring_errors = state.disk.as_ref().map_or(0, |ring| ring.write_errors());
+        RecorderStats { ring_errors, ..state.stats }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -222,6 +357,30 @@ impl Recorder {
         let since = Instant::now();
         let result = f(&mut state);
         (result, since.elapsed())
+    }
+}
+
+impl State {
+    /// In RAM mode this is the plain DVR plan. In disk mode, a window that the staging area holds
+    /// is planned the same way. A longer one takes everything staged, plus the ring records back
+    /// to the keyframe that covers the window.
+    fn plan_clip(&self, window: Hns, until: Option<Hns>) -> Result<ClipPlan, DvrError> {
+        let plan = |window| match until {
+            Some(end) => self.dvr.plan_snapshot_until(window, end),
+            None => self.dvr.plan_snapshot(window),
+        };
+        let Some(ring) = &self.disk else {
+            return Ok(ClipPlan { staged: plan(window)?, disk: None, until });
+        };
+        let oldest = self.dvr.oldest_pts().ok_or(DvrError::Empty)?;
+        let end = until.unwrap_or_else(|| self.dvr.newest_video_end());
+        let target = end.saturating_sub(window);
+        if oldest <= target {
+            return Ok(ClipPlan { staged: plan(window)?, disk: None, until });
+        }
+        // `i64::MAX` reaches back to the oldest staged GOP, as `DvrBuffer::resize` does.
+        let disk = ring.plan(oldest, target);
+        Ok(ClipPlan { staged: plan(Hns(i64::MAX))?, disk: Some((Arc::clone(ring), disk)), until })
     }
 }
 
