@@ -55,6 +55,15 @@ impl DvrConfig {
         };
         Self { video_bytes: bytes(max_video_bitrate_bps), audio_bytes: bytes(audio_bitrate_bps) }
     }
+
+    /// Size of the ring file in disk mode (P4.21): the video ring plus every audio slot, as a
+    /// record holds a GOP's video and the audio that goes with it. The slack covers record headers.
+    #[must_use]
+    pub fn ring_file_bytes(&self) -> u64 {
+        const AUDIO_SLOTS: u64 = TrackId::COUNT as u64 - 1;
+        const SLACK: u64 = 1 << 20;
+        self.video_bytes as u64 + self.audio_bytes as u64 * AUDIO_SLOTS + SLACK
+    }
 }
 
 /// What [`DvrBuffer::push`] did with a packet.
@@ -85,6 +94,9 @@ pub enum DvrError {
     /// The buffer was cleared or resized while a snapshot was being copied.
     #[error("the buffer changed while saving; try again")]
     Changed,
+    /// The ring file (disk mode, P4.21) couldn't be read.
+    #[error("the DVR ring file couldn't be read: {0}")]
+    Disk(String),
 }
 
 /// Index of the video ring in [`DvrBuffer::rings`]. Audio rings follow it.
@@ -175,6 +187,14 @@ impl DvrBuffer {
     #[must_use]
     pub fn oldest_pts(&self) -> Option<Hns> {
         self.rings[VIDEO_RING].front().map(|meta| meta.pts)
+    }
+
+    /// Start PTS of every GOP held, oldest first. The newest is the one being written.
+    pub fn gop_starts(&self) -> impl DoubleEndedIterator<Item = Hns> + '_ {
+        self.rings[VIDEO_RING]
+            .positions()
+            .filter(|(meta, _, _)| meta.keyframe)
+            .map(|(m, _, _)| m.pts)
     }
 
     /// Span of video currently held: from the oldest GOP's start to the end of the newest frame.

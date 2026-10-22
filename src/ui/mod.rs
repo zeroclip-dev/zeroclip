@@ -104,6 +104,17 @@ pub fn dvr_megabytes(secs: u32, max_kbps: u32) -> u64 {
     u64::from(max_kbps) * 1_000 / 8 * u64::from(secs) / 1_000_000
 }
 
+/// Size of the disk-mode ring file for `secs` (P4.21), in MB. The engine sizes it the same way.
+pub fn dvr_ring_megabytes(secs: u32, max_kbps: u32, audio_kbps: u32) -> u64 {
+    let window = zc_core::Hns::from_secs(i64::from(secs));
+    let config = zc_core::dvr::DvrConfig::for_window(
+        window,
+        u64::from(max_kbps) * 1_000,
+        u64::from(audio_kbps) * 1_000,
+    );
+    config.ring_file_bytes() / 1_000_000
+}
+
 /// The DVR memory limit the engine really runs under: the setting, capped at a share of this
 /// machine's RAM (D32, P4.20). The engine and the UI must agree on it, or the Profiles tab shows
 /// windows the engine then cuts.

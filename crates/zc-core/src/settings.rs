@@ -119,12 +119,32 @@ pub struct DvrSettings {
     pub enabled: bool,
     /// Upper bound on the buffer's RAM, in MiB. Profiles asking for more are clamped.
     pub ram_ceiling_mib: u32,
+    /// Where the buffer lives (D32). Applies when the engine starts.
+    pub storage: DvrStorage,
+    /// Folder of the ring file in [`DvrStorage::Disk`] mode. `None` is the recordings folder.
+    pub ring_dir: Option<PathBuf>,
 }
 
 impl Default for DvrSettings {
     fn default() -> Self {
-        Self { enabled: true, ram_ceiling_mib: 1_024 }
+        Self {
+            enabled: true,
+            ram_ceiling_mib: 1_024,
+            storage: DvrStorage::default(),
+            ring_dir: None,
+        }
     }
+}
+
+/// Where the DVR buffer is kept (D32). Hybrid (P4.22) is not built yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DvrStorage {
+    /// Pre-allocated, page-locked RAM (D4).
+    #[default]
+    Ram,
+    /// A fixed-size ring file on disk; only a small staging area stays in RAM (P4.21).
+    Disk,
 }
 
 /// Capture and encoder settings.
@@ -462,6 +482,27 @@ mod tests {
         assert_eq!(older.video.capture_mode, CaptureMode::Game);
         let screen: Settings = toml::from_str("[video]\ncapture_mode = \"screen\"\n").unwrap();
         assert_eq!(screen.video.capture_mode, CaptureMode::Screen);
+    }
+
+    #[test]
+    fn dvr_storage_defaults_to_ram_and_loads_from_older_files() {
+        assert_eq!(Settings::default().dvr.storage, DvrStorage::Ram);
+        let older: Settings = toml::from_str(
+            "[dvr]
+enabled = true
+ram_ceiling_mib = 512
+",
+        )
+        .unwrap();
+        assert_eq!(older.dvr.storage, DvrStorage::Ram);
+        assert_eq!(older.dvr.ring_dir, None);
+        let disk: Settings = toml::from_str(
+            "[dvr]
+storage = \"disk\"
+",
+        )
+        .unwrap();
+        assert_eq!(disk.dvr.storage, DvrStorage::Disk);
     }
 
     fn track(label: &str, exe: &str) -> AppTrack {
