@@ -18,7 +18,7 @@ use time::OffsetDateTime;
 use time::macros::format_description;
 use tracing::warn;
 use zc_core::dvr::DvrClip;
-use zc_core::media::{ContainerFormat, TrackInfo};
+use zc_core::media::{ContainerFormat, PacketRef, TrackInfo};
 use zc_core::settings::Settings;
 use zc_mux::chunked::ChunkedWriter;
 use zc_mux::container::{self, ContainerWriter};
@@ -225,15 +225,31 @@ pub(crate) fn write_clip(
     tracks: &[TrackInfo],
     cfg: &OutputConfig,
 ) -> io::Result<()> {
+    write_clip_with(file, tracks, cfg, |write| {
+        clip.packets.iter().try_for_each(|packet| write(packet.view()))
+    })
+}
+
+/// [`write_clip`] for a clip that isn't in RAM whole: `feed` is given the function that writes a
+/// packet, and calls it for every packet in order (a disk-mode clip reads its ring file as it
+/// goes, P4.21). Returns what `feed` returns.
+///
+/// # Errors
+/// As for [`write_clip`], and whatever `feed` fails with. The container is not finished then.
+pub(crate) fn write_clip_with<T>(
+    file: File,
+    tracks: &[TrackInfo],
+    cfg: &OutputConfig,
+    feed: impl FnOnce(&mut dyn FnMut(PacketRef<'_>) -> io::Result<()>) -> io::Result<T>,
+) -> io::Result<T> {
     // The writer chain owns `file` and closes it inside `finish`, so sync through a second
     // handle to the same file. `FlushFileBuffers` covers every handle to it.
     let handle = file.try_clone()?;
     let mut out = open_writer(file, tracks, cfg, Durability::AtFinish)?;
-    for packet in &clip.packets {
-        out.write_packet(packet.view())?;
-    }
+    let value = feed(&mut |packet| out.write_packet(packet))?;
     out.finish()?;
-    handle.sync_all()
+    handle.sync_all()?;
+    Ok(value)
 }
 
 #[cfg(test)]

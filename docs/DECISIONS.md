@@ -251,6 +251,7 @@ contend with game asset streaming (pacing from P3.23-25 applies); a ring file is
 never grown; a crash leaves the ring on disk, which P4.11 rescue can read; clips older than the RAM
 part are slower to dump than RAM-only.
 The ring defaults to a different drive than the recordings folder when one exists, so session writes and ring writes don't compete.
+Built so far (P4.21): `ram` and `disk` only; with hybrid not built, the default is `ram`, not hybrid, and `dvr.ring_dir` defaults to the recordings folder.
 
 ### D33 · Game profiles are sticky: only a profiled game changes the profile (builds on D21, D27, D31; first sentence amended by D35)
 A profiled game becomes the tracked game when it takes focus. Its profile stays in effect until

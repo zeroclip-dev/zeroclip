@@ -16,7 +16,7 @@ state machine; editing never re-encodes; nothing is ever deleted unverified.
 | Crate | Owns | Depends on | OS |
 |---|---|---|---|
 | `zeroclip` (repo root) | egui UI, settings file, logging, **wiring** (composition root) | `zc-engine`, `zc-core`, `zc-mux`, `zc-video`, `zc-win` (drive probe, page-locking); more adapters as phases land | Windows |
-| `zc-engine` | the engine actor, recording modes, the `Recorder`, synthetic sources | `zc-core`, `zc-mux` | any |
+| `zc-engine` | the engine actor, recording modes, the `Recorder`, the disk-backed DVR ring (`disk_dvr.rs`, D32 Disk mode), synthetic sources | `zc-core`, `zc-mux` | any |
 | `zc-core` | `Hns` time, packets, codecs, DVR buffer, watchdog FSM, profiles, hotkeys, DSP, settings, **ports** | — | any |
 | `zc-mux` | container writers (fMP4/MKV), chunked writes, HDD pacing | `zc-core` | any |
 | `zc-video` | D3D11 device, WGC capture, BGRA→NV12, MF hardware encoder, screenshots | `zc-core`, `zc-win` | Windows |
@@ -53,7 +53,8 @@ state machine; editing never re-encodes; nothing is ever deleted unverified.
 | `zc-game-audio`, `zc-mic`, one per app track (up to 6 source tracks) | `zc-audio` | WASAPI event loop → `SampleTimeline` → AAC → `PacketSink::push` (MMCSS "Pro Audio"); the mic applies the PTT gate and compressor; both reopen a lost device; each also writes its PCM into the Master `MixBus` | allocate, block on I/O |
 | `zc-master-mix` (Master, D30, audio track 1) | `zc-audio` | every 20 ms: mix the `MixBus` up to 200 ms behind real time → AAC → `PacketSink::push` (MMCSS "Pro Audio") | allocate, block on I/O, hold the bus lock across an encode |
 | `zc-input` (message thread) | `zc-input` | Raw Input + WinEvent hook → `OsEvent`s; never logs keystrokes | do real work in callbacks |
-| IO | engine (Phase 3) | one thread per clip dump and per recording (chunked writes; dumps paced on HDD) | hold the recorder lock |
+| IO | engine (Phase 3) | one thread per clip dump and per recording (chunked writes; dumps paced on HDD); in disk mode a dump also reads the ring file record by record | hold the recorder lock |
+| `zc-io-ring` (disk mode, D32) | `zc-engine` (`disk_dvr.rs`) | every 250 ms: copy finished GOPs out of the staging `DvrBuffer` in short holds, write each as one record to `zeroclip-dvr.ring` (paced on HDD) | hold the recorder lock across a write |
 | tokio pool | app (Phase 5–6) | uploads, waveform extraction, ffmpeg jobs | — |
 
 ## Data flow
@@ -132,11 +133,11 @@ stateDiagram-v2
 
 | Mode | Trigger | Path | Container |
 |---|---|---|---|
-| DVR clip | hotkey | snapshot of `DvrBuffer` → clip writer | fMP4 |
+| DVR clip | hotkey | snapshot of `DvrBuffer` → clip writer. Disk mode (`disk_dvr.rs`): staged part copied first, then the ring file's records are streamed into the writer one at a time | fMP4 |
 | Manual | hotkey toggle | `Tee` → session writer | fMP4 |
 | Session | game profile | `Tee` → session writer, for the life of the game | fMP4 |
 | Screenshot | hotkey | one texture → staging → PNG | PNG |
-| Crash rescue | game died unexpectedly | `DvrBuffer` → `recovery.tmp` → prompt | fMP4 |
+| Crash rescue | game died unexpectedly | `DvrBuffer` (disk mode: its staged part, then the ring file streamed on the IO thread) → `recovery.tmp` → prompt | fMP4 |
 | Recording file | while a recording runs | spool → IO thread → `<name>.mp4.partial`, synced per fragment | fMP4, renamed to `<name>.mp4` when finished |
 | Startup repair | app start, for each `*.partial` left behind | cut to the last complete fragment → `<name>.mp4`; never overwrites | fMP4 |
 
