@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 zc-core.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

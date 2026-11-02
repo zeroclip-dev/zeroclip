@@ -7,7 +7,8 @@ use eframe::egui::{self, Button, ComboBox, DragValue, Grid, Slider, TextEdit};
 use zc_audio::MicDevice;
 use zc_core::hotkey::Chord;
 use zc_core::media::{Codec, ContainerFormat};
-use zc_core::settings::{AAC_BITRATES_KBPS, MIX_GAIN_DB, MicMode, Settings};
+use zc_core::settings::{AAC_BITRATES_KBPS, CaptureMode, MIX_GAIN_DB, MicMode, Settings};
+use zc_video::capture::MonitorInfo;
 
 use super::{dvr_megabytes, human_duration};
 use crate::app::ZeroClipApp;
@@ -27,6 +28,8 @@ pub struct Draft {
     /// Microphones Windows reports, re-listed every `MIC_POLL` while the screen is open.
     mics: Vec<MicDevice>,
     mics_listed: Instant,
+    /// Displays Windows reports. Listed when the draft is made, and by the Refresh button.
+    monitors: Vec<MonitorInfo>,
     /// Problems from the last save attempt.
     pub problems: Vec<String>,
 }
@@ -48,6 +51,7 @@ impl Draft {
             push_to_talk: hotkeys.push_to_talk.as_ref().map(Chord::to_string).unwrap_or_default(),
             mics: zc_audio::list_microphones(),
             mics_listed: Instant::now(),
+            monitors: zc_video::capture::list_monitors(),
             problems: Vec::new(),
         }
     }
@@ -144,8 +148,50 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
         });
 
         section(ui, "Video", |ui| {
-            let video = &mut draft.settings.video;
+            let (monitors, video) = (&mut draft.monitors, &mut draft.settings.video);
             Grid::new("video").num_columns(2).spacing([24.0, 8.0]).show(ui, |ui| {
+                ui.label("Capture");
+                ComboBox::from_id_salt("capture")
+                    .selected_text(capture_label(video.capture_mode))
+                    .show_ui(ui, |ui| {
+                        for option in [CaptureMode::Game, CaptureMode::Screen] {
+                            ui.selectable_value(&mut video.capture_mode, option, capture_label(option));
+                        }
+                    });
+                ui.end_row();
+                if video.capture_mode == CaptureMode::Game {
+                    ui.label("");
+                    ui.weak("Records only games that have a profile. Add games on the Profiles tab.");
+                    ui.end_row();
+                }
+
+                // The screen only matters when the whole screen is recorded.
+                let screen_on = video.capture_mode == CaptureMode::Screen;
+                ui.label("Screen");
+                ui.add_enabled_ui(screen_on, |ui| {
+                    ui.horizontal(|ui| {
+                        let selected = video.monitor.map_or_else(
+                            || "Primary display (default)".to_owned(),
+                            |i| {
+                                monitors.iter().find(|m| m.index == i).map_or_else(
+                                    || format!("Display {} (not connected)", i + 1),
+                                    |m| m.name.clone(),
+                                )
+                            },
+                        );
+                        ComboBox::from_id_salt("monitor").selected_text(selected).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut video.monitor, None, "Primary display (default)");
+                            for m in monitors.iter() {
+                                ui.selectable_value(&mut video.monitor, Some(m.index), &m.name);
+                            }
+                        });
+                        if ui.button("Refresh").clicked() {
+                            *monitors = zc_video::capture::list_monitors();
+                        }
+                    });
+                });
+                ui.end_row();
+
                 ui.label("Codec");
                 ComboBox::from_id_salt("codec").selected_text(codec_label(video.codec)).show_ui(
                     ui,
@@ -183,6 +229,7 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
                 ui.checkbox(&mut video.capture_cursor, "Capture the mouse cursor");
                 ui.end_row();
             });
+            ui.weak("Screen applies when recording starts. Changing it during a recording stops that recording.");
             ui.weak("The keyframe interval is also the trim precision in the editor.");
         });
 
@@ -195,6 +242,13 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
                 ui.label("Memory limit");
                 ui.add(DragValue::new(&mut dvr.ram_ceiling_mib).range(64..=16_384).suffix(" MiB"));
             });
+            let ceiling = super::effective_ceiling(dvr.ram_ceiling_mib);
+            if ceiling.from_system_ram {
+                ui.weak(format!(
+                    "Your RAM caps this at {} MiB (5% of the total), so that is the limit in use.",
+                    ceiling.mib
+                ));
+            }
             ui.weak(format!(
                 "Buffer length is set per game on the Profiles tab. The default ({}) needs about {} MB at the maximum bitrate.",
                 human_duration(window),
@@ -320,7 +374,7 @@ pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
     });
 }
 
-fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+pub(super) fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(6.0);
     ui.strong(title);
     ui.add_space(4.0);
@@ -331,6 +385,13 @@ fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
 
 fn codec_label(codec: Option<Codec>) -> &'static str {
     codec.map_or("Auto (best the GPU supports)", Codec::name)
+}
+
+fn capture_label(mode: CaptureMode) -> &'static str {
+    match mode {
+        CaptureMode::Game => "Game only (default)",
+        CaptureMode::Screen => "Entire screen",
+    }
 }
 
 fn container_label(container: ContainerFormat) -> &'static str {

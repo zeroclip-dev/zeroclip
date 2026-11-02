@@ -14,6 +14,7 @@
 //! | [`ring`] | allocation-free packet FIFO in one byte ring, for the DVR buffer and the recording spool | §4, §5 |
 //! | [`watchdog`] | the encoder watchdog state machine | §8 |
 //! | [`profile`] | per-game profiles and RAM clamping | §7 |
+//! | [`focus_prompt`] | what a focus change means while a game is tracked (D35) | §7 |
 //! | [`hotkey`] | keys, chords and the chord matcher | §8 |
 //! | [`backoff`] | retry schedule for HDCP-protected content | §3 |
 //! | [`dsp`] | the mic dynamics compressor | §6 |
@@ -23,12 +24,13 @@
 //!
 //! Behaviour that is designed but not built yet is pinned down by tests marked
 //! `#[ignore = "spec: …"]`. Run `cargo test -p zc-core -- --ignored` to see what is
-//! left; see `CLAUDE.md` for the workflow.
+//! left; see `CONTRIBUTING.md` for the workflow.
 
 pub mod backoff;
 pub mod control;
 pub mod dsp;
 pub mod dvr;
+pub mod focus_prompt;
 pub mod hotkey;
 pub mod media;
 pub mod mix;

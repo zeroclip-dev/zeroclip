@@ -26,6 +26,8 @@ pub struct SyntheticStream {
     audio_tracks: u8,
     master: bool,
     next_frame: u32,
+    /// Frame number where the current GOP started; 0 until [`force_keyframe`](Self::force_keyframe).
+    gop_origin: u32,
     next_audio: [u32; MAX_AUDIO_TRACKS as usize],
 }
 
@@ -48,6 +50,7 @@ impl SyntheticStream {
             audio_tracks: 2,
             master: false,
             next_frame: 0,
+            gop_origin: 0,
             next_audio: [0; MAX_AUDIO_TRACKS as usize],
         }
     }
@@ -118,7 +121,14 @@ impl SyntheticStream {
         self.frame_pts(self.next_frame)
     }
 
-    /// The next video frame. Every `gop_frames`-th frame is a keyframe, starting with frame 0.
+    /// Makes the next video frame a keyframe that starts a fresh GOP cadence, like
+    /// `CODECAPI_AVEncVideoForceKeyFrame` on a real encoder.
+    pub fn force_keyframe(&mut self) {
+        self.gop_origin = self.next_frame;
+    }
+
+    /// The next video frame. Every `gop_frames`-th frame from the GOP origin is a keyframe,
+    /// starting with frame 0 (or with the frame forced by [`force_keyframe`](Self::force_keyframe)).
     pub fn next_video(&mut self) -> Packet {
         let n = self.next_frame;
         self.next_frame += 1;
@@ -128,7 +138,7 @@ impl SyntheticStream {
                 track: TrackId::Video,
                 pts,
                 duration: self.frame_pts(n + 1) - pts,
-                keyframe: n.is_multiple_of(self.gop_frames),
+                keyframe: (n - self.gop_origin).is_multiple_of(self.gop_frames),
             },
             data: payload(n, TrackId::Video, self.frame_bytes),
         }
@@ -234,6 +244,17 @@ mod tests {
         assert_eq!(keys, [true, false, false, true, false, false, true]);
         assert_eq!(SyntheticStream::sequence_number(&frames[5].data), 5);
         assert_eq!(frames[0].data.len(), 1_000);
+    }
+
+    #[test]
+    fn force_keyframe_starts_a_new_gop() {
+        let mut s = SyntheticStream::new().gop_frames(3);
+        let _ = s.next_video();
+        let _ = s.next_video();
+        s.force_keyframe();
+        let keys: Vec<bool> = (0..4).map(|_| s.next_video().meta.keyframe).collect();
+        // Frame 2 is forced, so the cadence restarts there: 2, 5 are keyframes; 3, 4 are not.
+        assert_eq!(keys, [true, false, false, true]);
     }
 
     #[test]
