@@ -1,4 +1,4 @@
-//! The recording spool's hot path never allocates (CLAUDE.md rule 2). The spool is written
+//! The recording spool's hot path never allocates (CONTRIBUTING.md rule 2). The spool is written
 //! under the recorder's lock, so `SpoolWriter::write` may only copy into its
 //! pre-allocated ring.
 //!

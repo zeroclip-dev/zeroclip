@@ -173,7 +173,7 @@ Profiles should be user-editable from the UI, and unknown executables should be 
 
 ### Crash rescue
 
-Detects unexpected termination of the tracked game process, dumps the current ring buffer to `recovery.tmp`, and prompts on next focus: *"Game closed unexpectedly. Keep the last X minutes?"* Because session recordings use a fragmented container, a crash mid-session needs no rescue at all — the file is already playable.
+Detects unexpected termination of the tracked game process, dumps the current ring buffer to `recovery-<unix_ms>.<ext>.tmp` in the output folder (one file per rescue, so an unanswered one is never overwritten; D34), and prompts: *"Game closed unexpectedly. Keep the last X minutes?"* Because session recordings use a fragmented container, a crash mid-session needs no rescue at all — the file is already playable.
 
 A recording is written as `<name>.mp4.partial` and synced after every fragment (D18). A crash leaves that file behind. At startup the app cuts it back to its last complete fragment and renames it to `<name>.mp4`, so at most about 1 s is lost. A file with no complete fragment is left as it is.
 

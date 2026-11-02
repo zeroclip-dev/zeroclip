@@ -1,5 +1,5 @@
 //! `Recorder::push` runs on the encoder and audio threads, so it must not allocate
-//! either (CLAUDE.md rule 2). Unlike `dvr_no_alloc.rs`, which covers the DVR buffer
+//! either (CONTRIBUTING.md rule 2). Unlike `dvr_no_alloc.rs`, which covers the DVR buffer
 //! alone, this covers the whole path: the master clock, the DVR buffer and the tee.
 //!
 //! It lives in its own integration-test binary because a `#[global_allocator]`

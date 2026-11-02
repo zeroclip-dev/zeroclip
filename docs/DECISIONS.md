@@ -220,3 +220,82 @@ the press with Master complete. A recording's Master ends about 200 ms before it
 (cutting per track at stop isn't built). Mix gains apply at the next start, and a source's
 volume in Master is fixed at record time (rebalance from the side tracks in the editor,
 P5.14).
+
+### D31 · Capture mode: game window by default, whole screen optional (supersedes the primary-monitor part of D24)
+ideo.capture_mode is game (default) or screen. In **Game** mode ZeroClip records only the
+window of a game that has a profile (CaptureTarget::Window), and only while that game has focus.
+Nothing from the desktop is captured. When another app takes focus, the video and audio sources stop,
+but the DVR buffer and the input thread keep running: hotkeys work, and a save cuts a clip from the
+kept buffer. Focusing the same game again resumes into the same buffer. Focusing a different profiled
+game clears the buffer first, so a clip never mixes two games. ZeroClip's own windows and explorer.exe
+(taskbar, Start menu) don't pause capture. **Screen** mode is D24's behaviour: ideo.monitor, from start.
+Costs: the buffer keeps footage from before and after a pause, so a clip can jump in time where the game
+was away; each resume starts a new encoder; a window resize during a pause doesn't clear the buffer (only
+a different game does); the mic and app tracks run only while a profiled game is captured; on Windows 10
+the game-audio fallback is whole-system loopback (D9), so the desktop's sound can reach the game track.
+The DVR ring is still sized at startup from the default profile, so a profile window longer than that is
+capped by the ring until P4.6 adds Recorder::resize.
+
+### D32 · DVR buffer storage: RAM, disk or hybrid, sized to free memory (amends D4, D21)
+`dvr.storage` is `ram`, `disk` or `hybrid`. **RAM** is D4 as built: pre-allocated, page-locked.
+**Disk** writes each finished GOP to a fixed-size ring file on a drive the user picks (default: a
+non-system drive if present); only the in-flight GOP stays in RAM. **Hybrid** keeps the newest
+`dvr.ram_secs` (default 20) in RAM and spills older GOPs to the ring file, so a long window costs
+about 50-100 MB of RAM. A dump reads RAM first, then the ring, and writes oldest first, so it no
+longer doubles RAM. The RAM part is capped at a share of *available* memory read at startup
+(`GlobalMemoryStatusEx`, default 5% of total); a window that doesn't fit is shortened and the UI says
+so, and the cost per window length is shown next to the setting. Under `QueryMemoryResourceNotification`
+low-memory the RAM part shrinks and page-locking is dropped. Default is hybrid with a 60 s window.
+Costs: continuous writes (about 9 GB/hour at 20 Mbps, 22 GB/hour at 50 Mbps) wear the drive and can
+contend with game asset streaming (pacing from P3.23-25 applies); a ring file is overwritten in place,
+never grown; a crash leaves the ring on disk, which P4.11 rescue can read; clips older than the RAM
+part are slower to dump than RAM-only.
+The ring defaults to a different drive than the recordings folder when one exists, so session writes and ring writes don't compete.
+
+### D33 · Game profiles are sticky: only a profiled game changes the profile (builds on D21, D27, D31; first sentence amended by D35)
+A profiled game becomes the tracked game when it takes focus. Its profile stays in effect until
+another profiled game takes focus, or its process exits (P4.7). Apps without a profile never change
+it, so alt-tabbing to Discord or opening Task Manager can't shrink the buffer before a crash rescue.
+Those apps go to `EngineStatus::recent_games` instead (newest first, at most 8), so the user can
+promote one to a profile. Game audio and the input process watch follow the tracked game's pid only,
+which amends D27: audio no longer follows every app that takes focus. Explorer and ZeroClip don't
+count as games. A resize (D21) releases the page locks on the old rings, resizes, and pins the new
+rings the same way; it logs its duration.
+Costs: an unprofiled game can't get its own window length while a profiled game is tracked; the
+profile stays in effect after the user has left the game, until another profiled game takes focus
+or the game exits.
+
+### D34 · Crash rescue trigger and files (builds on D19, D29, D33)
+The tracked game exiting with a non-zero code is "unexpected": 0 is a clean quit, Task Manager's
+End task and `taskkill` report 1, crashes report an NTSTATUS. On such an exit the engine copies the
+profile window out of the DVR before the default profile is restored (a resize would drop the
+footage) and writes it on the clip IO thread to `recovery-<unix_ms>.<ext>.tmp` in the output folder,
+created with `create_new` so a second rescue never overwrites an unanswered one. The file is synced
+before `RecoveryReady` is emitted. `.tmp` keeps it out of the Clips list; Keep is a same-volume
+rename (P4.12). One dump at a time (D29): if a save or flush is being written, the rescue waits for
+it (the game stays tracked, so its window holds) and runs first when that dump ends, ahead of a
+waiting watchdog flush, whose RESUMING clears the buffer. At shutdown the waiting rescue is still
+written. A different game focused while a rescue waits does not clear the buffer (D31), so the
+rescue still gets the dead game's footage. Costs: the copy of the window runs on the engine thread, so
+besides the short lock holds of D29 it stalls the engine thread (hotkeys, health, status) for the
+whole copy, about 750 MB for a 5 min window (Q4); the new game's first clips can hold the old game too.
+
+### D35 · A second game asks before it takes over the tracked game (amends D33, D27)
+While a game is tracked, another game taking focus does not change the tracked game by itself. A
+candidate is another profiled game, or an unprofiled app that is fullscreen or borderless on its monitor
+(zc-input reports this with the focus event). Other unprofiled apps (Discord, browsers, the shell) never
+prompt and stay in `recent_games`. After the candidate has kept focus for 3 s (so alt-tab flicks don't prompt), the engine emits
+`EngineEvent::FocusPrompt { current, candidate }` and the app shows a non-modal banner in the window:
+"Clipping {current}. {candidate} is in focus." Options: **Keep {current}** (default), **Switch to {candidate}**
+(the candidate's profile applies, as D33 describes), **Clip desktop** (capture mode goes to Screen, D31).
+Clip both in one buffer is not in this decision (see Costs). The banner never steals focus, so it does
+not force the window forward during fullscreen play. Each (current, candidate) pair prompts at most once per
+session, and the banner stays until the user picks an option or the candidate loses focus. No prompt is
+shown when nothing is tracked (desktop focus): the candidate is tracked directly, as in D33.
+The user's choice holds until the next prompt or the tracked game exits. The exit rules of D33 and P4.7
+still apply, and the crash-rescue rules of D34 are unchanged.
+This resolves D33's open Screen-mode side effect: an unprofiled game gets game audio only when the user
+picks it or picks Clip desktop, so the engine never retargets audio on its own.
+Costs: while a game is tracked, a game the user didn't pick keeps no buffer and no audio until they
+answer. "Clip both in one buffer" needs one ring per game and a two-track dump, a new output format; deferred.
+A workaround is saving both clips at once on a hotkey, which covers most of the need.

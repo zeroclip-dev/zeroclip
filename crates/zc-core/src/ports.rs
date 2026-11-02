@@ -170,8 +170,22 @@ pub enum OsEvent {
     Foreground {
         /// Owning process id.
         pid: u32,
+        /// The window, as its `HWND` value (for window capture).
+        hwnd: isize,
         /// Full path of its executable.
         exe: String,
+        /// The window covers its monitor, or is borderless on it (D35: a fullscreen app can
+        /// prompt the user even without a profile).
+        fullscreen: bool,
+    },
+    /// A process passed to [`InputSource::watch_process`] ended. `exit_code` is
+    /// `GetExitCodeProcess`'s value: 0 is a clean quit; Task Manager and `taskkill` give 1;
+    /// a crash gives an NTSTATUS such as `0xC0000005`.
+    ProcessExited {
+        /// The process that ended.
+        pid: u32,
+        /// Its exit code.
+        exit_code: u32,
     },
 }
 
@@ -185,6 +199,16 @@ pub trait InputSource: Send {
 
     /// Stops the input thread. Idempotent.
     fn stop(&mut self);
+
+    /// Reports [`OsEvent::ProcessExited`] when `pid` ends (crash rescue, DESIGN §8).
+    /// Default: ignored.
+    ///
+    /// # Errors
+    /// See [`SourceError`].
+    fn watch_process(&mut self, pid: u32) -> Result<(), SourceError> {
+        let _ = pid;
+        Ok(())
+    }
 }
 
 /// The drive-type probe the app injects: whether the drive holding a path has a seek penalty,
@@ -196,3 +220,7 @@ pub type SeekPenalty = fn(&Path) -> Result<Option<bool>, SourceError>;
 /// keeps the region pinned, and dropping it unpins the region. The engine calls this on the DVR
 /// rings, so the guard must be dropped before the memory is freed.
 pub type LockMemory = fn(&[u8]) -> Result<Box<dyn Send>, SourceError>;
+
+/// Reports this machine's physical RAM in MiB (`zc-win`, P4.20). `None` means the OS didn't say.
+/// The engine caps the DVR's RAM ceiling at a share of it (D32).
+pub type TotalMemory = fn() -> Option<u64>;
