@@ -42,6 +42,8 @@ struct State {
     /// Page locks on the DVR rings. Declared before `dvr`, so they drop first: fields drop in
     /// declaration order, and a ring must be unpinned before its memory is freed.
     locks: Vec<Box<dyn Send>>,
+    /// The last page-lock request, so a resize can pin the new rings the same way (P4.6).
+    pin: Option<(LockMemory, Vec<TrackId>)>,
     clock: MasterClock,
     dvr: DvrBuffer,
     tee: Tee,
@@ -66,6 +68,7 @@ impl Recorder {
         Self {
             state: Mutex::new(State {
                 locks: Vec::new(),
+                pin: None,
                 clock: MasterClock::new(),
                 dvr: DvrBuffer::new(config),
                 tee: Tee::new(),
@@ -136,8 +139,10 @@ impl Recorder {
         self.lock().dvr.buffered()
     }
 
-    /// Empties the DVR buffer, for when the video format changes: GOPs from the old encoder
-    /// can't share a clip with the new one (DESIGN §8, "buffer restarts from empty").
+    /// Empties the DVR buffer, for when the video format changes or the watchdog resumes after a
+    /// re-init: GOPs from the old encoder can't share a clip with the new one (DESIGN §8, "buffer
+    /// restarts from empty"). The [`MasterClock`] stays anchored, so the new encoder's packets
+    /// carry on the session timeline instead of starting again at zero.
     pub fn clear(&self) {
         self.lock().dvr.clear();
     }
@@ -157,15 +162,36 @@ impl Recorder {
         let mut state = self.lock();
         // Release the old pins before taking new ones, so the same pages are never pinned twice.
         state.locks.clear();
-        let mut guards = Vec::with_capacity(tracks.len());
-        let mut bytes = 0;
-        for &track in tracks {
-            let region = state.dvr.memory(track);
-            guards.push(lock(region)?);
-            bytes += region.len();
-        }
+        state.pin = Some((lock, tracks.to_vec()));
+        let (guards, bytes) = pin_rings(&state.dvr, lock, tracks)?;
         state.locks = guards;
         Ok(bytes)
+    }
+
+    /// Changes the DVR buffer to `config` when a game profile asks for another window (D21). The
+    /// lock is held for the whole resize, so pushes wait: that is the brief writer pause. The time
+    /// it took is logged, to check it against the watchdog's limit.
+    ///
+    /// The old rings are freed by the resize, so their page locks are released first, and the new
+    /// rings are locked again the way [`lock_memory`](Self::lock_memory) did.
+    pub fn resize(&self, config: DvrConfig) {
+        let started = Instant::now();
+        let mut state = self.lock();
+        let State { locks, dvr, pin, .. } = &mut *state;
+        locks.clear();
+        dvr.resize(config);
+        if let Some((lock, tracks)) = pin.as_ref() {
+            match pin_rings(dvr, *lock, tracks) {
+                Ok((guards, _)) => *locks = guards,
+                Err(error) => tracing::warn!(%error, "resized DVR buffer not page-locked"),
+            }
+        }
+        let elapsed = started.elapsed();
+        tracing::info!(
+            elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            ?config,
+            "DVR buffer resized"
+        );
     }
 
     /// Starts feeding a disk writer (manual or session recording).
@@ -197,6 +223,23 @@ impl Recorder {
         let result = f(&mut state);
         (result, since.elapsed())
     }
+}
+
+/// Pins the rings of `tracks` with `lock`. All or nothing: on the first refusal the guards taken
+/// so far are dropped, which unpins them. Returns the guards and the bytes pinned.
+fn pin_rings(
+    dvr: &DvrBuffer,
+    lock: LockMemory,
+    tracks: &[TrackId],
+) -> Result<(Vec<Box<dyn Send>>, usize), SourceError> {
+    let mut guards = Vec::with_capacity(tracks.len());
+    let mut bytes = 0;
+    for &track in tracks {
+        let region = dvr.memory(track);
+        guards.push(lock(region)?);
+        bytes += region.len();
+    }
+    Ok((guards, bytes))
 }
 
 impl PacketSink for Recorder {
@@ -350,5 +393,15 @@ mod tests {
         assert!(recorder.lock_memory(refuse_audio, &tracks).is_err());
         // Video was pinned first. It must be unpinned again, so nothing is half locked.
         assert!(recorder.lock().locks.is_empty());
+    }
+
+    #[test]
+    fn resize_changes_the_ring_size_and_pins_the_new_rings() {
+        let recorder = Recorder::new(DvrConfig { video_bytes: 10_000_000, audio_bytes: 1_000_000 });
+        recorder.lock_memory(pin, &[TrackId::Video]).expect("video pins");
+        recorder.resize(DvrConfig { video_bytes: 20_000_000, audio_bytes: 1_000_000 });
+        let state = recorder.lock();
+        assert_eq!(state.dvr.memory(TrackId::Video).len(), 20_000_000, "the ring grew");
+        assert_eq!(state.locks.len(), 1, "the new ring is pinned again");
     }
 }

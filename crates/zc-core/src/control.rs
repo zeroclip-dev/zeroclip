@@ -23,8 +23,20 @@ pub enum Command {
     PushToTalk(bool),
     /// Settings changed; apply what can be applied live.
     ApplySettings(Box<Settings>),
+    /// The user answered the focus prompt (D35). Clip desktop is not a choice here: the UI
+    /// sends `ApplySettings` with capture mode Screen.
+    FocusChoice(FocusChoice),
     /// Stop all sources and exit the engine thread.
     Shutdown,
+}
+
+/// The user's answer to a focus prompt (D35).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusChoice {
+    /// Keep clipping the tracked game.
+    Keep,
+    /// Track the candidate: its profile applies, as on a profiled focus (D33).
+    Switch,
 }
 
 /// Notifications from the engine.
@@ -64,6 +76,24 @@ pub enum EngineEvent {
         window: Hns,
         /// Whether the window was reduced to respect the RAM ceiling.
         clamped: bool,
+    },
+    /// The tracked game died unexpectedly. The DVR buffer was dumped to `path`; the user
+    /// should be asked whether to keep or discard it.
+    RecoveryReady {
+        /// The rescued clip.
+        path: PathBuf,
+        /// Executable of the game that died.
+        game: String,
+        /// How much footage the rescue holds.
+        duration: Hns,
+    },
+    /// A second game took focus while another is tracked (D35). Ask whether to switch. The engine
+    /// emits it once per pair per session; it names the tracked game and the candidate by file name.
+    FocusPrompt {
+        /// The game being clipped.
+        current: String,
+        /// The app that has focus and kept it for the debounce.
+        candidate: String,
     },
     /// Something the user should know about, but not an error.
     Warning(String),
@@ -110,4 +140,7 @@ pub struct EngineStatus {
     pub watchdog: WatchdogState,
     /// Executable of the focused game, if any.
     pub game: Option<String>,
+    /// Executable file names that had focus recently and have no profile, newest first,
+    /// at most 8.
+    pub recent_games: Vec<String>,
 }

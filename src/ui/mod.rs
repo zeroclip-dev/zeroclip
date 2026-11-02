@@ -3,6 +3,7 @@
 
 pub mod clips;
 pub mod components;
+pub mod focus_prompt;
 pub mod home;
 pub mod profiles;
 pub mod settings;
@@ -16,7 +17,11 @@ use crate::app::{NoticeLevel, Tab, ZeroClipApp};
 use components::mic_indicator::MicIndicator;
 
 pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
+    focus_prompt::clear_if_left(app);
     egui::Panel::top("top_bar").show(ui, |ui| top_bar(app, ui));
+    if app.focus_prompt.is_some() {
+        egui::Panel::top("focus_prompt").show(ui, |ui| focus_prompt::banner(app, ui));
+    }
     egui::Panel::bottom("status_bar").show(ui, |ui| status_bar(app, ui));
     egui::CentralPanel::default().show(ui, |ui| match app.tab {
         Tab::Home => home::show(app, ui),
@@ -97,6 +102,13 @@ pub fn human_duration(t: Hns) -> String {
 /// Approximate DVR memory for `secs` at `max_kbps`, in MB (DESIGN §4 table).
 pub fn dvr_megabytes(secs: u32, max_kbps: u32) -> u64 {
     u64::from(max_kbps) * 1_000 / 8 * u64::from(secs) / 1_000_000
+}
+
+/// The DVR memory limit the engine really runs under: the setting, capped at a share of this
+/// machine's RAM (D32, P4.20). The engine and the UI must agree on it, or the Profiles tab shows
+/// windows the engine then cuts.
+pub fn effective_ceiling(setting_mib: u32) -> zc_core::profile::RamCeiling {
+    zc_core::profile::effective_ram_ceiling(setting_mib, zc_win::memory::total_physical_mib())
 }
 
 pub fn notice_color(level: NoticeLevel) -> Color32 {

@@ -10,6 +10,8 @@ documented core beats a perfect product that isn't finished.
 How to see what is left in the code: `cargo test -- --ignored` runs every spec that
 hasn't been implemented yet.
 
+**Current phase: Phase 3 is done on hardware except P3.28 (README GIF), P3.29 (launch post) and P3.30 (tag v0.1.0). Next code: Phase 4, start at P4.1 ([docs/plan/P4.md](plan/P4.md)).**
+
 Every box below is broken into task cards in [docs/plan/](plan/README.md). Work the
 cards; tick a box here when its cards are done.
 
@@ -19,7 +21,7 @@ cards; tick a box here when its cards are done.
 - [x] `zc-core` domain types; specs for the DVR buffer, watchdog, hotkeys, profiles and clock
 - [x] Engine actor with ports for the platform adapters, and a synthetic-source harness
 - [x] egui app shell: settings persistence, logging, profile editor, activity feed
-- [x] Design, architecture and decision docs; CLAUDE.md for Claude Code
+- [x] Design, architecture and decision docs
 - [x] Add the CI workflow as `.github/workflows/ci.yml` (format, lint, test and docs on Windows)
 
 ## Phase 0 — Spike (a weekend)
@@ -64,7 +66,7 @@ Measured 2026-10-05 with `spike-phase2`: every track within ±11 ms of its minut
 - [x] Implement `zc_mux::container::create` (fMP4, decided in D18)
 - [x] Crash-safe recordings: sync every fragment, `.partial` files, startup repair (D18)
 - [x] `Recorder` spec; `SyntheticVideoSource`; the `synthetic_harness` save-clip spec
-- [ ] DVR save, manual recording, session recording; page-lock the buffer (`VirtualLock`)
+- [x] DVR save, manual recording, page-lock the buffer (`VirtualLock`); automatic session recording is P4.7
 - [x] `zc-win::drive` + HDD pacing for dumps
 
 *Done when:* a DVR dump taken at any arbitrary moment decodes from its first frame and has audio.
@@ -73,10 +75,11 @@ Measured 2026-10-05 with `spike-phase2`: every track within ±11 ms of its minut
 
 ## Phase 4 — UI, profiles, watchdogs
 
-- [ ] Specs: `Watchdog::on_event`, `ProfileSet`, `clamp_window` (`clamp_window` done early, in Phase 3: P3.16)
-- [ ] `zc-store` (rusqlite, bundled) and the migrations
-- [ ] Profile engine on foreground change, with safe buffer resizing
-- [ ] Watchdog wiring and the `synthetic_harness` recovery spec; crash rescue (`recovery.tmp` + prompt)
+- [x] Specs: `Watchdog::on_event`, `ProfileSet`, `clamp_window` (`clamp_window` done early, in Phase 3: P3.16)
+- [x] `zc-store` (rusqlite, bundled) and the migrations
+- [x] Profile engine on foreground change, with safe buffer resizing
+- [x] Watchdog wiring and the `synthetic_harness` recovery spec (P4.9)
+- [ ] Crash rescue (`recovery.tmp` + prompt) (P4.11, P4.12)
 - [ ] Flight recorder: in-memory ring of recent events, dumped with crash rescue
 - [ ] System tray; close-to-tray; start with Windows
 
@@ -115,5 +118,5 @@ and P5.14.
 ## Portfolio polish (any time)
 
 - [ ] Publish the repo; add the CI badge to the README
-- [ ] GitHub Sponsors (`.github/FUNDING.yml`) — ten minutes, no downside
+- [x] GitHub Sponsors (`.github/FUNDING.yml`) — ten minutes, no downside
 - [ ] Screenshots / a short GIF of saving a clip

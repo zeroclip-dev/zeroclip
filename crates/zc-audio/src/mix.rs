@@ -3,6 +3,11 @@
 //! The sources write their PCM into a shared [`MixBus`]. One mixer thread wakes every 20 ms,
 //! mixes everything up to 200 ms behind real time, and encodes the result, so the first audio
 //! track is the mix players and Discord play. The per-source tracks are unchanged, for the editor.
+//!
+//! The mixer thread joins the multithreaded apartment ([`Apartment`]) and starts Media
+//! Foundation ([`MediaFoundation`]), because the AAC encoder is a Media Foundation transform
+//! and needs both running on the thread that calls it. See the
+//! [Media Foundation API](https://learn.microsoft.com/en-us/windows/win32/api/mfapi/) reference.
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};

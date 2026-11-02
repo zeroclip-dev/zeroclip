@@ -132,6 +132,37 @@ pub fn clamp_window(
     }
 }
 
+/// The share of physical RAM the DVR's RAM part may use, in percent (D32).
+const RAM_CEILING_PERCENT: u64 = 5;
+
+/// The lowest ceiling the RAM share can set, in MiB. The settings check refuses less too.
+const RAM_CEILING_FLOOR_MIB: u64 = 64;
+
+/// The DVR RAM ceiling the engine runs under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RamCeiling {
+    /// The ceiling to use, in MiB.
+    pub mib: u32,
+    /// Whether the RAM share cut the setting down, so the UI can say where the number comes from.
+    pub from_system_ram: bool,
+}
+
+/// The DVR RAM ceiling: the user's setting, capped at 5% of physical RAM and never below 64 MiB
+/// (D32). With no RAM reading (`None`), the setting stands unchanged.
+#[must_use]
+pub fn effective_ram_ceiling(setting_mib: u32, total_physical_mib: Option<u64>) -> RamCeiling {
+    let Some(total) = total_physical_mib else {
+        return RamCeiling { mib: setting_mib, from_system_ram: false };
+    };
+    let cap = (total.saturating_mul(RAM_CEILING_PERCENT) / 100).max(RAM_CEILING_FLOOR_MIB);
+    if u64::from(setting_mib) > cap {
+        // `cap` is below the setting, which is a u32, so it always fits.
+        RamCeiling { mib: u32::try_from(cap).unwrap_or(u32::MAX), from_system_ram: true }
+    } else {
+        RamCeiling { mib: setting_mib, from_system_ram: false }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,5 +232,39 @@ mod tests {
         let c = clamp_window(Hns::from_secs(300), 20_000_000, 500_000_000);
         assert!(c.clamped);
         assert_eq!(c.window, Hns::from_secs(200));
+    }
+
+    #[test]
+    fn ram_ceiling_takes_five_percent_of_a_16_gb_machine() {
+        // 16 GiB = 16384 MiB; 5% is 819 MiB, under the 1024 MiB setting.
+        let c = effective_ram_ceiling(1_024, Some(16_384));
+        assert_eq!(c, RamCeiling { mib: 819, from_system_ram: true });
+    }
+
+    #[test]
+    fn ram_ceiling_takes_five_percent_of_a_4_gb_machine() {
+        // 4 GiB = 4096 MiB; 5% is 204 MiB.
+        let c = effective_ram_ceiling(1_024, Some(4_096));
+        assert_eq!(c, RamCeiling { mib: 204, from_system_ram: true });
+    }
+
+    #[test]
+    fn ram_ceiling_keeps_the_setting_when_it_is_under_the_cap() {
+        // 32 GiB: 5% is 1638 MiB, above the 1024 MiB setting.
+        let c = effective_ram_ceiling(1_024, Some(32_768));
+        assert_eq!(c, RamCeiling { mib: 1_024, from_system_ram: false });
+    }
+
+    #[test]
+    fn ram_ceiling_keeps_the_setting_without_a_ram_reading() {
+        let c = effective_ram_ceiling(1_024, None);
+        assert_eq!(c, RamCeiling { mib: 1_024, from_system_ram: false });
+    }
+
+    #[test]
+    fn ram_ceiling_never_drops_below_64_mib() {
+        // 100 MiB of RAM: 5% is 5 MiB, so the floor applies.
+        let c = effective_ram_ceiling(1_024, Some(100));
+        assert_eq!(c, RamCeiling { mib: 64, from_system_ram: true });
     }
 }

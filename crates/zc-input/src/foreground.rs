@@ -2,15 +2,18 @@
 
 use std::cell::RefCell;
 
-use windows::Win32::Foundation::{CloseHandle, HWND};
+use windows::Win32::Foundation::{CloseHandle, HWND, RECT};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+};
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EVENT_SYSTEM_FOREGROUND, GetForegroundWindow, GetWindowThreadProcessId, OBJID_WINDOW,
-    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    EVENT_SYSTEM_FOREGROUND, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
+    IsZoomed, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 use windows::core::PWSTR;
 use zc_core::ports::{OsEvent, SourceError};
@@ -26,15 +29,52 @@ thread_local! {
 
 fn report(hwnd: HWND) {
     if let Some((pid, exe)) = process_for_window(hwnd) {
+        let fullscreen = covers_its_monitor(hwnd);
         EMIT.with(|cell| {
             // try_borrow: a panic must never unwind out of the extern callback.
             if let Ok(mut emit) = cell.try_borrow_mut()
                 && let Some(emit) = emit.as_mut()
             {
-                emit(OsEvent::Foreground { pid, exe });
+                emit(OsEvent::Foreground { pid, hwnd: hwnd.0 as isize, exe, fullscreen });
             }
         });
     }
+}
+
+/// Whether the window covers its whole monitor: fullscreen, or borderless on it (D35). A
+/// maximised window doesn't count, even when it overshoots the monitor by its frame (no taskbar
+/// on that monitor, or an auto-hide taskbar): it is checked with
+/// [IsZoomed](https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-iszoomed) first.
+/// Otherwise compares [GetWindowRect](https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-getwindowrect)
+/// with the monitor's `rcMonitor` from [MONITORINFO](https://learn.microsoft.com/windows/win32/api/winuser/ns-winuser-monitorinfo).
+/// `false` when either can't be read (the window closed already).
+#[must_use]
+pub fn covers_its_monitor(hwnd: HWND) -> bool {
+    // SAFETY: plain FFI call; a bad handle gives FALSE.
+    if unsafe { IsZoomed(hwnd) }.as_bool() {
+        return false;
+    }
+    let mut window = RECT::default();
+    // SAFETY: `window` is a valid out-parameter for the call; it is only read on success.
+    if unsafe { GetWindowRect(hwnd, &mut window) }.is_err() {
+        return false;
+    }
+    // SAFETY: plain FFI call; for any window it returns the nearest monitor, and a bad handle
+    // makes `GetMonitorInfoW` below fail instead.
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: u32::try_from(std::mem::size_of::<MONITORINFO>()).unwrap_or(0),
+        ..MONITORINFO::default()
+    };
+    // SAFETY: `info` is a valid out-parameter, and its `cbSize` is set as the API requires.
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return false;
+    }
+    let m = info.rcMonitor;
+    window.left <= m.left
+        && window.top <= m.top
+        && window.right >= m.right
+        && window.bottom >= m.bottom
 }
 
 unsafe extern "system" fn on_foreground(

@@ -6,14 +6,15 @@
 //! lets the recording modes and the watchdog be tested deterministically, on any
 //! OS, instead of by hoping a real crash happens while you're watching.
 
+use std::fmt;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use zc_core::media::{Codec, TrackId, TrackInfo, TrackKind};
-use zc_core::ports::{Emit, SourceError, VideoSource, VideoStart};
+use zc_core::ports::{Emit, InputSource, OsEvent, SourceError, VideoSource, VideoStart};
 use zc_core::sink::SharedSink;
 use zc_core::testing::SyntheticStream;
 use zc_core::watchdog::HealthEvent;
@@ -34,13 +35,17 @@ pub struct SyntheticVideoSource {
     /// The next frame to produce. While running, the worker owns it; `stop` gets it back,
     /// so a restart continues the frame numbers and PTS (as a real QPC clock does).
     stream: SyntheticStream,
+    /// Also owned by the worker while running, and returned by `stop`, so an injected fault
+    /// that has fired stays fired across a restart.
     faults: FaultPlan,
     /// Pace packets in real time (for manual testing); otherwise as fast as possible.
     realtime: bool,
+    /// Set by `request_keyframe`; the worker clears it when it makes the next frame an IDR.
+    keyframe_requested: Arc<AtomicBool>,
     /// Tells the worker to exit. Replaced on every `start`.
     stop: Arc<AtomicBool>,
-    /// The worker thread, which returns the stream when joined.
-    worker: Option<JoinHandle<SyntheticStream>>,
+    /// The worker thread, which returns the stream and fault plan when joined.
+    worker: Option<JoinHandle<(SyntheticStream, FaultPlan)>>,
 }
 
 impl Default for SyntheticVideoSource {
@@ -57,6 +62,7 @@ impl SyntheticVideoSource {
             stream: SyntheticStream::new(),
             faults: FaultPlan::default(),
             realtime: false,
+            keyframe_requested: Arc::new(AtomicBool::new(false)),
             stop: Arc::new(AtomicBool::new(false)),
             worker: None,
         }
@@ -78,23 +84,34 @@ impl SyntheticVideoSource {
 }
 
 /// The worker's loop: pushes frames into `sink` until `stop` is set or an encoder fault
-/// is injected. Returns the stream, so the next `start` carries on from where this one stopped.
+/// is injected. Returns the stream and fault plan, so the next `start` carries on from where
+/// this one stopped.
 fn run(
     mut stream: SyntheticStream,
-    faults: &FaultPlan,
+    mut faults: FaultPlan,
     realtime: bool,
+    keyframe_requested: &AtomicBool,
     stop: &AtomicBool,
     sink: &SharedSink,
     health: &Emit<HealthEvent>,
-) -> SyntheticStream {
+) -> (SyntheticStream, FaultPlan) {
     let started = Instant::now();
     let first = stream.now();
     let mut dropping = false;
     while !stop.load(Ordering::Relaxed) {
+        let forced = keyframe_requested.swap(false, Ordering::AcqRel);
+        if forced {
+            stream.force_keyframe();
+        }
         let packet = stream.next_video();
         let n = SyntheticStream::sequence_number(&packet.data);
-        if faults.encoder_fault_at == Some(n) {
+        // `take_if` consumes the fault, so a restarted source doesn't fault again.
+        if faults.encoder_fault_at.take_if(|at| *at == n).is_some() {
             health(HealthEvent::EncoderFault { hresult: 0x8000_4005_u32.cast_signed() });
+            // Like a dead encoder: stay running, produce nothing, until stopped.
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(1));
+            }
             break;
         }
         if realtime {
@@ -107,16 +124,27 @@ fn run(
         if faults.dropped_frames.iter().any(|&(f, c)| (f..f.saturating_add(c)).contains(&n)) {
             health(HealthEvent::FrameDropped);
             dropping = true;
-            continue;
+            // A dropped frame can't carry the keyframe; ask again for the next one.
+            if forced {
+                keyframe_requested.store(true, Ordering::Release);
+            }
+        } else {
+            sink.push(packet.view());
+            if forced {
+                health(HealthEvent::KeyframeEmitted);
+            }
+            if dropping {
+                // One event when delivery resumes, not one per frame (the actor's inbox must not flood).
+                health(HealthEvent::FrameDelivered { interval: packet.meta.duration });
+                dropping = false;
+            }
         }
-        sink.push(packet.view());
-        if dropping {
-            // One event when delivery resumes, not one per frame (the actor's inbox must not flood).
-            health(HealthEvent::FrameDelivered { interval: packet.meta.duration });
-            dropping = false;
+        if !realtime {
+            // The pusher would otherwise starve the engine thread on the Recorder mutex.
+            thread::yield_now();
         }
     }
-    stream
+    (stream, faults)
 }
 
 impl VideoSource for SyntheticVideoSource {
@@ -131,12 +159,15 @@ impl VideoSource for SyntheticVideoSource {
         }
         self.stop = Arc::new(AtomicBool::new(false));
         let stream = std::mem::take(&mut self.stream);
-        let faults = self.faults.clone();
+        let faults = std::mem::take(&mut self.faults);
         let realtime = self.realtime;
+        let keyframe_requested = Arc::clone(&self.keyframe_requested);
         let stop = Arc::clone(&self.stop);
         let worker = thread::Builder::new()
             .name("zc-synthetic-video".into())
-            .spawn(move || run(stream, &faults, realtime, &stop, &sink, &health))
+            .spawn(move || {
+                run(stream, faults, realtime, &keyframe_requested, &stop, &sink, &health)
+            })
             .map_err(|e| SourceError::Other(e.to_string()))?;
         self.worker = Some(worker);
         Ok(Codec::H264)
@@ -156,14 +187,17 @@ impl VideoSource for SyntheticVideoSource {
         if let Some(worker) = self.worker.take() {
             self.stop.store(true, Ordering::Relaxed);
             match worker.join() {
-                Ok(stream) => self.stream = stream,
+                Ok((stream, faults)) => {
+                    self.stream = stream;
+                    self.faults = faults;
+                }
                 Err(_) => tracing::error!("synthetic video thread panicked"),
             }
         }
     }
 
     fn request_keyframe(&mut self) {
-        todo!("Phase 4: start a new GOP on the next frame")
+        self.keyframe_requested.store(true, Ordering::Release);
     }
 
     fn screenshot(&mut self, _path: &Path) -> Result<(), SourceError> {
@@ -171,10 +205,65 @@ impl VideoSource for SyntheticVideoSource {
     }
 }
 
+/// A fake OS input thread (DESIGN §12): the test injects [`OsEvent`]s the way Raw Input and
+/// the foreground hook would. Clones share state, so the test keeps one clone and gives the
+/// engine another.
+#[derive(Clone, Default)]
+pub struct SyntheticInput {
+    /// The engine's emitter, set by `start` and cleared by `stop`.
+    emit: Arc<Mutex<Option<Emit<OsEvent>>>>,
+    /// Pids passed to `watch_process`, in order.
+    watched: Arc<Mutex<Vec<u32>>>,
+}
+
+impl SyntheticInput {
+    /// Sends `event` to the engine as if the OS had produced it. Returns `false` if the
+    /// source isn't started.
+    pub fn inject(&self, event: OsEvent) -> bool {
+        // Clone the emitter out, so the lock isn't held while the engine handles the event.
+        let emit = self.emit.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        match emit {
+            Some(emit) => {
+                emit(event);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The pids passed to `watch_process` so far, in order.
+    #[must_use]
+    pub fn watched(&self) -> Vec<u32> {
+        self.watched.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+}
+
+impl InputSource for SyntheticInput {
+    fn start(&mut self, events: Emit<OsEvent>) -> Result<(), SourceError> {
+        *self.emit.lock().unwrap_or_else(PoisonError::into_inner) = Some(events);
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        *self.emit.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    fn watch_process(&mut self, pid: u32) -> Result<(), SourceError> {
+        self.watched.lock().unwrap_or_else(PoisonError::into_inner).push(pid);
+        Ok(())
+    }
+}
+
+// Manual, because the emitter is a closure and has no `Debug`.
+impl fmt::Debug for SyntheticInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SyntheticInput").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicU32;
-    use std::sync::{Mutex, PoisonError};
     use std::time::Duration;
 
     use zc_core::media::PacketRef;
@@ -246,5 +335,38 @@ mod tests {
         let expected: Vec<u32> = (0..=last).filter(|n| !(5..8).contains(n)).collect();
         assert_eq!(seen, expected);
         assert_eq!(drops.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn request_keyframe_reports_keyframe_emitted_and_stop_returns() {
+        let sink = Arc::new(Collect::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let health: Emit<HealthEvent> = Arc::new(move |event| {
+            let _ = tx.send(event);
+        });
+        let config = VideoStart {
+            target: CaptureTarget::PrimaryMonitor,
+            codec: Codec::H264,
+            fps: 60,
+            min_bitrate_bps: 0,
+            max_bitrate_bps: 0,
+            keyframe_interval: Hns::from_secs(1),
+            capture_cursor: false,
+        };
+        let mut source = SyntheticVideoSource::new();
+        source.start(&config, sink.clone(), health).expect("the synthetic source starts");
+        source.request_keyframe();
+
+        // The worker runs flat out, so the event arrives long before the timeout.
+        loop {
+            match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(HealthEvent::KeyframeEmitted) => break,
+                Ok(_) => {}
+                Err(e) => panic!("KeyframeEmitted never arrived: {e}"),
+            }
+        }
+        // Returns (does not hang) even though the worker is mid-loop.
+        source.stop();
+        assert!(!sink.0.lock().unwrap_or_else(PoisonError::into_inner).is_empty());
     }
 }

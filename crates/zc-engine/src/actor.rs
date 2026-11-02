@@ -1,27 +1,32 @@
+use std::collections::HashSet;
 use std::fmt;
+use std::fs::File;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use time::OffsetDateTime;
 use time::macros::format_description;
 
-use zc_core::control::{Command, EngineEvent, EngineStatus, MicState};
-use zc_core::dvr::{DvrConfig, DvrError};
+use zc_core::control::{Command, EngineEvent, EngineStatus, FocusChoice, MicState};
+use zc_core::dvr::{DvrClip, DvrConfig, DvrError};
+use zc_core::focus_prompt::{self, DEBOUNCE, FocusAction, Focused, is_shell, pair_key};
 use zc_core::hotkey::{Binding, ChordMatcher, HotkeyEvent, Trigger};
 use zc_core::media::{TrackId, TrackInfo, TrackKind};
 use zc_core::ports::{
     AudioSource, AudioStart, CaptureTarget, Emit, InputSource, LockMemory, OsEvent, SeekPenalty,
-    SourceError, VideoSource, VideoStart,
+    SourceError, TotalMemory, VideoSource, VideoStart,
 };
-use zc_core::profile::{WindowClamp, clamp_window};
-use zc_core::settings::{MicMode, Settings};
+use zc_core::profile::{
+    GameProfile, ProfileSet, WindowClamp, clamp_window, effective_ram_ceiling, exe_name,
+};
+use zc_core::settings::{CaptureMode, MicMode, Settings};
 use zc_core::sink::{SharedSink, SinkId};
-use zc_core::watchdog::HealthEvent;
+use zc_core::watchdog::{HealthEvent, Watchdog, WatchdogAction, WatchdogConfig, WatchdogState};
 use zc_core::{Codec, Hns};
 use zc_mux::pacing::{DriveKind, WritePacer};
 
@@ -39,6 +44,9 @@ pub struct Ports {
     pub game_audio: Option<Box<dyn AudioSource>>,
     /// Microphone (`zc-audio`, Phase 2).
     pub mic: Option<Box<dyn AudioSource>>,
+    /// Per-app audio tracks (`zc-audio`, D26), one per enabled `AppTrack` in settings order, each
+    /// with the label its container track gets. They start after the mic and before Master.
+    pub app_audio: Vec<(String, Box<dyn AudioSource>)>,
     /// The Master mix, track 1 (`zc-audio`, D30). Starts after the sources above, and only if
     /// one of them started.
     pub master_audio: Option<Box<dyn AudioSource>>,
@@ -49,6 +57,9 @@ pub struct Ports {
     pub seek_penalty: Option<SeekPenalty>,
     /// Pins the DVR rings in RAM (`zc-win`, P3.25). Without it the rings can be paged out.
     pub lock_memory: Option<LockMemory>,
+    /// Reports the machine's physical RAM (`zc-win`, P4.20). Without it the settings' RAM ceiling
+    /// stands unchanged (D32).
+    pub total_memory: Option<TotalMemory>,
 }
 
 impl fmt::Debug for Ports {
@@ -57,10 +68,12 @@ impl fmt::Debug for Ports {
             .field("video", &self.video.is_some())
             .field("game_audio", &self.game_audio.is_some())
             .field("mic", &self.mic.is_some())
+            .field("app_audio", &self.app_audio.len())
             .field("master_audio", &self.master_audio.is_some())
             .field("input", &self.input.is_some())
             .field("seek_penalty", &self.seek_penalty.is_some())
             .field("lock_memory", &self.lock_memory.is_some())
+            .field("total_memory", &self.total_memory.is_some())
             .finish()
     }
 }
@@ -105,8 +118,11 @@ impl Engine {
     ) -> Result<EngineHandle, EngineError> {
         let (inbox, rx) = mpsc::channel();
         let (events_tx, events) = mpsc::channel();
-        let (dvr, _) = dvr_config(&config.settings);
+        // Read once: the machine's RAM doesn't change while the engine runs.
+        let total_mib = ports.total_memory.and_then(|total| total());
+        let (dvr, _) = dvr_config(&config.settings, total_mib);
         let actor = Actor {
+            total_mib,
             output_dir: config
                 .settings
                 .recording
@@ -128,6 +144,18 @@ impl Engine {
             drive: DriveKind::default(),
             mic_running: false,
             ptt_held: false,
+            video_track: None,
+            game_capture: None,
+            tracked: None,
+            audio_running: false,
+            watchdog: None,
+            video_config: None,
+            flushing: false,
+            pace_dumps: false,
+            rescue_waiting: None,
+            focus_pending: None,
+            focus_prompt: None,
+            prompted: HashSet::new(),
         };
         let thread =
             thread::Builder::new().name("zc-engine".into()).spawn(move || actor.run(&rx))?;
@@ -142,8 +170,9 @@ enum Msg {
     Health(HealthEvent),
     /// The recording's IO thread has finished: the saved file and its duration, or why it failed.
     RecordingEnded(io::Result<(PathBuf, Hns)>),
-    /// The clip's IO thread has finished: the saved file and its duration, or why there isn't one.
-    ClipWritten(Result<(PathBuf, Hns), ClipError>),
+    /// The clip's IO thread has finished: which dump it wrote, and the saved file and its
+    /// duration, or why there isn't one.
+    ClipWritten(Dump, Result<(PathBuf, Hns), ClipError>),
 }
 
 /// A handle to a running engine. Dropping it shuts the engine down.
@@ -164,7 +193,7 @@ impl fmt::Debug for Msg {
             Self::Os(e) => write!(f, "Os({e:?})"),
             Self::Health(e) => write!(f, "Health({e:?})"),
             Self::RecordingEnded(result) => write!(f, "RecordingEnded({result:?})"),
-            Self::ClipWritten(result) => write!(f, "ClipWritten({result:?})"),
+            Self::ClipWritten(dump, result) => write!(f, "ClipWritten({dump:?}, {result:?})"),
         }
     }
 }
@@ -224,6 +253,8 @@ const MASTER_CATCH_UP: Duration = Duration::from_millis(300);
 /// State owned by the engine thread.
 struct Actor {
     settings: Settings,
+    /// The machine's physical RAM in MiB, if the port could read it (D32).
+    total_mib: Option<u64>,
     output_dir: PathBuf,
     ports: Ports,
     /// Our own inbox, for the emitters handed to sources.
@@ -252,6 +283,142 @@ struct Actor {
     mic_running: bool,
     /// Whether the push-to-talk key is down, as the last `Command::PushToTalk` said.
     ptt_held: bool,
+    /// The video track of the encoder that last started. Kept while capture is paused, so a clip
+    /// can still be cut from the buffer (D31).
+    video_track: Option<TrackInfo>,
+    /// The game whose buffer is held: its window and exe file name. Set when capture starts for a
+    /// profiled game, and kept while paused. Only used in Game mode (D31).
+    game_capture: Option<GameCapture>,
+    /// The game whose profile is in effect (P4.6). Sticky: other apps don't change it, so the
+    /// buffer keeps the game's window while the user is elsewhere.
+    tracked: Option<Tracked>,
+    /// Whether the audio sources are running. Set by `start_audio`, cleared by `stop_capture`.
+    audio_running: bool,
+    /// Decides the encoder recovery sequence (DESIGN §8). Created when the video source starts
+    /// and dropped when capture stops, so it is `Some` exactly while video is meant to run, also
+    /// mid-recovery when the encoder itself is down.
+    watchdog: Option<Watchdog>,
+    /// What the video source was last started with, so a watchdog re-init rebuilds the same
+    /// capture, only with the codec the watchdog picks.
+    video_config: Option<VideoStart>,
+    /// The clip being written is the watchdog's flush, so its end moves recovery on (`Flushed`).
+    flushing: bool,
+    /// The watchdog saw a slow disk: dumps are paced at the HDD rate whatever the drive probe
+    /// said (DESIGN §8: pace the writes, don't re-init).
+    pace_dumps: bool,
+    /// A crash rescue that found the dump slot busy (D29). It runs when that dump ends, before a
+    /// flush waiting there too, because the flush ends in RESUMING, which clears the buffer.
+    rescue_waiting: Option<WaitingRescue>,
+    /// An app that is a candidate for a prompt and has focus, waiting out the debounce (D35). Its
+    /// due time says when the prompt is emitted.
+    focus_pending: Option<(Candidate, Instant)>,
+    /// The candidate the user was asked about. Switch applies to it; it is dropped once focus
+    /// moves to another app (D35).
+    focus_prompt: Option<Candidate>,
+    /// (tracked, candidate) pairs already prompted this session, by lowercase file name (D35).
+    prompted: HashSet<(String, String)>,
+}
+
+/// An app that could take over the tracked game (D35): what a switch needs.
+#[derive(Clone, Debug)]
+struct Candidate {
+    pid: u32,
+    hwnd: isize,
+    /// The executable's file name.
+    exe: String,
+}
+
+/// A tracked game that died while another dump was being written: what its rescue needs once the
+/// slot is free (D34).
+struct WaitingRescue {
+    pid: u32,
+    game: String,
+    exit_code: u32,
+}
+
+/// What a clip IO thread writes, which decides what its end reports.
+#[derive(Debug)]
+enum Dump {
+    /// A clip: the user's save, or the watchdog's flush (`Actor::flushing` tells them apart).
+    Clip,
+    /// The tracked game died: its window, rescued to a `recovery-*.tmp` file (P4.11, D34).
+    Rescue { game: String, exit_code: u32 },
+}
+
+/// The game window capture follows, and its exe file name.
+struct GameCapture {
+    hwnd: isize,
+    exe: String,
+}
+
+/// The game with a profile in effect: its process, and its exe file name.
+struct Tracked {
+    pid: u32,
+    exe: String,
+    /// The tee slot of the session recording this game's profile started (P4.7). Kept so the
+    /// game's exit stops that recording, and not a manual one the user started after stopping it.
+    session: Option<SinkId>,
+    /// The profile wants a session but the recording slot was still finishing the previous
+    /// session's file; [`Engine::on_recording_ended`] starts it once the slot is free.
+    session_pending: bool,
+}
+
+/// How many recently focused games without a profile the status keeps.
+const RECENT_GAMES: usize = 8;
+
+/// The window that took focus, as a foreground change reports it.
+#[derive(Clone, Copy, Debug)]
+struct Focus<'a> {
+    pid: u32,
+    hwnd: isize,
+    exe: &'a str,
+}
+
+/// What a foreground change does to capture in Game mode (D31).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureDecision {
+    /// Capture this window. `clear_buffer` when the buffer holds a different game.
+    Start { hwnd: isize, clear_buffer: bool },
+    /// Stop capture, and keep the buffer.
+    Pause,
+    /// Leave capture as it is.
+    Keep,
+}
+
+/// Decides what a focus change does to capture (D31). `tracked` is the game with a profile in
+/// effect, if any, and `kept` is the game whose buffer is held (window, exe file name), and
+/// `capturing` says whether its window is being captured now.
+///
+/// In Screen mode nothing changes. In Game mode, a profiled game starts capture (or moves it to
+/// its new window), and any other app pauses it. While a game is tracked, another profiled game
+/// doesn't move capture: it is a candidate for a prompt (D35), so it pauses like any other app.
+/// ZeroClip's own windows and the shell are ignored, so opening ZeroClip or the Start menu
+/// mid-game doesn't pause capture.
+fn capture_decision(
+    mode: CaptureMode,
+    profiles: &ProfileSet,
+    tracked: Option<&str>,
+    kept: Option<(isize, &str)>,
+    capturing: bool,
+    own_pid: u32,
+    focus: Focus<'_>,
+) -> CaptureDecision {
+    if mode == CaptureMode::Screen || focus.pid == own_pid || is_shell(focus.exe) {
+        return CaptureDecision::Keep;
+    }
+    if profiles.find(focus.exe).is_none() {
+        return CaptureDecision::Pause;
+    }
+    if tracked.is_some_and(|game| !focus_prompt::same_game(game, focus.exe)) {
+        return CaptureDecision::Pause;
+    }
+    let same_game =
+        kept.is_some_and(|(_, exe)| exe_name(exe).eq_ignore_ascii_case(exe_name(focus.exe)));
+    let same_window = kept.is_some_and(|(hwnd, _)| hwnd == focus.hwnd);
+    if capturing && same_window && same_game {
+        return CaptureDecision::Keep;
+    }
+    CaptureDecision::Start { hwnd: focus.hwnd, clear_buffer: kept.is_some() && !same_game }
 }
 
 /// A manual recording, from its start until its IO thread has finished the file.
@@ -266,11 +433,13 @@ struct ActiveRecording {
 }
 
 /// Why a DVR save produced no clip, as its IO thread reports it.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 enum ClipError {
     /// The DVR buffer holds no video yet.
+    #[error("nothing is buffered yet")]
     NothingBuffered,
     /// The snapshot or the file write failed. The text says why.
+    #[error("{0}")]
     Failed(String),
 }
 
@@ -312,17 +481,30 @@ fn bindings(settings: &Settings) -> Vec<Binding<HotkeyAction>> {
 /// Sizes the DVR for these settings, and says how the RAM ceiling clamped the window the
 /// profile asks for (DESIGN §7). With the DVR off, both rings are zero bytes, which
 /// `DvrBuffer` treats as off.
-fn dvr_config(settings: &Settings) -> (DvrConfig, WindowClamp) {
-    let max_video_bps = u64::from(settings.video.max_bitrate_kbps) * 1_000;
-    let ram_ceiling = u64::from(settings.dvr.ram_ceiling_mib) << 20;
-    let clamp = clamp_window(settings.profiles.default.buffer(), max_video_bps, ram_ceiling);
+fn dvr_config(settings: &Settings, total_mib: Option<u64>) -> (DvrConfig, WindowClamp) {
+    let ram = effective_ram_ceiling(settings.dvr.ram_ceiling_mib, total_mib);
+    let clamp = clamp_for(settings, &settings.profiles.default, ram.mib);
     let config = if settings.dvr.enabled {
-        let audio_bps = u64::from(settings.audio.bitrate_kbps) * 1_000;
-        DvrConfig::for_window(clamp.window, max_video_bps, audio_bps)
+        dvr_for(settings, clamp.window)
     } else {
         DvrConfig { video_bytes: 0, audio_bytes: 0 }
     };
     (config, clamp)
+}
+
+/// The DVR rings for a `window` at the bitrates in these settings.
+fn dvr_for(settings: &Settings, window: Hns) -> DvrConfig {
+    let max_video_bps = u64::from(settings.video.max_bitrate_kbps) * 1_000;
+    let audio_bps = u64::from(settings.audio.bitrate_kbps) * 1_000;
+    DvrConfig::for_window(window, max_video_bps, audio_bps)
+}
+
+/// The DVR window a profile asks for, limited by the effective RAM ceiling (`ram_ceiling_mib`, the
+/// output of [`effective_ram_ceiling`]) at the video bitrate.
+fn clamp_for(settings: &Settings, profile: &GameProfile, ram_ceiling_mib: u32) -> WindowClamp {
+    let max_video_bps = u64::from(settings.video.max_bitrate_kbps) * 1_000;
+    let ram_ceiling = u64::from(ram_ceiling_mib) << 20;
+    clamp_window(profile.buffer(), max_video_bps, ram_ceiling)
 }
 
 /// The container track for an audio source that has started. `codec_private` stays
@@ -336,11 +518,17 @@ fn audio_track(track: TrackId, label: &str, config: &AudioStart) -> TrackInfo {
     }
 }
 
-/// What the video source is asked to do, from the user's settings.
-fn video_start(settings: &Settings) -> VideoStart {
+/// What Screen mode records: the chosen monitor, or the primary one.
+fn screen_target(settings: &Settings) -> CaptureTarget {
+    settings.video.monitor.map_or(CaptureTarget::PrimaryMonitor, CaptureTarget::Monitor)
+}
+
+/// What the video source is asked to do: `target` comes from the capture mode (see
+/// `Actor::capture_target`), the rest from the user's settings.
+fn video_start(settings: &Settings, target: CaptureTarget) -> VideoStart {
     let v = &settings.video;
     VideoStart {
-        target: CaptureTarget::PrimaryMonitor,
+        target,
         // "Auto" asks for the best codec; the adapter walks down the ladder.
         codec: v.codec.unwrap_or(Codec::LADDER[0]),
         fps: v.fps,
@@ -368,14 +556,42 @@ fn save_clip_file(
     end: Hns,
     cfg: &OutputConfig,
     tracks: &[TrackInfo],
+    label: &str,
 ) -> Result<(PathBuf, Hns), ClipError> {
     let clip = recorder.snapshot_until(window, end).map_err(|e| match e {
         DvrError::Empty => ClipError::NothingBuffered,
         other => ClipError::Failed(other.to_string()),
     })?;
-    let (path, file) = output::create_file(&cfg.dir, "clip", cfg.format.extension())
+    let (path, file) = output::create_file(&cfg.dir, label, cfg.format.extension())
         .map_err(|e| ClipError::Failed(e.to_string()))?;
-    output::write_clip(&clip, file, tracks, cfg).map_err(|e| ClipError::Failed(e.to_string()))?;
+    write_dump(&clip, path, file, tracks, cfg)
+}
+
+/// Writes a crash rescue that was already copied out of the DVR to `path`, a new file (P4.11).
+/// Runs on the clip's IO thread. `create_new` means an unanswered rescue is never overwritten.
+fn save_rescue_file(
+    clip: &DvrClip,
+    path: PathBuf,
+    cfg: &OutputConfig,
+    tracks: &[TrackInfo],
+) -> Result<(PathBuf, Hns), ClipError> {
+    let failed = |e: io::Error| ClipError::Failed(e.to_string());
+    // The folder exists from startup, but the user may have removed it since.
+    std::fs::create_dir_all(&cfg.dir).map_err(failed)?;
+    let file = File::create_new(&path).map_err(failed)?;
+    write_dump(clip, path, file, tracks, cfg)
+}
+
+/// Writes `clip` into `file` at `path` and syncs it (DurableFile::dump, then `sync_all`), so the
+/// file is complete on disk before its event goes out.
+fn write_dump(
+    clip: &DvrClip,
+    path: PathBuf,
+    file: File,
+    tracks: &[TrackInfo],
+    cfg: &OutputConfig,
+) -> Result<(PathBuf, Hns), ClipError> {
+    output::write_clip(clip, file, tracks, cfg).map_err(|e| ClipError::Failed(e.to_string()))?;
     // The clip still plays without its length in the mehd, so a failure to set it is only logged.
     if let Err(error) = zc_mux::repair::set_fragment_duration(&path) {
         tracing::warn!(error = %error, "could not set a clip's length");
@@ -386,7 +602,7 @@ fn save_clip_file(
 impl Actor {
     fn run(mut self, rx: &Receiver<Msg>) {
         tracing::info!(output_dir = %self.output_dir.display(), "engine started");
-        self.update_window();
+        self.reapply_profile();
         self.detect_drive();
         // Before the sources start: pinning holds the recorder lock while Windows commits the
         // whole buffer, which would stall the encoder and audio threads if they were running.
@@ -400,7 +616,13 @@ impl Actor {
                 self.on_tick();
                 next_tick = now + STATUS_INTERVAL;
             }
-            let msg = match rx.recv_timeout(next_tick.saturating_duration_since(now)) {
+            if self.focus_pending.as_ref().is_some_and(|(_, due)| now >= *due) {
+                self.on_focus_settled();
+            }
+            // Wake for the next tick, or for a candidate's debounce if that comes first (D35).
+            let wake =
+                self.focus_pending.as_ref().map_or(next_tick, |(_, due)| next_tick.min(*due));
+            let msg = match rx.recv_timeout(wake.saturating_duration_since(now)) {
                 Ok(msg) => msg,
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -412,19 +634,30 @@ impl Actor {
                 Msg::Os(event) => self.on_os_event(event),
                 Msg::Health(event) => self.on_health(event),
                 Msg::RecordingEnded(result) => self.on_recording_ended(result),
-                Msg::ClipWritten(result) => self.on_clip_written(result),
+                Msg::ClipWritten(dump, result) => self.on_clip_written(dump, result),
             }
         }
         self.stop_sources();
         self.finish_recording();
-        // A clip being saved finishes first: quitting right after Alt+F10 must not cut it short.
-        if let Some(thread) = self.saving.take() {
-            tracing::info!("finishing the clip being saved before exiting");
-            if thread.join().is_err() {
-                tracing::error!("clip thread panicked");
-            }
-        }
+        self.finish_dumps();
         tracing::info!("engine stopped");
+    }
+
+    /// At shutdown, waits for the dump being written, then writes a crash rescue that was waiting
+    /// for it. Quitting right after Alt+F10 must not cut the clip short, and quitting right after a
+    /// game crash must not lose the rescue: its file stays for the next start's scan (P4.12).
+    fn finish_dumps(&mut self) {
+        loop {
+            if let Some(thread) = self.saving.take() {
+                tracing::info!("finishing the clip being saved before exiting");
+                if thread.join().is_err() {
+                    tracing::error!("clip thread panicked");
+                }
+            }
+            // The slot is free now, so the rescue starts at once and the loop joins it.
+            let Some(waiting) = self.rescue_waiting.take() else { break };
+            self.run_waiting_rescue(waiting);
+        }
     }
 
     fn emit(&self, event: EngineEvent) {
@@ -433,18 +666,297 @@ impl Actor {
         }
     }
 
-    /// Works out the DVR window the settings ask for after the RAM ceiling, and warns if
-    /// the ceiling cut it. The buffer itself keeps the size it was allocated with.
-    fn update_window(&mut self) {
-        let (_, clamp) = dvr_config(&self.settings);
+    /// Makes `profile` the one in effect: the DVR window is the profile's, limited by the RAM
+    /// ceiling. A window that changed resizes the buffer (D21). `announce` says a game took focus,
+    /// so the UI hears about it. A settings change re-applies quietly. The status keeps the active
+    /// window, so there is only one copy of it to go stale.
+    fn apply_profile(&mut self, profile: &GameProfile, exe: &str, announce: bool) {
+        let ram = effective_ram_ceiling(self.settings.dvr.ram_ceiling_mib, self.total_mib);
+        let clamp = clamp_for(&self.settings, profile, ram.mib);
+        if clamp.window != self.status.buffer_window && self.settings.dvr.enabled {
+            self.recorder.resize(dvr_for(&self.settings, clamp.window));
+        }
         self.status.buffer_window = clamp.window;
         if clamp.clamped {
+            let source = if ram.from_system_ram { ", set from your system RAM," } else { "" };
             self.emit(EngineEvent::Warning(format!(
-                "The {} MiB DVR memory limit cuts the buffer to {:.0} s.",
-                self.settings.dvr.ram_ceiling_mib,
+                "The {} MiB DVR memory limit{source} cuts the buffer to {:.0} s.",
+                ram.mib,
                 clamp.window.as_secs_f64(),
             )));
         }
+        if announce {
+            self.emit(EngineEvent::ProfileApplied {
+                exe: exe.to_owned(),
+                window: clamp.window,
+                clamped: clamp.clamped,
+            });
+        }
+    }
+
+    /// Applies the tracked game's profile again after the settings changed, or the default when no
+    /// game is tracked or its profile was removed.
+    fn reapply_profile(&mut self) {
+        let profile = self
+            .tracked
+            .as_ref()
+            .and_then(|tracked| self.settings.profiles.find(&tracked.exe))
+            .unwrap_or(&self.settings.profiles.default)
+            .clone();
+        self.apply_profile(&profile, "", false);
+    }
+
+    /// Handles a focus change for profiles (P4.6). A profiled game becomes the tracked game when
+    /// nothing is tracked: its profile applies, and its process gets the input watch and the game
+    /// audio. Any other app keeps the current profile (sticky, D33), so alt-tabbing to Discord or
+    /// opening Task Manager can't shrink the buffer before a crash rescue. Such an app is listed
+    /// as a recent game instead. A second game, or a fullscreen app without a profile, is a
+    /// candidate: after the debounce the user is asked (D35), and nothing moves until they answer.
+    ///
+    /// Returns whether this focus started tracking a game, so the caller can start its session
+    /// recording once capture is running.
+    fn on_profile_focus(&mut self, pid: u32, hwnd: isize, exe: &str, fullscreen: bool) -> bool {
+        let name = exe_name(exe);
+        let ours = pid == std::process::id();
+        let is_tracked = self.tracked.as_ref().is_some_and(|t| t.exe.eq_ignore_ascii_case(name));
+        let focused =
+            Focused { exe, profiled: self.settings.profiles.find(exe).is_some(), fullscreen, ours };
+        let action = {
+            let tracked = self.tracked.as_ref().map(|t| t.exe.as_str());
+            let asked = tracked.is_some_and(|t| self.prompted.contains(&pair_key(t, name)));
+            focus_prompt::on_focus(tracked, focused, asked)
+        };
+        if !focused.profiled && !is_tracked && !is_shell(exe) && !ours && !name.is_empty() {
+            self.remember_recent(name);
+        }
+        match action {
+            FocusAction::Ignore => false,
+            FocusAction::Track => {
+                if self.tracked.as_ref().is_some_and(|tracked| tracked.pid == pid) {
+                    return false;
+                }
+                self.track_game(pid, exe);
+                true
+            }
+            FocusAction::Ask => {
+                let candidate = Candidate { pid, hwnd, exe: name.to_owned() };
+                self.focus_pending = Some((candidate, Instant::now() + DEBOUNCE));
+                false
+            }
+        }
+    }
+
+    /// Makes the app behind `pid` the tracked game (D33): its process gets the input watch and
+    /// the game audio, and its profile (the default for an app without one) applies. Used for a
+    /// profiled game when nothing is tracked, and for a switch the user picked (D35).
+    fn track_game(&mut self, pid: u32, exe: &str) {
+        let name = exe_name(exe);
+        let profile = self.settings.profiles.resolve(exe).clone();
+        // The previous game's session ends with its tracking: only the tracked game's exit is
+        // acted on, so nothing else would ever stop it.
+        self.stop_session();
+        self.tracked =
+            Some(Tracked { pid, exe: name.to_owned(), session: None, session_pending: false });
+        if let Some(input) = self.ports.input.as_mut()
+            && let Err(error) = input.watch_process(pid)
+        {
+            tracing::warn!(pid, %error, "couldn't watch the game's process");
+        }
+        if let Some(audio) = self.ports.game_audio.as_mut() {
+            audio.set_target_process(Some(pid));
+        }
+        self.apply_profile(&profile, name, true);
+    }
+
+    /// A focus change to `exe` ends a candidate's wait and its prompt, unless `exe` is that
+    /// candidate (D35). The tracked game is unchanged either way. The shell never ends them: a
+    /// fullscreen player reaches ZeroClip through the taskbar or alt-tab (D35).
+    fn settle_candidates(&mut self, exe: &str) {
+        if is_shell(exe) {
+            return;
+        }
+        let name = exe_name(exe);
+        if self.focus_pending.as_ref().is_some_and(|(c, _)| !focus_prompt::same_game(&c.exe, name))
+        {
+            self.focus_pending = None;
+        }
+        if self.focus_prompt.as_ref().is_some_and(|c| !focus_prompt::same_game(&c.exe, name)) {
+            self.focus_prompt = None;
+        }
+    }
+
+    /// The candidate kept focus for the debounce (D35): ask the user, once per pair per session.
+    fn on_focus_settled(&mut self) {
+        let Some((candidate, _)) = self.focus_pending.take() else { return };
+        let Some(current) = self.tracked.as_ref().map(|t| t.exe.clone()) else { return };
+        self.prompted.insert(pair_key(&current, &candidate.exe));
+        self.emit(EngineEvent::FocusPrompt { current, candidate: candidate.exe.clone() });
+        self.focus_prompt = Some(candidate);
+    }
+
+    /// The user's answer to the focus prompt (D35). Switch tracks the candidate as a profiled
+    /// focus would (D33), and starts its capture. Keep, or a prompt that already went away, does
+    /// nothing to the tracked game.
+    fn on_focus_choice(&mut self, choice: FocusChoice) {
+        let Some(candidate) = self.focus_prompt.take() else { return };
+        if choice == FocusChoice::Switch {
+            self.track_game(candidate.pid, &candidate.exe);
+            self.on_capture_focus(Focus {
+                pid: candidate.pid,
+                hwnd: candidate.hwnd,
+                exe: &candidate.exe,
+            });
+            self.start_session();
+        }
+        self.publish_status();
+    }
+
+    /// Starts the tracked game's session recording when its profile asks for one (P4.7, formerly
+    /// P3.26). It takes the one recording slot (D20), so it gets the same `.partial` + repair
+    /// robustness as a manual recording, and the DVR keeps buffering alongside it. A recording
+    /// already running is left alone: the user started it, so it isn't ours to replace.
+    fn start_session(&mut self) {
+        let Some(tracked) = self.tracked.as_ref() else { return };
+        let wanted = self.settings.profiles.find(&tracked.exe).is_some_and(|p| p.session_recording);
+        if !wanted {
+            return;
+        }
+        if let Some(recording) = self.recording.as_ref() {
+            // `id` is None once a stop was asked for: the file is only being finished, so the
+            // session can start as soon as the slot frees up.
+            if recording.id.is_none() {
+                if let Some(tracked) = self.tracked.as_mut() {
+                    tracked.session_pending = true;
+                }
+            } else {
+                tracing::debug!("session recording skipped: a recording is already running");
+            }
+            return;
+        }
+        self.start_recording("session");
+        let id = self.recording.as_ref().and_then(|recording| recording.id);
+        if let Some(tracked) = self.tracked.as_mut() {
+            tracked.session = id;
+        }
+    }
+
+    /// Stops the tracked game's session recording, if it is still the one running. The IO thread
+    /// finishes the file and reports `RecordingStopped`, as for a manual stop.
+    fn stop_session(&mut self) {
+        let Some(id) = self.tracked.as_mut().and_then(|tracked| tracked.session.take()) else {
+            return;
+        };
+        if self.recording.as_ref().is_some_and(|recording| recording.id == Some(id)) {
+            self.stop_recording();
+        }
+    }
+
+    /// A watched process ended (P4.7). Only the tracked game's exit matters: an unexpected exit
+    /// rescues the buffer first (P4.11), then its session recording stops, game audio lets go of
+    /// its process, and the default profile applies again. Any other pid is a game tracked
+    /// earlier, whose profile has already been replaced.
+    fn on_process_exited(&mut self, pid: u32, exit_code: u32) {
+        let Some(game) =
+            self.tracked.as_ref().filter(|tracked| tracked.pid == pid).map(|t| t.exe.clone())
+        else {
+            tracing::debug!(pid, exit_code, "an untracked process exited");
+            return;
+        };
+        tracing::info!(pid, exit_code, "the tracked game exited");
+        // 0 is a clean quit. Task Manager's End task (Details tab) and `taskkill` report 1, and a
+        // crash reports its NTSTATUS, such as 0xC0000005 for an access violation. So anything but
+        // 0 is unexpected (D34).
+        if exit_code != 0 {
+            // One dump at a time (D29). The game stays tracked while the rescue waits, so its
+            // profile keeps the buffer at the game's window; `on_clip_written` comes back for it.
+            if self.saving.is_some() {
+                tracing::info!(pid, "crash rescue waits for the dump being written");
+                self.rescue_waiting = Some(WaitingRescue { pid, game, exit_code });
+                return;
+            }
+            // Before anything below: the default profile can shrink the buffer and drop the
+            // footage the rescue exists to save.
+            self.rescue(&game, exit_code);
+        }
+        self.release_game();
+    }
+
+    /// Runs a rescue that waited for the dump slot, then lets go of its game, unless another
+    /// profiled game took over while it waited. That game's focus already replaced the tracking,
+    /// and its buffer is what the rescue gets. A different game's focus skips the Game-mode clear
+    /// (D31) while a rescue waits, so the dead game's footage is still there.
+    fn run_waiting_rescue(&mut self, waiting: WaitingRescue) {
+        self.rescue(&waiting.game, waiting.exit_code);
+        if self.tracked.as_ref().is_some_and(|tracked| tracked.pid == waiting.pid) {
+            self.release_game();
+        }
+    }
+
+    /// Crash rescue (P4.11, D34): copies the game's window out of the DVR and starts the clip IO
+    /// thread writing it to `recovery-<unix_ms>.<ext>.tmp` in the output folder. The file stays
+    /// there so Keep is a same-volume rename, and `.tmp` keeps it out of the Clips list until the
+    /// user answers (P4.12). `RecoveryReady` goes out once the file is on disk.
+    ///
+    /// The copy runs here, not on the IO thread as a save's does (D29): the caller reverts to the
+    /// default profile right after, and a resize under a copy in progress would fail it
+    /// (`DvrError::Changed`). It is a few short lock holds (D29), once per crash. The caller
+    /// checks the dump slot is free, so this is the only copy of the window.
+    fn rescue(&mut self, game: &str, exit_code: u32) {
+        if !self.settings.dvr.enabled {
+            tracing::info!(game, exit_code, "game exited unexpectedly; the DVR buffer is off");
+            return;
+        }
+        let snapshot = match self.video_track.clone() {
+            Some(video) => self.recorder.snapshot(self.status.buffer_window).map(|c| (video, c)),
+            None => Err(DvrError::Empty),
+        };
+        let (video, clip) = match snapshot {
+            Ok(found) => found,
+            Err(DvrError::Empty) => {
+                self.emit(EngineEvent::Warning(format!(
+                    "{game} closed unexpectedly, but nothing was buffered yet."
+                )));
+                return;
+            }
+            Err(error) => {
+                tracing::error!(game, %error, "crash rescue: the buffer couldn't be copied");
+                self.emit(EngineEvent::Error(format!("Couldn't rescue {game}'s footage: {error}")));
+                return;
+            }
+        };
+        let (tracks, cfg) = self.dump_output(video);
+        // Milliseconds, so two rescues never share a name. `create_new` still refuses a name in
+        // use rather than overwrite an unanswered rescue.
+        let unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        let path = cfg.dir.join(format!("recovery-{unix_ms}.{}.tmp", cfg.format.extension()));
+        let dump = Dump::Rescue { game: game.to_owned(), exit_code };
+        self.spawn_dump(dump, move || save_rescue_file(&clip, path, &cfg, &tracks));
+    }
+
+    /// Lets go of the tracked game after it exited: its session recording stops, game audio
+    /// releases its process, and the default profile applies again.
+    fn release_game(&mut self) {
+        self.stop_session();
+        if let Some(audio) = self.ports.game_audio.as_mut() {
+            audio.set_target_process(None);
+        }
+        self.tracked = None;
+        // A prompt about the game that just exited has nothing left to switch away from (D35).
+        self.focus_pending = None;
+        self.focus_prompt = None;
+        self.status.game = None;
+        let default = self.settings.profiles.default.clone();
+        self.apply_profile(&default, "*", false);
+        self.publish_status();
+    }
+
+    /// Moves `exe` to the front of the recent games, dropping an older entry for it, and keeps
+    /// the newest [`RECENT_GAMES`].
+    fn remember_recent(&mut self, exe: &str) {
+        let recent = &mut self.status.recent_games;
+        recent.retain(|game| !game.eq_ignore_ascii_case(exe));
+        recent.insert(0, exe.to_owned());
+        recent.truncate(RECENT_GAMES);
     }
 
     /// Asks the drive probe whether the output folder is on a spinning disk, which sets the
@@ -489,7 +1001,8 @@ impl Actor {
         let video = self.ports.video.is_some().then_some(TrackId::Video);
         let audio = [&self.ports.game_audio, &self.ports.mic, &self.ports.master_audio]
             .into_iter()
-            .filter_map(|source| source.as_ref().map(|source| source.track()));
+            .filter_map(|source| source.as_ref().map(|source| source.track()))
+            .chain(self.ports.app_audio.iter().map(|(_, source)| source.track()));
         let tracks: Vec<TrackId> = video.into_iter().chain(audio).collect();
         let started = Instant::now();
         match self.recorder.lock_memory(lock, &tracks) {
@@ -546,8 +1059,10 @@ impl Actor {
     }
 
     fn start_sources(&mut self) {
-        self.start_video();
-        self.start_audio();
+        // Game mode starts nothing here: capture begins when a profiled game takes focus (D31).
+        if let Some(target) = self.capture_target() {
+            self.start_capture(target);
+        }
 
         let inbox = self.inbox.clone();
         let os_events: Emit<OsEvent> = Arc::new(move |event| {
@@ -589,6 +1104,13 @@ impl Actor {
                 Err(e) => errors.push(format!("Microphone unavailable: {e}")),
             }
         }
+        // An app track that fails is reported and skipped; it never stops the recording.
+        for (label, app) in &mut self.ports.app_audio {
+            match app.start(&config, Arc::clone(&sink), Arc::clone(&health)) {
+                Ok(()) => tracks.push(audio_track(app.track(), label, &config)),
+                Err(e) => errors.push(format!("{label} audio unavailable: {e}")),
+            }
+        }
         // Only when a source runs, so Master is never a track of silence alone. It starts after
         // them, so its mix point is set before any source writes (D30).
         if !tracks.is_empty()
@@ -600,6 +1122,7 @@ impl Actor {
             }
         }
         self.audio_tracks = tracks;
+        self.audio_running = true;
         // `run` publishes the first status once the sources have started.
         self.status.mic = self.mic_state();
         for error in errors {
@@ -607,15 +1130,40 @@ impl Actor {
         }
     }
 
-    fn start_video(&mut self) {
+    /// What the video source should record now, or `None` when nothing should be: in Game mode
+    /// that is only the game window while it is captured.
+    fn capture_target(&self) -> Option<CaptureTarget> {
+        match self.settings.video.capture_mode {
+            CaptureMode::Screen => Some(screen_target(&self.settings)),
+            CaptureMode::Game if self.status.capturing => {
+                self.game_capture.as_ref().map(|game| CaptureTarget::Window(game.hwnd))
+            }
+            CaptureMode::Game => None,
+        }
+    }
+
+    /// Starts the video source on `target`, and the audio sources unless they already run.
+    fn start_capture(&mut self, target: CaptureTarget) {
+        self.start_video(target);
+        if !self.audio_running {
+            self.start_audio();
+        }
+    }
+
+    fn start_video(&mut self, target: CaptureTarget) {
         let health = self.health_emitter();
-        let config = video_start(&self.settings);
+        let config = video_start(&self.settings, target);
         let sink: SharedSink = self.recorder.clone();
         match self.ports.video.as_mut().map(|video| video.start(&config, sink, health)) {
             Some(Ok(codec)) => {
-                tracing::info!(codec = codec.name(), "capture started");
+                tracing::info!(codec = codec.name(), ?target, "capture started");
+                // A fresh start is a healthy pipeline, so any recovery in progress is over.
+                self.watchdog = Some(Watchdog::new(WatchdogConfig::default(), codec));
+                self.video_config = Some(config);
+                self.status.watchdog = WatchdogState::Running;
                 self.status.capturing = true;
                 self.status.codec = Some(codec);
+                self.video_track = self.ports.video.as_ref().and_then(|video| video.format());
             }
             Some(Err(e)) => self.emit(EngineEvent::Error(format!("Capture couldn't start: {e}"))),
             None => self.emit(EngineEvent::Warning(
@@ -625,19 +1173,106 @@ impl Actor {
     }
 
     fn stop_sources(&mut self) {
-        let Ports { video, game_audio, mic, master_audio, input, .. } = &mut self.ports;
-        if let Some(input) = input {
+        if let Some(input) = self.ports.input.as_mut() {
             input.stop();
         }
+        self.stop_capture();
+    }
+
+    /// Restarts capture after a video setting or the capture mode changed. The DVR buffer
+    /// restarts from empty, since GOPs from the old encoder can't share a clip with the new one.
+    fn restart_capture(&mut self) {
+        tracing::info!("video settings changed; restarting capture");
+        let target = self.capture_target();
+        let was_capturing = self.status.capturing;
+        if let Some(video) = self.ports.video.as_mut() {
+            video.stop();
+        }
+        if self.recording.as_ref().is_some_and(|r| r.id.is_some()) {
+            self.stop_recording();
+            self.emit(EngineEvent::Warning(
+                "Video settings changed, so the recording was stopped.".into(),
+            ));
+        }
+        // `clear` keeps the rings' memory, so the pins taken at startup still hold.
+        self.recorder.clear();
+        self.status.capturing = false;
+        match target {
+            // Audio keeps running when only the video restarts.
+            Some(target) if was_capturing => self.start_video(target),
+            Some(target) => self.start_capture(target),
+            None => self.stop_capture(),
+        }
+    }
+
+    /// Starts, pauses or keeps capture for the window that took focus (D31).
+    fn on_capture_focus(&mut self, focus: Focus<'_>) {
+        let kept = self.game_capture.as_ref().map(|game| (game.hwnd, game.exe.as_str()));
+        // `status.capturing` is false mid-recovery, but the capture session is still alive.
+        let active = self.status.capturing || self.watchdog.is_some();
+        let tracked = self.tracked.as_ref().map(|t| t.exe.as_str());
+        let decision = capture_decision(
+            self.settings.video.capture_mode,
+            &self.settings.profiles,
+            tracked,
+            kept,
+            active,
+            std::process::id(),
+            focus,
+        );
+        match decision {
+            CaptureDecision::Keep => {}
+            CaptureDecision::Pause => {
+                // Not `status.capturing`: that is false mid-recovery, and a recovery left running
+                // would restart the encoder while the user is in another app.
+                if self.watchdog.is_some() {
+                    tracing::info!("focus left the game; capture paused");
+                    self.stop_capture();
+                }
+            }
+            CaptureDecision::Start { hwnd, clear_buffer } => {
+                if active {
+                    self.stop_capture();
+                }
+                // A rescue waiting for the dump slot still needs the dead game's footage, so it
+                // isn't cleared. Trade-off: the new game's first clips can hold the old game too.
+                if clear_buffer && self.rescue_waiting.is_none() {
+                    self.recorder.clear();
+                }
+                let exe = exe_name(focus.exe).to_owned();
+                tracing::info!(exe, hwnd, clear_buffer, "capturing the game window");
+                self.game_capture = Some(GameCapture { hwnd, exe });
+                self.start_capture(CaptureTarget::Window(hwnd));
+            }
+        }
+    }
+
+    /// Stops the video and audio sources and keeps the DVR buffer. The input thread keeps running,
+    /// so the hotkeys work and the next game focus can start capture again (D31).
+    fn stop_capture(&mut self) {
+        let Ports { video, game_audio, mic, app_audio, master_audio, .. } = &mut self.ports;
         // Master last: it still mixes what the sources wrote before they stopped.
-        for audio in [game_audio, mic, master_audio].into_iter().flatten() {
+        let sources = [game_audio, mic]
+            .into_iter()
+            .flatten()
+            .chain(app_audio.iter_mut().map(|(_, source)| source))
+            .chain(master_audio.as_mut());
+        for audio in sources {
             audio.stop();
         }
         if let Some(video) = video {
             video.stop();
         }
+        // A recovery cut short here must not restart the encoder later (a pending flush's
+        // `Flushed` then finds no watchdog and is dropped).
+        self.watchdog = None;
+        // A flush still writing ends through `on_clip_written`; its `Flushed` must not reach a
+        // watchdog created later.
+        self.flushing = false;
+        self.status.watchdog = WatchdogState::Running;
         tracing::info!(stats = ?self.recorder.stats(), "recorder totals");
         self.status.capturing = false;
+        self.audio_running = false;
         self.mic_running = false;
         self.status.mic = self.mic_state();
     }
@@ -645,6 +1280,7 @@ impl Actor {
     fn on_command(&mut self, command: Command) {
         match command {
             Command::SaveClip => self.save_clip(),
+            Command::FocusChoice(choice) => self.on_focus_choice(choice),
             Command::ToggleRecording => self.toggle_recording(),
             Command::Screenshot => self.take_screenshot(),
             Command::PushToTalk(down) => {
@@ -658,7 +1294,7 @@ impl Actor {
                 // Phase 4: also re-size the DVR buffer. Until then it keeps its startup size.
                 let video_changed = self.settings.video != settings.video;
                 self.settings = *settings;
-                self.update_window();
+                self.reapply_profile();
                 self.hotkeys = ChordMatcher::new(bindings(&self.settings));
                 // Switching modes must never leave the push-to-talk gate open.
                 if let Some(mic) = self.ports.mic.as_mut() {
@@ -667,21 +1303,12 @@ impl Actor {
                 // The gate was just set for the new mode, and the matcher was rebuilt above, so
                 // it has forgotten any push-to-talk key that was down.
                 self.ptt_held = false;
-                if video_changed && let Some(video) = self.ports.video.as_mut() {
-                    tracing::info!("video settings changed; restarting capture");
-                    video.stop();
-                    // A new codec, size or frame rate can't continue the same file or share
-                    // DVR clips with the old encoder's GOPs.
-                    if self.recording.as_ref().is_some_and(|r| r.id.is_some()) {
-                        self.stop_recording();
-                        self.emit(EngineEvent::Warning(
-                            "Video settings changed, so the recording was stopped.".into(),
-                        ));
-                    }
-                    // `clear` keeps the rings' memory, so the pins taken at startup still hold.
-                    self.recorder.clear();
-                    self.status.capturing = false;
-                    self.start_video();
+                // In Game mode with nothing captured, the next game focus starts capture with the
+                // new settings, so there is nothing to restart now.
+                let restart = self.settings.video.capture_mode == CaptureMode::Screen
+                    || self.status.capturing;
+                if video_changed && self.ports.video.is_some() && restart {
+                    self.restart_capture();
                 }
                 if let Some(dir) = &self.settings.recording.output_dir
                     && *dir != self.output_dir
@@ -805,6 +1432,9 @@ impl Actor {
         }
         self.status.recording = false;
         self.publish_status();
+        if self.tracked.as_mut().is_some_and(|t| std::mem::take(&mut t.session_pending)) {
+            self.start_session();
+        }
         match result {
             Ok((path, duration)) => {
                 tracing::info!(path = %path.display(), "recording saved");
@@ -844,14 +1474,20 @@ impl Actor {
             self.emit(EngineEvent::Warning("Still saving the previous clip.".into()));
             return;
         }
-        let Some(video) = self.ports.video.as_ref().and_then(|video| video.format()) else {
+        // The buffer outlives a pause (D31), so the track comes from the last encoder, not the
+        // running one.
+        let Some(video) = self.video_track.clone() else {
             self.emit(EngineEvent::Warning("Nothing to save yet: capture hasn't started.".into()));
             return;
         };
-        let tracks: Vec<TrackInfo> =
-            std::iter::once(video).chain(self.audio_tracks.iter().cloned()).collect();
-        let cfg = OutputConfig::from_settings(&self.settings, self.output_dir.clone(), self.drive);
-        let window = self.status.buffer_window;
+        self.spawn_clip("clip", self.status.buffer_window, video);
+    }
+
+    /// Starts the clip IO thread, which snapshots the last `window` of the DVR and writes it to a
+    /// new `label` file, then reports `Msg::ClipWritten`. Returns whether the thread started; if
+    /// not, the error has been reported.
+    fn spawn_clip(&mut self, label: &'static str, window: Hns, video: TrackInfo) -> bool {
+        let (tracks, cfg) = self.dump_output(video);
         // The clip ends at the press. The Master mix trails real time (D30), so when it runs the
         // copy waits until the mix has reached that point.
         let end = self.recorder.video_end();
@@ -861,39 +1497,148 @@ impl Actor {
             Duration::ZERO
         };
         let recorder = Arc::clone(&self.recorder);
+        self.spawn_dump(Dump::Clip, move || {
+            if !catch_up.is_zero() {
+                thread::sleep(catch_up);
+            }
+            save_clip_file(&recorder, window, end, &cfg, &tracks, label)
+        })
+    }
+
+    /// The tracks and output settings for a dump whose video track is `video`. Dumps come in
+    /// bursts, so they are paced on a spinning disk, and always once the watchdog saw a slow one.
+    fn dump_output(&self, video: TrackInfo) -> (Vec<TrackInfo>, OutputConfig) {
+        let tracks: Vec<TrackInfo> =
+            std::iter::once(video).chain(self.audio_tracks.iter().cloned()).collect();
+        let mut cfg =
+            OutputConfig::from_settings(&self.settings, self.output_dir.clone(), self.drive);
+        if self.pace_dumps {
+            let hdd_rate = u64::from(self.settings.storage.hdd_write_mb_per_sec) * 1_000_000;
+            cfg.pacer = WritePacer::limited(hdd_rate);
+        }
+        (tracks, cfg)
+    }
+
+    /// Starts the clip IO thread on `job`, which writes one dump, and reports what it returns as
+    /// `Msg::ClipWritten` with `dump`. Takes the one dump slot (`saving`, D29), so callers check
+    /// it is free. Returns whether the thread started; if not, the error has been reported.
+    fn spawn_dump(
+        &mut self,
+        dump: Dump,
+        job: impl FnOnce() -> Result<(PathBuf, Hns), ClipError> + Send + 'static,
+    ) -> bool {
         let inbox = self.inbox.clone();
         let spawned = thread::Builder::new().name("zc-io-clip".into()).spawn(move || {
             // A panic must still report back, or `saving` stays set and refuses every later save.
-            let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                if !catch_up.is_zero() {
-                    thread::sleep(catch_up);
-                }
-                save_clip_file(&recorder, window, end, &cfg, &tracks)
-            }))
-            .unwrap_or_else(|_| Err(ClipError::Failed("the clip thread panicked".into())));
+            let result = panic::catch_unwind(AssertUnwindSafe(job))
+                .unwrap_or_else(|_| Err(ClipError::Failed("the clip thread panicked".into())));
             // Fails only while the engine is shutting down, when nobody needs the result.
-            let _ = inbox.send(Msg::ClipWritten(result));
+            let _ = inbox.send(Msg::ClipWritten(dump, result));
         });
         match spawned {
             // The result comes back through the inbox; the handle is joined then, or at shutdown.
-            Ok(thread) => self.saving = Some(thread),
-            Err(e) => self.emit(EngineEvent::Error(format!("Couldn't save the clip: {e}"))),
+            Ok(thread) => {
+                self.saving = Some(thread);
+                true
+            }
+            Err(e) => {
+                self.emit(EngineEvent::Error(format!("Couldn't save the clip: {e}")));
+                false
+            }
         }
     }
 
-    /// The clip's IO thread has finished, or given up. Clears `saving`, so the next press is taken.
-    fn on_clip_written(&mut self, result: Result<(PathBuf, Hns), ClipError>) {
+    /// The watchdog's FLUSHING step (DESIGN §8): writes everything the DVR holds to its own
+    /// `recovered` file, because the buffer restarts empty when capture resumes. It is a normal
+    /// dump on the clip IO thread, so `Flushed` comes from [`on_clip_written`](Self::on_clip_written)
+    /// and the actor never waits on the disk. Returns `Flushed` at once when there is nothing to
+    /// write, and `None` while the write (or a save it waits behind) runs.
+    fn start_flush(&mut self) -> Option<HealthEvent> {
+        // One dump at a time (D29): a save already running finishes first, and its end starts this.
+        if self.saving.is_some() {
+            return None;
+        }
+        match self.video_track.clone() {
+            Some(video) if self.settings.dvr.enabled => {
+                // The whole buffer, not the profile's window: the ring may hold more, and all of
+                // it is about to be cleared.
+                self.flushing = self.spawn_clip("recovered", Hns(i64::MAX), video);
+                (!self.flushing).then_some(HealthEvent::Flushed)
+            }
+            _ => Some(HealthEvent::Flushed),
+        }
+    }
+
+    /// The clip's IO thread has finished, or given up. Clears `saving`, so the next press is taken,
+    /// and starts a rescue or a flush that was waiting for it.
+    fn on_clip_written(&mut self, dump: Dump, result: Result<(PathBuf, Hns), ClipError>) {
         // The thread sends this just before it exits, so the join returns at once.
         if let Some(thread) = self.saving.take()
             && thread.join().is_err()
         {
             tracing::error!("clip thread panicked");
         }
+        let flushed = std::mem::take(&mut self.flushing);
+        if let Dump::Rescue { game, exit_code } = dump {
+            self.on_rescue_written(game, exit_code, result);
+        } else {
+            self.on_dump_written(flushed, result);
+        }
+        // The rescue first: a flush moving on below ends in RESUMING, which clears the buffer.
+        // The flush then waits behind the rescue's write, and starts at its end.
+        if let Some(waiting) = self.rescue_waiting.take() {
+            self.run_waiting_rescue(waiting);
+        }
+        if flushed {
+            // Even a failed flush moves on: staying stuck in FLUSHING would end capture for good.
+            self.on_health(HealthEvent::Flushed);
+        } else if self.watchdog.as_ref().is_some_and(|w| w.state() == WatchdogState::Flushing)
+            && let Some(event) = self.start_flush()
+        {
+            // The flush was waiting behind this save. `start_flush` found nothing to write.
+            self.on_health(event);
+        }
+    }
+
+    /// Reports a written rescue: the prompt's `RecoveryReady`, or why there is no file.
+    fn on_rescue_written(
+        &mut self,
+        game: String,
+        exit_code: u32,
+        result: Result<(PathBuf, Hns), ClipError>,
+    ) {
+        match result {
+            Ok((path, duration)) => {
+                tracing::warn!(
+                    game,
+                    exit_code,
+                    path = %path.display(),
+                    "game exited unexpectedly; buffer rescued"
+                );
+                self.emit(EngineEvent::RecoveryReady { path, game, duration });
+            }
+            Err(error) => {
+                tracing::error!(game, exit_code, %error, "crash rescue failed");
+                self.emit(EngineEvent::Error(format!("Couldn't rescue {game}'s footage: {error}")));
+            }
+        }
+    }
+
+    /// Reports a written clip or flush.
+    fn on_dump_written(&mut self, flushed: bool, result: Result<(PathBuf, Hns), ClipError>) {
         match result {
             Ok((path, duration)) => {
                 tracing::info!(path = %path.display(), "clip saved");
+                if flushed {
+                    self.emit(EngineEvent::Warning(format!(
+                        "The encoder failed and is restarting; the footage so far was saved to {}.",
+                        path.display()
+                    )));
+                }
                 self.emit(EngineEvent::ClipSaved { path, duration });
             }
+            // An empty buffer has nothing to rescue, so the flush says nothing about it.
+            Err(ClipError::NothingBuffered) if flushed => {}
             Err(ClipError::NothingBuffered) => {
                 self.emit(EngineEvent::Warning("Nothing to save yet.".into()));
             }
@@ -921,30 +1666,128 @@ impl Actor {
                 };
                 self.on_command(command);
             }
-            // Phase 2 policy: game audio follows every focus change. Phase 4 narrows
-            // it to profiled games, resolves the profile, resizes the DVR buffer and
-            // maybe starts a session.
-            OsEvent::Foreground { pid, exe } => {
+            OsEvent::Foreground { pid, hwnd, exe, fullscreen } => {
                 tracing::debug!(pid, exe, "foreground changed");
-                // The taskbar, Start menu and desktop belong to explorer.exe, which
-                // makes no sound: clicking them mid-game must not retarget the game's
-                // audio track away from the game.
-                let is_shell = exe
-                    .rsplit(['\\', '/'])
-                    .next()
-                    .is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe"));
-                if !is_shell && let Some(game) = self.ports.game_audio.as_mut() {
-                    game.set_target_process(Some(pid));
+                self.settle_candidates(&exe);
+                let newly_tracked = self.on_profile_focus(pid, hwnd, &exe, fullscreen);
+                self.on_capture_focus(Focus { pid, hwnd, exe: &exe });
+                // After capture focus: in Game mode the encoder starts there, and a recording
+                // needs its video track.
+                if newly_tracked {
+                    self.start_session();
                 }
-                self.status.game = Some(exe);
+                // The status holds the file name, not the full path (P4.6).
+                self.status.game = Some(exe_name(&exe).to_owned());
                 self.publish_status();
+            }
+            OsEvent::ProcessExited { pid, exit_code } => self.on_process_exited(pid, exit_code),
+        }
+    }
+
+    /// Feeds a health signal to the watchdog and carries out what it decides (DESIGN §8). Most
+    /// steps finish at once and answer with the next event, which goes straight back in. The
+    /// flush and the first IDR come back later through the inbox. Without a watchdog (video not
+    /// started, or capture paused) the signal is dropped.
+    fn on_health(&mut self, mut event: HealthEvent) {
+        tracing::trace!(?event, "health");
+        loop {
+            let Some(watchdog) = self.watchdog.as_mut() else { return };
+            let before = watchdog.state();
+            let action = watchdog.on_event(event);
+            let after = watchdog.state();
+            if after != before {
+                tracing::info!(?before, ?after, ?action, "watchdog");
+                self.status.watchdog = after;
+                // RESUMING has a running encoder again; only the first IDR is still to come.
+                self.status.capturing =
+                    matches!(after, WatchdogState::Running | WatchdogState::Resuming);
+                self.publish_status();
+            }
+            match self.perform(action) {
+                Some(next) => event = next,
+                None => return,
             }
         }
     }
 
-    fn on_health(&mut self, event: HealthEvent) {
-        // Phase 4: `Watchdog::on_event` decides; carry out the action it returns.
-        tracing::trace!(?event, "health");
+    /// Carries out one watchdog step. Returns the health event that answers it when the step is
+    /// done already, or `None` when nothing follows or the answer comes later.
+    fn perform(&mut self, action: WatchdogAction) -> Option<HealthEvent> {
+        match action {
+            WatchdogAction::None => None,
+            WatchdogAction::Drain => {
+                // `VideoSource::stop` drains the encoder's in-flight samples into the sink and
+                // releases the device, so once it returns the buffer holds everything encoded.
+                if let Some(video) = self.ports.video.as_mut() {
+                    video.stop();
+                }
+                Some(HealthEvent::Drained)
+            }
+            WatchdogAction::FlushToDisk => self.start_flush(),
+            WatchdogAction::Reinit { codec } => Some(self.reinit(codec)),
+            WatchdogAction::Resume => {
+                // The old GOPs are in the flushed file. `clear` keeps the master clock anchored,
+                // so PTS carries on from before the fault rather than from zero (DESIGN §8). The
+                // DVR skips frames until the IDR asked for here, which the source reports.
+                self.recorder.clear();
+                if let Some(video) = self.ports.video.as_mut() {
+                    video.request_keyframe();
+                }
+                None
+            }
+            WatchdogAction::PaceDiskWrites => {
+                if !self.pace_dumps {
+                    self.pace_dumps = true;
+                    self.emit(EngineEvent::Warning(
+                        "The disk is slow; clips will be written more gently.".into(),
+                    ));
+                }
+                None
+            }
+            WatchdogAction::GiveUp => {
+                tracing::error!("watchdog gave up: no codec could be re-initialised");
+                self.status.capturing = false;
+                self.emit(EngineEvent::Error(
+                    "Capture stopped: no hardware encoder could be restarted. Update the GPU \
+                     driver or restart ZeroClip."
+                        .into(),
+                ));
+                None
+            }
+        }
+    }
+
+    /// The watchdog's REINIT step: starts the video source again as it was last started, with
+    /// `codec`, which is lower on the ladder after repeated failures (DESIGN §3, §8).
+    fn reinit(&mut self, codec: Codec) -> HealthEvent {
+        let Some(config) = self.video_config else { return HealthEvent::ReinitFailed };
+        let config = VideoStart { codec, ..config };
+        let sink: SharedSink = self.recorder.clone();
+        let health = self.health_emitter();
+        let Some(video) = self.ports.video.as_mut() else { return HealthEvent::ReinitFailed };
+        match video.start(&config, sink, health) {
+            Ok(actual) => {
+                tracing::info!(codec = actual.name(), "encoder re-initialised");
+                let format = video.format();
+                self.status.codec = Some(actual);
+                // The tee would keep writing the new encoder's packets under the old track
+                // header, as `restart_capture` avoids.
+                if self.recording.as_ref().is_some_and(|r| r.id.is_some()) {
+                    self.stop_recording();
+                    self.emit(EngineEvent::Warning(
+                        "The encoder restarted, so the recording was stopped.".into(),
+                    ));
+                }
+                // A step down the ladder changes the track; the buffer is cleared at RESUMING,
+                // so later clips hold only the new format.
+                self.video_track = format;
+                HealthEvent::ReinitSucceeded
+            }
+            Err(error) => {
+                tracing::warn!(codec = codec.name(), %error, "encoder re-init failed");
+                HealthEvent::ReinitFailed
+            }
+        }
     }
 
     /// Runs once a second while no message arrives. Refreshes the buffered span on the
@@ -986,24 +1829,25 @@ mod tests {
 
     use zc_core::hotkey::Key;
 
-    use crate::synthetic::SyntheticVideoSource;
+    use crate::synthetic::{SyntheticInput, SyntheticVideoSource};
 
     use super::*;
 
-    /// A video source that never touches a GPU and can be told to fail.
+    /// A video source that never touches a GPU and can be told to fail. It records the target of
+    /// every start.
     struct FakeVideo {
         fail: bool,
-        starts: Arc<AtomicUsize>,
+        targets: Arc<Mutex<Vec<CaptureTarget>>>,
     }
 
     impl VideoSource for FakeVideo {
         fn start(
             &mut self,
-            _: &VideoStart,
+            config: &VideoStart,
             _: SharedSink,
             _: Emit<HealthEvent>,
         ) -> Result<Codec, SourceError> {
-            self.starts.fetch_add(1, Ordering::Relaxed);
+            self.targets.lock().unwrap().push(config.target);
             if self.fail {
                 Err(SourceError::Unsupported("no GPU in this test".into()))
             } else {
@@ -1011,7 +1855,12 @@ mod tests {
             }
         }
         fn format(&self) -> Option<TrackInfo> {
-            None
+            (!self.fail).then(|| TrackInfo {
+                track: TrackId::Video,
+                label: "Video".into(),
+                kind: TrackKind::Video { codec: Codec::Hevc, width: 1920, height: 1080, fps: 60 },
+                codec_private: Vec::new(),
+            })
         }
         fn stop(&mut self) {}
         fn request_keyframe(&mut self) {}
@@ -1022,37 +1871,49 @@ mod tests {
 
     fn with_video(fail: bool) -> Ports {
         Ports {
-            video: Some(Box::new(FakeVideo { fail, starts: Arc::default() })),
+            video: Some(Box::new(FakeVideo { fail, targets: Arc::default() })),
             ..Ports::default()
         }
     }
 
+    /// The default settings, in Screen mode, for tests about the whole screen.
+    fn screen_settings() -> Settings {
+        let mut settings = Settings::default();
+        settings.video.capture_mode = CaptureMode::Screen;
+        settings
+    }
+
     #[test]
     fn changed_video_settings_restart_capture_once() {
-        let starts = Arc::new(AtomicUsize::new(0));
-        let video = FakeVideo { fail: false, starts: Arc::clone(&starts) };
-        let (engine, _) = spawn(Ports { video: Some(Box::new(video)), ..Ports::default() });
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let video = FakeVideo { fail: false, targets: Arc::clone(&targets) };
+        let (engine, _) =
+            spawn_in(screen_settings(), Ports { video: Some(Box::new(video)), ..Ports::default() });
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.capturing));
 
-        let mut settings = Settings::default();
+        let mut settings = screen_settings();
         settings.profiles.default.buffer_secs = 90; // not a video setting
         engine.send(Command::ApplySettings(Box::new(settings.clone()))).unwrap();
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
-        assert_eq!(starts.load(Ordering::Relaxed), 1, "unchanged video settings keep capturing");
+        assert_eq!(targets.lock().unwrap().len(), 1, "unchanged video settings keep capturing");
 
         settings.video.fps = 30;
         engine.send(Command::ApplySettings(Box::new(settings))).unwrap();
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.capturing));
-        assert_eq!(starts.load(Ordering::Relaxed), 2);
+        assert_eq!(targets.lock().unwrap().len(), 2);
     }
 
     const TIMEOUT: Duration = Duration::from_secs(5);
 
     fn spawn(ports: Ports) -> (EngineHandle, Arc<AtomicUsize>) {
+        spawn_in(Settings::default(), ports)
+    }
+
+    fn spawn_in(settings: Settings, ports: Ports) -> (EngineHandle, Arc<AtomicUsize>) {
         let wakes = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&wakes);
         let config = EngineConfig {
-            settings: Settings::default(),
+            settings,
             default_output_dir: std::env::temp_dir().join("zeroclip-test"),
         };
         let engine = Engine::spawn(
@@ -1100,7 +1961,7 @@ mod tests {
 
     #[test]
     fn reports_the_codec_once_capture_starts() {
-        let (engine, _) = spawn(with_video(false));
+        let (engine, _) = spawn_in(screen_settings(), with_video(false));
         wait_for(
             &engine,
             |e| matches!(e, EngineEvent::Status(s) if s.capturing && s.codec == Some(Codec::Hevc)),
@@ -1109,7 +1970,7 @@ mod tests {
 
     #[test]
     fn capture_failure_is_reported_not_fatal() {
-        let (engine, _) = spawn(with_video(true));
+        let (engine, _) = spawn_in(screen_settings(), with_video(true));
         wait_for(&engine, |e| matches!(e, EngineEvent::Error(m) if m.starts_with("Capture")));
         let event = wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
         let EngineEvent::Status(status) = event else { unreachable!() };
@@ -1118,14 +1979,187 @@ mod tests {
 
     #[test]
     fn video_start_follows_settings() {
-        let start = video_start(&Settings::default());
+        let start = video_start(&Settings::default(), CaptureTarget::PrimaryMonitor);
         assert_eq!(start.codec, Codec::Av1, "Auto asks for the best codec");
         assert_eq!(start.min_bitrate_bps, 5_000_000);
         assert_eq!(start.max_bitrate_bps, 20_000_000);
         assert_eq!(start.keyframe_interval, zc_core::Hns::from_secs(1));
         assert!(!start.capture_cursor);
+        assert_eq!(start.target, CaptureTarget::PrimaryMonitor);
     }
 
+    #[test]
+    fn screen_mode_targets_the_chosen_monitor() {
+        let mut settings = Settings::default();
+        settings.video.monitor = Some(1);
+        assert_eq!(screen_target(&settings), CaptureTarget::Monitor(1));
+        assert_eq!(
+            video_start(&settings, screen_target(&settings)).target,
+            CaptureTarget::Monitor(1)
+        );
+    }
+
+    fn focus(pid: u32, hwnd: isize, exe: &str) -> Focus<'_> {
+        Focus { pid, hwnd, exe }
+    }
+
+    const CS2: &str = r"C:\Games\cs2.exe";
+    const DISCORD: &str = r"C:\Apps\Discord.exe";
+
+    #[test]
+    fn screen_mode_never_changes_capture() {
+        let decision = capture_decision(
+            CaptureMode::Screen,
+            &ProfileSet::default(),
+            None,
+            None,
+            true,
+            1,
+            focus(9, 5, DISCORD),
+        );
+        assert_eq!(decision, CaptureDecision::Keep);
+    }
+
+    #[test]
+    fn game_mode_starts_on_a_profiled_game() {
+        let decision = capture_decision(
+            CaptureMode::Game,
+            &ProfileSet::default(),
+            Some("cs2.exe"),
+            None,
+            false,
+            1,
+            focus(42, 100, CS2),
+        );
+        assert_eq!(decision, CaptureDecision::Start { hwnd: 100, clear_buffer: false });
+    }
+
+    #[test]
+    fn game_mode_pauses_on_any_other_app() {
+        let decision = capture_decision(
+            CaptureMode::Game,
+            &ProfileSet::default(),
+            Some("cs2.exe"),
+            Some((100, "cs2.exe")),
+            true,
+            1,
+            focus(8, 5, DISCORD),
+        );
+        assert_eq!(decision, CaptureDecision::Pause);
+    }
+
+    #[test]
+    fn same_game_after_a_pause_keeps_the_buffer() {
+        let decision = capture_decision(
+            CaptureMode::Game,
+            &ProfileSet::default(),
+            Some("cs2.exe"),
+            Some((100, "cs2.exe")),
+            false,
+            1,
+            focus(42, 100, CS2),
+        );
+        assert_eq!(decision, CaptureDecision::Start { hwnd: 100, clear_buffer: false });
+    }
+
+    #[test]
+    fn a_candidate_game_does_not_move_capture_while_one_is_tracked() {
+        // D35: the prompt decides, so capture stays off the second game and keeps its buffer.
+        let decision = capture_decision(
+            CaptureMode::Game,
+            &ProfileSet::default(),
+            Some("cs2.exe"),
+            Some((100, "cs2.exe")),
+            true,
+            1,
+            focus(77, 300, r"D:\Games\RainbowSix.exe"),
+        );
+        assert_eq!(decision, CaptureDecision::Pause);
+    }
+
+    #[test]
+    fn a_different_game_clears_the_buffer_when_none_is_tracked() {
+        // After the tracked game exited, the next game is tracked at once and takes the buffer.
+        let decision = capture_decision(
+            CaptureMode::Game,
+            &ProfileSet::default(),
+            None,
+            Some((100, "cs2.exe")),
+            false,
+            1,
+            focus(77, 300, r"D:\Games\RainbowSix.exe"),
+        );
+        assert_eq!(decision, CaptureDecision::Start { hwnd: 300, clear_buffer: true });
+    }
+
+    #[test]
+    fn another_window_of_the_same_game_moves_capture_and_keeps_the_buffer() {
+        let decision = capture_decision(
+            CaptureMode::Game,
+            &ProfileSet::default(),
+            Some("cs2.exe"),
+            Some((100, "cs2.exe")),
+            true,
+            1,
+            focus(42, 200, CS2),
+        );
+        assert_eq!(decision, CaptureDecision::Start { hwnd: 200, clear_buffer: false });
+    }
+
+    #[test]
+    fn the_game_being_captured_is_left_alone() {
+        let decision = capture_decision(
+            CaptureMode::Game,
+            &ProfileSet::default(),
+            Some("cs2.exe"),
+            Some((100, "cs2.exe")),
+            true,
+            1,
+            focus(42, 100, CS2),
+        );
+        assert_eq!(decision, CaptureDecision::Keep);
+    }
+
+    #[test]
+    fn zeroclip_and_the_shell_never_pause_capture() {
+        let (profiles, kept) = (ProfileSet::default(), Some((100, "cs2.exe")));
+        let own = capture_decision(
+            CaptureMode::Game,
+            &profiles,
+            Some("cs2.exe"),
+            kept,
+            true,
+            1,
+            focus(1, 5, DISCORD),
+        );
+        assert_eq!(own, CaptureDecision::Keep, "our own window is ignored");
+        let shell = capture_decision(
+            CaptureMode::Game,
+            &profiles,
+            Some("cs2.exe"),
+            kept,
+            true,
+            1,
+            focus(3, 6, r"C:\Windows\explorer.exe"),
+        );
+        assert_eq!(shell, CaptureDecision::Keep, "the taskbar is ignored");
+    }
+
+    #[test]
+    fn a_game_without_a_profile_is_not_captured() {
+        let mut settings = Settings::default();
+        settings.profiles.games.clear();
+        let decision = capture_decision(
+            CaptureMode::Game,
+            &settings.profiles,
+            None,
+            None,
+            false,
+            1,
+            focus(42, 100, CS2),
+        );
+        assert_eq!(decision, CaptureDecision::Pause, "without a profile, the game is not captured");
+    }
     #[test]
     fn file_stamp_is_sortable_and_has_no_colons() {
         let t = time::macros::datetime!(2023-11-14 22:13:20.5 UTC);
@@ -1134,7 +2168,7 @@ mod tests {
 
     #[test]
     fn screenshot_is_saved_in_the_output_folder() {
-        let (engine, _) = spawn(with_video(false));
+        let (engine, _) = spawn_in(screen_settings(), with_video(false));
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.capturing));
         engine.send(Command::Screenshot).unwrap();
         let event = wait_for(&engine, |e| matches!(e, EngineEvent::ScreenshotSaved { .. }));
@@ -1150,7 +2184,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("zeroclip-clip-empty-{}", std::process::id()));
         let cfg = OutputConfig::from_settings(&Settings::default(), dir.clone(), DriveKind::Ssd);
         let recorder = Recorder::new(DvrConfig { video_bytes: 10_000_000, audio_bytes: 1_000_000 });
-        let result = save_clip_file(&recorder, Hns::from_secs(60), Hns::from_secs(60), &cfg, &[]);
+        let result =
+            save_clip_file(&recorder, Hns::from_secs(60), Hns::from_secs(60), &cfg, &[], "clip");
         assert!(matches!(result, Err(ClipError::NothingBuffered)));
         assert!(!dir.exists(), "the file is only created once there is a clip to write");
     }
@@ -1254,7 +2289,7 @@ mod tests {
     #[test]
     fn mic_indicator_follows_the_push_to_talk_key() {
         use zc_core::hotkey::{Chord, Key};
-        let mut settings = Settings::default();
+        let mut settings = screen_settings();
         settings.audio.mic = MicMode::PushToTalk;
         settings.hotkeys.push_to_talk = Some(Chord::new([Key::MOUSE5]).unwrap());
         let input = FakeInput::default();
@@ -1295,7 +2330,7 @@ mod tests {
 
     #[test]
     fn mic_indicator_stays_live_while_the_mic_is_always_on() {
-        let mut settings = Settings::default();
+        let mut settings = screen_settings();
         settings.audio.mic = MicMode::AlwaysOn;
         let ports = Ports { mic: Some(Box::new(FakeMic::default())), ..Ports::default() };
         let engine = Engine::spawn(
@@ -1357,26 +2392,431 @@ mod tests {
     }
 
     #[test]
-    fn game_audio_starts_and_follows_focus() {
+    fn game_audio_follows_the_tracked_game_only() {
         let (input, game) = (FakeInput::default(), FakeAudio::default());
         let ports = Ports {
             input: Some(Box::new(input.clone())),
             game_audio: Some(Box::new(game.clone())),
             ..Ports::default()
         };
-        let (engine, _) = spawn(ports);
+        // Screen mode, so the audio starts with the engine. Game mode would wait for a profiled game.
+        let (engine, _) = spawn_in(screen_settings(), ports);
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
         let emit = input.0.lock().unwrap().clone().expect("input started");
-        emit(OsEvent::Foreground { pid: 42, exe: r"C:\Games\game.exe".into() });
-        // Clicking the taskbar focuses explorer.exe, which must not take the audio.
-        emit(OsEvent::Foreground { pid: 7, exe: r"C:\Windows\Explorer.EXE".into() });
-        wait_for(
-            &engine,
-            |e| matches!(e, EngineEvent::Status(s) if s.game.as_deref() == Some(r"C:\Windows\Explorer.EXE")),
-        );
+        emit(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into(), fullscreen: false });
+        // Clicking the taskbar and alt-tabbing to an app without a profile must not take the audio.
+        emit(OsEvent::Foreground {
+            pid: 7,
+            hwnd: 200,
+            exe: r"C:\Windows\Explorer.EXE".into(),
+            fullscreen: false,
+        });
+        emit(OsEvent::Foreground { pid: 9, hwnd: 300, exe: DISCORD.into(), fullscreen: false });
+        wait_for_focus(&engine, "Discord.exe", false);
         let state = game.0.lock().unwrap();
         assert_eq!(state.0, 1, "started once");
-        assert_eq!(state.1, [Some(42)]);
+        assert_eq!(state.1, [Some(42)], "set once, for the game");
+    }
+
+    #[test]
+    fn synthetic_input_reaches_the_engine() {
+        let input = SyntheticInput::default();
+        let ports = Ports { input: Some(Box::new(input.clone())), ..Ports::default() };
+        let (engine, _) = spawn(ports);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        let injected = input.inject(OsEvent::Foreground {
+            pid: 1,
+            hwnd: 1,
+            exe: r"C:\x\cs2.exe".into(),
+            fullscreen: false,
+        });
+        assert!(injected, "the engine started the input source");
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.game.is_some()));
+    }
+
+    /// Starts an engine in Screen mode with a synthetic input, and returns the input too.
+    fn spawn_with_input(settings: Settings) -> (EngineHandle, SyntheticInput) {
+        let input = SyntheticInput::default();
+        let ports = Ports { input: Some(Box::new(input.clone())), ..Ports::default() };
+        let (engine, _) = spawn_in(settings, ports);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        (engine, input)
+    }
+
+    #[test]
+    fn foreground_game_applies_its_profile() {
+        let (engine, input) = spawn_with_input(screen_settings());
+        input.inject(OsEvent::Foreground {
+            pid: 42,
+            hwnd: 100,
+            exe: CS2.into(),
+            fullscreen: false,
+        });
+        let EngineEvent::ProfileApplied { exe, window, clamped } =
+            wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!((exe.as_str(), window, clamped), ("cs2.exe", Hns::from_secs(120), false));
+        assert_eq!(input.watched(), [42], "the game's process is watched");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn unknown_apps_keep_the_current_profile() {
+        let (engine, input) = spawn_with_input(screen_settings());
+        input.inject(OsEvent::Foreground {
+            pid: 42,
+            hwnd: 100,
+            exe: CS2.into(),
+            fullscreen: false,
+        });
+        wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }));
+        input.inject(OsEvent::Foreground {
+            pid: 9,
+            hwnd: 300,
+            exe: r"C:\Windows\notepad.exe".into(),
+            fullscreen: false,
+        });
+        // Collect what the engine says up to the status for the new focus.
+        let mut events = Vec::new();
+        loop {
+            let event = engine.wait_event(TIMEOUT).expect("timed out waiting for an event");
+            let done = matches!(&event, EngineEvent::Status(s) if s.game.as_deref() == Some("notepad.exe"));
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        assert!(
+            !events.iter().any(|e| matches!(e, EngineEvent::ProfileApplied { .. })),
+            "an unknown app must not change the profile"
+        );
+        let EngineEvent::Status(status) = events.pop().expect("the status") else { unreachable!() };
+        assert_eq!(status.buffer_window, Hns::from_secs(120), "the game's window stays");
+        assert_eq!(status.recent_games, ["notepad.exe"]);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn profile_window_is_clamped_to_the_ram_ceiling() {
+        let mut settings = screen_settings();
+        settings.dvr.ram_ceiling_mib = 64;
+        let max_video_bps = u64::from(settings.video.max_bitrate_kbps) * 1_000;
+        let (engine, input) = spawn_with_input(settings);
+        input.inject(OsEvent::Foreground {
+            pid: 42,
+            hwnd: 100,
+            exe: r"C:\Games\RainbowSix.exe".into(),
+            fullscreen: false,
+        });
+        let EngineEvent::ProfileApplied { window, clamped, .. } =
+            wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }))
+        else {
+            unreachable!()
+        };
+        assert!(clamped, "5 min at this bitrate doesn't fit in 64 MiB");
+        assert_eq!(window, clamp_window(Hns::from_secs(300), max_video_bps, 64 << 20).window);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn game_exit_reverts_to_the_default_window() {
+        let (engine, input) = spawn_with_input(screen_settings());
+        input.inject(OsEvent::Foreground {
+            pid: 42,
+            hwnd: 100,
+            exe: CS2.into(),
+            fullscreen: false,
+        });
+        wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }));
+        input.inject(OsEvent::ProcessExited { pid: 42, exit_code: 0 });
+        let EngineEvent::Status(status) =
+            wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.game.is_none()))
+        else {
+            unreachable!()
+        };
+        assert_eq!(status.buffer_window, Hns::from_secs(60), "back to the default profile");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn exit_of_an_untracked_process_is_ignored() {
+        let (engine, input) = spawn_with_input(screen_settings());
+        input.inject(OsEvent::Foreground {
+            pid: 42,
+            hwnd: 100,
+            exe: CS2.into(),
+            fullscreen: false,
+        });
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.game.is_some()));
+        input.inject(OsEvent::ProcessExited { pid: 7, exit_code: 1 });
+        // Give cs2 a window no status published so far has, so only a status made after the exit
+        // was handled (one inbox, in order) can show it. It needs cs2 to still be tracked.
+        let mut settings = screen_settings();
+        for game in &mut settings.profiles.games {
+            if game.exe.eq_ignore_ascii_case("cs2.exe") {
+                game.buffer_secs = 150;
+            }
+        }
+        engine.send(Command::ApplySettings(Box::new(settings))).unwrap();
+        let EngineEvent::Status(status) = wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Status(s) if s.buffer_window == Hns::from_secs(150)),
+        ) else {
+            unreachable!()
+        };
+        assert_eq!(status.game.as_deref(), Some("cs2.exe"), "cs2 is still tracked");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn session_profile_records_for_the_life_of_the_game() {
+        let dir = std::env::temp_dir().join(format!("zeroclip-session-{}", std::process::id()));
+        let mut settings = screen_settings();
+        settings.recording.output_dir = Some(dir.clone());
+        let input = SyntheticInput::default();
+        let ports = Ports {
+            video: Some(Box::new(SyntheticVideoSource::new().realtime(true))),
+            input: Some(Box::new(input.clone())),
+            ..Ports::default()
+        };
+        let (engine, _) = spawn_in(settings, ports);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.capturing));
+
+        // cs2's default profile has session recording on.
+        input.inject(OsEvent::Foreground {
+            pid: 42,
+            hwnd: 100,
+            exe: CS2.into(),
+            fullscreen: false,
+        });
+        let EngineEvent::RecordingStarted { path } =
+            wait_for(&engine, |e| matches!(e, EngineEvent::RecordingStarted { .. }))
+        else {
+            unreachable!()
+        };
+        assert!(path.to_string_lossy().contains("session"), "{}", path.display());
+
+        input.inject(OsEvent::ProcessExited { pid: 42, exit_code: 0 });
+        wait_for(&engine, |e| matches!(e, EngineEvent::RecordingStopped { .. }));
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Waits until the status names `exe` (by file name) as the focused app, with capture
+    /// `capturing`. That status is published after the focus change is handled.
+    fn wait_for_focus(engine: &EngineHandle, exe: &str, capturing: bool) {
+        wait_for(engine, |e| {
+            matches!(e, EngineEvent::Status(s)
+                if s.game.as_deref() == Some(exe_name(exe)) && s.capturing == capturing)
+        });
+    }
+
+    #[test]
+    fn game_mode_captures_a_profiled_game_window_only() {
+        let (targets, input) = (Arc::new(Mutex::new(Vec::new())), FakeInput::default());
+        let video = FakeVideo { fail: false, targets: Arc::clone(&targets) };
+        let ports = Ports {
+            input: Some(Box::new(input.clone())),
+            video: Some(Box::new(video)),
+            ..Ports::default()
+        };
+        // No session recording: the fake video pushes nothing, so it would leave an empty file.
+        let mut settings = Settings::default();
+        settings.profiles.games.iter_mut().for_each(|game| game.session_recording = false);
+        let (engine, _) = spawn_in(settings, ports);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        assert!(targets.lock().unwrap().is_empty(), "nothing is captured before a game");
+
+        let emit = input.0.lock().unwrap().clone().expect("input started");
+        emit(OsEvent::Foreground { pid: 7, hwnd: 900, exe: DISCORD.into(), fullscreen: false });
+        wait_for_focus(&engine, DISCORD, false);
+        emit(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into(), fullscreen: false });
+        wait_for_focus(&engine, CS2, true);
+        assert_eq!(*targets.lock().unwrap(), [CaptureTarget::Window(100)]);
+
+        emit(OsEvent::Foreground { pid: 7, hwnd: 900, exe: DISCORD.into(), fullscreen: false });
+        wait_for_focus(&engine, DISCORD, false);
+        // Alt+F10 still saves while capture is paused: the buffer is kept, so the save is only
+        // "nothing buffered yet", not "capture hasn't started".
+        engine.send(Command::SaveClip).unwrap();
+        wait_for(&engine, |e| matches!(e, EngineEvent::Warning(m) if m == "Nothing to save yet."));
+
+        emit(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into(), fullscreen: false });
+        wait_for_focus(&engine, CS2, true);
+        assert_eq!(targets.lock().unwrap().len(), 2, "the same game resumes on its window");
+        engine.shutdown();
+    }
+
+    /// Focus `exe` as `pid` on the synthetic input, and wait until the engine has handled it.
+    fn focus_app(
+        engine: &EngineHandle,
+        input: &SyntheticInput,
+        pid: u32,
+        hwnd: isize,
+        exe: &str,
+        fullscreen: bool,
+    ) {
+        input.inject(OsEvent::Foreground { pid, hwnd, exe: exe.into(), fullscreen });
+        let name = exe_name(exe).to_owned();
+        wait_for(
+            engine,
+            move |e| matches!(e, EngineEvent::Status(s) if s.game.as_deref() == Some(name.as_str())),
+        );
+    }
+
+    /// Collects events for `period` and reports whether any of them is a focus prompt.
+    fn a_focus_prompt_within(engine: &EngineHandle, period: Duration) -> bool {
+        let deadline = Instant::now() + period;
+        while let Some(event) =
+            engine.wait_event(deadline.saturating_duration_since(Instant::now()))
+        {
+            if matches!(event, EngineEvent::FocusPrompt { .. }) {
+                return true;
+            }
+        }
+        false
+    }
+
+    const R6: &str = r"D:\Games\RainbowSix.exe";
+    const WINDOWED: &str = r"E:\Games\Windowed.exe";
+
+    #[test]
+    fn a_second_game_waits_for_the_user_before_it_takes_over() {
+        let (engine, input) = spawn_with_input(screen_settings());
+        input.inject(OsEvent::Foreground {
+            pid: 42,
+            hwnd: 100,
+            exe: CS2.into(),
+            fullscreen: false,
+        });
+        wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }));
+
+        input.inject(OsEvent::Foreground { pid: 77, hwnd: 300, exe: R6.into(), fullscreen: false });
+        let EngineEvent::FocusPrompt { current, candidate } =
+            wait_for(&engine, |e| matches!(e, EngineEvent::FocusPrompt { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!((current.as_str(), candidate.as_str()), ("cs2.exe", "RainbowSix.exe"));
+        assert!(!input.watched().contains(&77), "the candidate is not tracked before the answer");
+
+        engine.send(Command::FocusChoice(FocusChoice::Switch)).unwrap();
+        let EngineEvent::ProfileApplied { exe, .. } =
+            wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(exe, "RainbowSix.exe", "Switch applies the candidate's profile");
+        assert!(input.watched().contains(&77), "and watches its process");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn the_shell_keeps_the_prompt_and_switch_still_tracks_the_candidate() {
+        const EXPLORER: &str = r"C:\Windows\explorer.exe";
+        let (engine, input) = spawn_with_input(screen_settings());
+        focus_app(&engine, &input, 42, 100, CS2, false);
+        input.inject(OsEvent::Foreground { pid: 77, hwnd: 300, exe: R6.into(), fullscreen: false });
+        wait_for(&engine, |e| matches!(e, EngineEvent::FocusPrompt { .. }));
+
+        // The taskbar takes focus while the banner is up: the prompt must survive it.
+        input.inject(OsEvent::Foreground {
+            pid: 5,
+            hwnd: 50,
+            exe: EXPLORER.into(),
+            fullscreen: false,
+        });
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Status(s) if s.game.as_deref() == Some("explorer.exe")),
+        );
+
+        engine.send(Command::FocusChoice(FocusChoice::Switch)).unwrap();
+        let EngineEvent::ProfileApplied { exe, .. } =
+            wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(exe, "RainbowSix.exe", "Switch still applies the candidate's profile");
+        assert!(input.watched().contains(&77), "and watches its process");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_quick_alt_tab_and_an_ordinary_app_never_prompt() {
+        let (engine, input) = spawn_with_input(screen_settings());
+        input.inject(OsEvent::Foreground {
+            pid: 42,
+            hwnd: 100,
+            exe: CS2.into(),
+            fullscreen: false,
+        });
+        wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }));
+
+        // Flick through a second game, then leave it before the debounce ends.
+        input.inject(OsEvent::Foreground { pid: 77, hwnd: 300, exe: R6.into(), fullscreen: false });
+        input.inject(OsEvent::Foreground {
+            pid: 9,
+            hwnd: 900,
+            exe: DISCORD.into(),
+            fullscreen: false,
+        });
+        // A windowed app without a profile is never a candidate.
+        assert!(!a_focus_prompt_within(&engine, Duration::from_millis(3_500)));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_fullscreen_app_without_a_profile_is_a_candidate() {
+        let (engine, input) = spawn_with_input(screen_settings());
+        input.inject(OsEvent::Foreground {
+            pid: 42,
+            hwnd: 100,
+            exe: CS2.into(),
+            fullscreen: false,
+        });
+        wait_for(&engine, |e| matches!(e, EngineEvent::ProfileApplied { .. }));
+
+        input.inject(OsEvent::Foreground {
+            pid: 55,
+            hwnd: 500,
+            exe: WINDOWED.into(),
+            fullscreen: true,
+        });
+        let EngineEvent::FocusPrompt { candidate, .. } =
+            wait_for(&engine, |e| matches!(e, EngineEvent::FocusPrompt { .. }))
+        else {
+            unreachable!()
+        };
+        assert_eq!(candidate, "Windowed.exe");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_pair_prompts_once_per_session() {
+        let (engine, input) = spawn_with_input(screen_settings());
+        focus_app(&engine, &input, 42, 100, CS2, false);
+        input.inject(OsEvent::Foreground { pid: 77, hwnd: 300, exe: R6.into(), fullscreen: false });
+        wait_for(&engine, |e| matches!(e, EngineEvent::FocusPrompt { .. }));
+        engine.send(Command::FocusChoice(FocusChoice::Keep)).unwrap();
+
+        // Back to the tracked game, then to the candidate again: the pair has been asked.
+        focus_app(&engine, &input, 42, 100, CS2, false);
+        input.inject(OsEvent::Foreground { pid: 77, hwnd: 300, exe: R6.into(), fullscreen: false });
+        assert!(!a_focus_prompt_within(&engine, Duration::from_millis(3_500)));
+        engine.shutdown();
+    }
+    #[test]
+    fn screen_mode_records_the_primary_monitor_from_the_start() {
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let video = FakeVideo { fail: false, targets: Arc::clone(&targets) };
+        let ports = Ports { video: Some(Box::new(video)), ..Ports::default() };
+        let (engine, _) = spawn_in(screen_settings(), ports);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.capturing));
+        assert_eq!(*targets.lock().unwrap(), [CaptureTarget::PrimaryMonitor]);
+        engine.shutdown();
     }
 
     /// An audio source that pushes a 20 ms synthetic packet of its track about every 20 ms, from
@@ -1426,7 +2866,7 @@ mod tests {
     #[test]
     fn master_leads_the_audio_tracks_of_a_saved_clip() {
         let dir = std::env::temp_dir().join(format!("zeroclip-master-{}", std::process::id()));
-        let mut settings = Settings::default();
+        let mut settings = screen_settings();
         settings.recording.output_dir = Some(dir.clone());
         let config = EngineConfig { settings, default_output_dir: dir.clone() };
         let ports = Ports {
@@ -1459,17 +2899,62 @@ mod tests {
     }
 
     #[test]
+    fn an_app_track_is_started_and_named_by_its_label_in_a_saved_clip() {
+        let dir = std::env::temp_dir().join(format!("zeroclip-app-{}", std::process::id()));
+        let mut settings = screen_settings();
+        settings.recording.output_dir = Some(dir.clone());
+        let config = EngineConfig { settings, default_output_dir: dir.clone() };
+        let app = FeedAudio::new(zc_core::TrackId::audio(3).expect("slot 3 is an audio track"));
+        let ports = Ports {
+            video: Some(Box::new(SyntheticVideoSource::new().realtime(true))),
+            game_audio: Some(Box::new(FeedAudio::new(zc_core::TrackId::GameAudio))),
+            app_audio: vec![("Discord".to_owned(), Box::new(app) as Box<dyn AudioSource>)],
+            ..Ports::default()
+        };
+        let engine = Engine::spawn(config, ports, Arc::new(|()| {})).expect("spawn");
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Status(s) if s.buffered >= zc_core::Hns::from_secs(1)),
+        );
+        engine.send(Command::SaveClip).unwrap();
+        let event = wait_for(&engine, |e| matches!(e, EngineEvent::ClipSaved { .. }));
+        let EngineEvent::ClipSaved { path, .. } = event else { unreachable!() };
+        engine.shutdown();
+
+        // The app track is declared after Game, and carries its settings label.
+        let file = std::fs::read(&path).expect("the clip is readable");
+        let first = |name: &[u8]| {
+            file.windows(name.len())
+                .position(|w| w == name)
+                .unwrap_or_else(|| panic!("{} is not in the clip", String::from_utf8_lossy(name)))
+        };
+        assert!(first(b"Game") < first(b"Discord"), "the app track follows the game track");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn dvr_is_sized_for_the_clamped_window_and_off_when_disabled() {
         let mut settings = Settings::default();
         settings.profiles.default.buffer_secs = 600;
         settings.dvr.ram_ceiling_mib = 64;
-        let (config, clamp) = dvr_config(&settings);
+        let (config, clamp) = dvr_config(&settings, None);
         assert!(clamp.clamped);
         assert_eq!(config, DvrConfig::for_window(clamp.window, 20_000_000, 192_000));
 
         settings.dvr.enabled = false;
-        let (config, _) = dvr_config(&settings);
+        let (config, _) = dvr_config(&settings, None);
         assert_eq!(config, DvrConfig { video_bytes: 0, audio_bytes: 0 });
+    }
+
+    #[test]
+    fn the_system_ram_share_caps_the_window_when_it_is_smaller() {
+        // 4 GiB of RAM: the 5% share (204 MiB) is under the 1024 MiB setting, so a 10 min window
+        // at 20 Mbps (1500 MB) is cut to what 204 MiB holds.
+        let mut settings = Settings::default();
+        settings.profiles.default.buffer_secs = 600;
+        let (_, clamp) = dvr_config(&settings, Some(4_096));
+        assert!(clamp.clamped);
+        assert_eq!(clamp.window, clamp_window(Hns::from_secs(600), 20_000_000, 204 << 20).window);
     }
 
     #[test]
@@ -1492,7 +2977,8 @@ mod tests {
     fn status_reports_the_buffered_footage_each_second() {
         // Frames arrive at 60 fps in real time, so a tick a second in sees about a second.
         let video = SyntheticVideoSource::new().realtime(true);
-        let (engine, _) = spawn(Ports { video: Some(Box::new(video)), ..Ports::default() });
+        let (engine, _) =
+            spawn_in(screen_settings(), Ports { video: Some(Box::new(video)), ..Ports::default() });
         wait_for(
             &engine,
             |e| matches!(e, EngineEvent::Status(s) if s.buffered >= zc_core::Hns::from_secs(1)),
@@ -1511,7 +2997,7 @@ mod tests {
             input: Some(Box::new(input.clone())),
             ..Ports::default()
         };
-        let (engine, _) = spawn(ports);
+        let (engine, _) = spawn_in(screen_settings(), ports);
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
         let emit = input.0.lock().unwrap().clone().expect("input started");
         let stop = Arc::new(AtomicBool::new(false));
@@ -1550,7 +3036,7 @@ mod tests {
         // The output folder is a plain file, so no recording file can be created in it.
         let blocker = std::env::temp_dir().join(format!("zeroclip-blocker-{}", std::process::id()));
         std::fs::write(&blocker, b"").unwrap();
-        let mut settings = Settings::default();
+        let mut settings = screen_settings();
         settings.recording.output_dir = Some(blocker.clone());
         let config = EngineConfig { settings, default_output_dir: blocker.clone() };
         let video = SyntheticVideoSource::new().realtime(true);
@@ -1571,7 +3057,7 @@ mod tests {
     fn changing_video_settings_ends_the_recording_and_empties_the_dvr() {
         let dir = std::env::temp_dir().join(format!("zeroclip-restart-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut settings = Settings::default();
+        let mut settings = screen_settings();
         settings.recording.output_dir = Some(dir.clone());
         let config = EngineConfig { settings: settings.clone(), default_output_dir: dir.clone() };
         let video = SyntheticVideoSource::new().realtime(true);
@@ -1672,7 +3158,7 @@ mod tests {
             lock_memory: Some(record_pin),
             ..Ports::default()
         };
-        let (engine, _) = spawn(ports);
+        let (engine, _) = spawn_in(screen_settings(), ports);
         wait_for(&engine, |e| matches!(e, EngineEvent::Status(s) if s.capturing));
         assert!(pinned_first.load(Ordering::SeqCst), "the pin ran after a source had started");
         engine.shutdown();
@@ -1686,7 +3172,7 @@ mod tests {
             lock_memory: Some(refuse_lock),
             ..Ports::default()
         };
-        let (engine, _) = spawn(ports);
+        let (engine, _) = spawn_in(screen_settings(), ports);
         let mut warnings = 0;
         loop {
             match engine.wait_event(TIMEOUT).expect("status") {
