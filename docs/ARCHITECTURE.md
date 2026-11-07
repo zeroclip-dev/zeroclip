@@ -15,7 +15,7 @@ state machine; editing never re-encodes; nothing is ever deleted unverified.
 
 | Crate | Owns | Depends on | OS |
 |---|---|---|---|
-| `zeroclip` (repo root) | egui UI, settings file, logging, **wiring** (composition root) | `zc-engine`, `zc-core`, `zc-mux`, `zc-video`, `zc-win` (drive probe, page-locking); more adapters as phases land | Windows |
+| `zeroclip` (repo root) | GPUI UI, settings file, logging, **wiring** (composition root) | `zc-engine`, `zc-core`, `zc-mux`, `zc-video`, `zc-win` (drive probe, page-locking); more adapters as phases land | Windows |
 | `zc-engine` | the engine actor, recording modes, the `Recorder`, the disk-backed DVR ring (`disk_dvr.rs`, D32 Disk mode), synthetic sources | `zc-core`, `zc-mux` | any |
 | `zc-core` | `Hns` time, packets, codecs, DVR buffer, watchdog FSM, profiles, hotkeys, DSP, settings, **ports** | — | any |
 | `zc-mux` | container writers (fMP4/MKV), chunked writes, HDD pacing | `zc-core` | any |
@@ -46,7 +46,7 @@ state machine; editing never re-encodes; nothing is ever deleted unverified.
 
 | Thread | Owner | Does | Must never |
 |---|---|---|---|
-| UI | eframe | draws; sends `Command`s; drains `EngineEvent`s | block on the engine |
+| UI | GPUI | draws; sends `Command`s; drains `EngineEvent`s | block on the engine |
 | `zc-engine` | engine actor | owns settings, profile, watchdog, modes; starts/stops sources | touch the hot path |
 | WGC frame pool | `zc-video` | pace to the target fps, convert to NV12, hand the ring slot to the encoder thread | allocate, block |
 | Encoder (`zc-video` thread) | `zc-video` | NeedInput → `ProcessInput`; HaveOutput → `ProcessOutput` → `PacketSink::push`; repeat the last frame while the screen is static | allocate, block on I/O |
@@ -105,7 +105,7 @@ carry only a PTS.
 - **UI → engine:** `zc_core::control::Command` (save clip, toggle recording, screenshot,
   push-to-talk, apply settings, shutdown) over a channel.
 - **Engine → UI:** `EngineEvent` (status, clip saved, warnings, …) over a channel, plus a
-  `wake` callback that makes egui repaint — egui sleeps otherwise, which is how the UI
+  `wake` callback that makes GPUI repaint — GPUI sleeps otherwise, which is how the UI
   costs nothing while a game runs.
 - **Input → engine:** `OsEvent::Key` goes through the `ChordMatcher` (in `zc-core`) and
   becomes commands; `OsEvent::Foreground` goes through `ProfileSet::resolve` and
