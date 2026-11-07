@@ -3,6 +3,7 @@
 
 pub mod button;
 pub mod labeled_toggle;
+pub mod mic_indicator;
 pub mod number_stepper;
 pub mod open_apps;
 pub mod screens;
