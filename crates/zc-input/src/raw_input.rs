@@ -32,7 +32,7 @@ const USAGE_KEYBOARD: u16 = 0x06;
 /// # Errors
 /// Registration failures.
 pub fn register(hwnd: HWND) -> Result<(), SourceError> {
-    // Never RIDEV_NOLEGACY: the egui window still needs WM_KEYDOWN.
+    // Never RIDEV_NOLEGACY: the app window still needs WM_KEYDOWN.
     let device = |usage| RAWINPUTDEVICE {
         usUsagePage: USAGE_PAGE_GENERIC,
         usUsage: usage,

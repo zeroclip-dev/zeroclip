@@ -108,7 +108,7 @@ impl Engine {
     /// Starts the engine on its own thread.
     ///
     /// `wake` is called after each event is queued, so a UI that sleeps until
-    /// something happens (egui does) knows to repaint.
+    /// something happens (the UI does) knows to repaint.
     ///
     /// # Errors
     /// [`EngineError::Spawn`] if the thread can't be created.

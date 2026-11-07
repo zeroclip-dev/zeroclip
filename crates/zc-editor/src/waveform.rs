@@ -1,7 +1,7 @@
 //! Waveform peaks for the editor timeline (DESIGN §9, "Waveform").
 //!
 //! A background task decodes the audio (ffmpeg → raw f32 PCM on stdout), computes
-//! one RMS value per bucket, and hands the array to egui to draw. Results are
+//! one RMS value per bucket, and hands the array to the UI to draw. Results are
 //! cached by file hash in `zc-store`, so reopening a clip is instant.
 
 /// Splits `samples` into `buckets` equal spans and returns the RMS of each.
