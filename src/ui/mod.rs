@@ -93,6 +93,7 @@ fn status_bar(app: &ZeroClipApp) -> impl IntoElement {
         .children(mic_indicator(status.mic))
         .child(div().ml_auto().child(concat!("v", env!("CARGO_PKG_VERSION"))))
 }
+
 /// "45 s", "2 min", "1 min 30 s".
 pub fn human_duration(t: Hns) -> String {
     let secs = t.as_millis().max(0) / 1_000;

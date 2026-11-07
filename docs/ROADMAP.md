@@ -35,7 +35,7 @@ matches the egui one it replaces.
 - [ ] Profiles (merged, awaiting check by eye)
 - [ ] Settings (merged, awaiting check by eye)
 - [ ] Focus prompt + components (merged, awaiting check by eye)
-- [ ] Remove eframe/egui deps and the glow note in `Cargo.toml`
+- [x] Remove eframe/egui deps and the glow note in `Cargo.toml`
 
 ## Phase 0 — Spike (a weekend)
 
