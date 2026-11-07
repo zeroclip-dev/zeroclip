@@ -2,7 +2,11 @@
 //! widget.
 
 pub mod button;
+pub mod number_stepper;
 pub mod open_apps;
 pub mod screens;
+pub mod segmented;
 pub mod status_dot;
 pub mod tab_button;
+pub mod text_field;
+pub mod toggle;
