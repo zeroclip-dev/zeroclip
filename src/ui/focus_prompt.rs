@@ -1,12 +1,18 @@
 //! The focus prompt banner (D35): a second game has focus while one is clipped. Non-modal, under
 //! the top bar. It never takes keyboard focus, and the window is never raised for it.
 
-use gpui::{Context, IntoElement, ParentElement, StatefulInteractiveElement as _, Styled, div};
+use gpui::{
+    Context, FontWeight, IntoElement, ParentElement, StatefulInteractiveElement as _, Styled, div,
+    rgb,
+};
 use zc_core::control::FocusChoice;
 use zc_core::focus_prompt::is_shell;
 
 use super::components::button::button;
 use crate::app::ZeroClipApp;
+
+const BANNER_BG: u32 = 0x3a3320;
+const BANNER_EDGE: u32 = 0x5c4f20;
 
 /// A focus prompt on screen: the game being clipped, and the app that has focus (file names).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,31 +26,41 @@ pub struct FocusPrompt {
 /// alt-tab) never clears it (D35): that is the way back to ZeroClip. Focus on ZeroClip itself
 /// doesn't send a foreground event, so it never clears the banner either.
 pub fn clear_if_left(app: &mut ZeroClipApp) {
-    let on_shell = app.status.game.as_deref().is_some_and(is_shell);
-    let left = !on_shell
-        && app
-            .focus_prompt
-            .as_ref()
-            .is_some_and(|prompt| app.status.game.as_deref() != Some(prompt.candidate.as_str()));
-    if left {
+    if has_left(app.status.game.as_deref(), app.focus_prompt.as_ref()) {
         app.focus_prompt = None;
     }
 }
 
+/// True when the focused app (`game`) has moved away from the prompt's candidate, and is not the shell.
+fn has_left(game: Option<&str>, prompt: Option<&FocusPrompt>) -> bool {
+    let Some(prompt) = prompt else { return false };
+    let on_shell = game.is_some_and(is_shell);
+    !on_shell && game != Some(prompt.candidate.as_str())
+}
+
 /// The banner: the sentence, then the three answers. Returns nothing to draw when no prompt is up.
-/// Non-modal and never takes keyboard focus. (Enter-picks-Keep from the egui version is not ported yet.)
+/// Non-modal and never takes keyboard focus. Enter-picks-Keep (egui version) is not ported: it needs
+/// a focus handle on the root view, which lives outside this file.
 pub fn banner(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> Option<impl IntoElement> {
     let prompt = app.focus_prompt.as_ref()?;
     Some(
         div()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
             .gap_3()
             .px_3()
             .py_2()
-            .bg(gpui::rgb(0x3a3320))
-            .child(format!("Clipping {}. {} is in focus.", prompt.current, prompt.candidate))
+            .bg(rgb(BANNER_BG))
+            .border_b_1()
+            .border_color(rgb(BANNER_EDGE))
+            .child(
+                div().font_weight(FontWeight::SEMIBOLD).child(format!(
+                    "Clipping {}. {} is in focus.",
+                    prompt.current, prompt.candidate
+                )),
+            )
             .child(button("fp-keep", format!("Keep {}", prompt.current)).on_click(cx.listener(
                 |app, _, _, cx| {
                     app.answer_focus_prompt(FocusChoice::Keep);
@@ -64,4 +80,35 @@ pub fn banner(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> Option<impl I
                 cx.notify();
             }))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prompt() -> FocusPrompt {
+        FocusPrompt { current: "Game.exe".into(), candidate: "Other.exe".into() }
+    }
+
+    #[test]
+    fn prompt_clears_when_candidate_loses_focus() {
+        assert!(has_left(Some("Discord.exe"), Some(&prompt())));
+        assert!(has_left(None, Some(&prompt())));
+    }
+
+    #[test]
+    fn prompt_stays_while_candidate_has_focus() {
+        assert!(!has_left(Some("Other.exe"), Some(&prompt())));
+    }
+
+    #[test]
+    fn prompt_stays_when_focus_goes_to_the_shell() {
+        // Taskbar, Start and alt-tab are the way back to ZeroClip (D35).
+        assert!(!has_left(Some("C:\\Windows\\explorer.exe"), Some(&prompt())));
+    }
+
+    #[test]
+    fn no_prompt_means_nothing_to_clear() {
+        assert!(!has_left(Some("Discord.exe"), None));
+    }
 }
