@@ -6,3 +6,4 @@ pub mod open_apps;
 pub mod screens;
 pub mod status_dot;
 pub mod tab_button;
+pub mod toggle;

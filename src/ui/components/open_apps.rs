@@ -16,23 +16,31 @@ pub struct OpenAppsList {
 }
 
 impl OpenAppsList {
-    fn refresh(&mut self) {
+    pub fn refresh(&mut self) {
         self.apps = list_open_apps();
         self.loaded = true;
     }
+
+    /// The windows listed last, listing them first if that never happened.
+    pub fn apps(&mut self) -> &[OpenApp] {
+        if !self.loaded {
+            self.refresh();
+        }
+        &self.apps
+    }
 }
 
-fn same_exe(a: &str, b: &str) -> bool {
+pub fn same_exe(a: &str, b: &str) -> bool {
     exe_name(a).eq_ignore_ascii_case(exe_name(b))
 }
 
-fn has_live_track(tracks: &[AppTrack], exe: &str) -> bool {
+pub fn has_live_track(tracks: &[AppTrack], exe: &str) -> bool {
     tracks.iter().any(|t| t.enabled && same_exe(&t.exe, exe))
 }
 
 /// Whether turning on a track for `exe` can succeed: it already has an entry to re-enable, or
 /// there is a free slot for a new one.
-fn track_slot_free(tracks: &[AppTrack], exe: &str) -> bool {
+pub fn track_slot_free(tracks: &[AppTrack], exe: &str) -> bool {
     tracks.len() < MAX_APP_TRACKS || tracks.iter().any(|t| same_exe(&t.exe, exe))
 }
 
