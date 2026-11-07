@@ -29,12 +29,12 @@ cards; tick a box here when its cards are done.
 The UI moves from egui to GPUI (D36). One screen per task; a box is ticked when the ported screen
 matches the egui one it replaces.
 
-- [ ] Shell: window, tray, navigation
-- [ ] Home
-- [ ] Clips
-- [ ] Profiles
-- [ ] Settings
-- [ ] Focus prompt + components
+- [x] Shell: window, navigation (tray is Phase 4)
+- [x] Home
+- [ ] Clips (merged, awaiting check by eye)
+- [ ] Profiles (merged, awaiting check by eye)
+- [ ] Settings (merged, awaiting check by eye)
+- [ ] Focus prompt + components (merged, awaiting check by eye)
 - [ ] Remove eframe/egui deps and the glow note in `Cargo.toml`
 
 ## Phase 0 — Spike (a weekend)
