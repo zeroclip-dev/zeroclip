@@ -10,11 +10,10 @@ pub mod settings;
 
 use gpui::{Context, IntoElement, ParentElement, StatefulInteractiveElement, Styled, div, rgb};
 use zc_core::Hns;
-use zc_core::control::MicState;
 use zc_core::media::Codec;
 
 use crate::app::{Tab, ZeroClipApp};
-use components::{status_dot::status_dot, tab_button::tab_button};
+use components::{mic_indicator::mic_indicator, status_dot::status_dot, tab_button::tab_button};
 
 const RED: u32 = 0xf08080;
 const GREEN: u32 = 0x90ee90;
@@ -74,11 +73,6 @@ fn top_bar(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoElement
 
 fn status_bar(app: &ZeroClipApp) -> impl IntoElement {
     let status = &app.status;
-    let mic = match status.mic {
-        MicState::Off => None,
-        MicState::Live => Some(("Mic live", RED)),
-        MicState::Muted => Some(("Mic muted", GRAY)),
-    };
     div()
         .flex()
         .flex_row()
@@ -96,15 +90,7 @@ fn status_bar(app: &ZeroClipApp) -> impl IntoElement {
         ))
         .child(format!("Watchdog: {:?}", status.watchdog))
         .child(format!("Game: {}", status.game.as_deref().unwrap_or("none")))
-        .children(mic.map(|(label, color)| {
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .child(status_dot(rgb(color)))
-                .child(label)
-        }))
+        .children(mic_indicator(status.mic))
         .child(div().ml_auto().child(concat!("v", env!("CARGO_PKG_VERSION"))))
 }
 /// "45 s", "2 min", "1 min 30 s".
