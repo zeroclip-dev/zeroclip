@@ -1,12 +1,10 @@
+#![allow(dead_code)] // read once the Clips screen is ported
+
 //! The clip list. For now a plain folder listing; the library (thumbnails,
 //! metadata from zc-store), the editor and sharing arrive in Phases 4–6.
 
 use std::path::Path;
 use std::time::SystemTime;
-
-use eframe::egui;
-
-use crate::app::{NoticeLevel, ZeroClipApp};
 
 const EXTENSIONS: &[&str] = &["mp4", "mkv", "png", "jpg"];
 
@@ -61,62 +59,25 @@ impl ClipList {
     }
 }
 
-pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
-    let dir = app.output_dir();
-    if !app.clips.scanned {
-        app.clips.rescan(&dir);
-    }
-
-    ui.horizontal(|ui| {
-        ui.heading("Clips");
-        if ui.button("Refresh").clicked() {
-            app.clips.invalidate();
-        }
-        if ui.button("Open folder").clicked()
-            && let Err(e) = open_folder(&dir)
-        {
-            app.notify(NoticeLevel::Error, format!("Couldn't open {}: {e}", dir.display()));
-        }
-    });
-    ui.weak(dir.display().to_string());
-    ui.add_space(8.0);
-
-    if let Some(error) = &app.clips.error {
-        ui.colored_label(egui::Color32::LIGHT_RED, error);
-    }
-    if app.clips.files.is_empty() {
-        ui.weak("No clips yet. Saved clips and screenshots will show up here.");
-        return;
-    }
-    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-        egui::Grid::new("clips").num_columns(3).striped(true).spacing([24.0, 6.0]).show(ui, |ui| {
-            ui.strong("File");
-            ui.strong("Size");
-            ui.strong("Saved");
-            ui.end_row();
-            for file in &app.clips.files {
-                ui.label(&file.name);
-                ui.label(format!("{:.1} MB", file.size_bytes as f64 / 1_000_000.0));
-                ui.label(file.modified.map_or_else(|| "—".to_owned(), age));
-                ui.end_row();
-            }
-        });
-    });
+/// Placeholder until the Clips screen is ported to GPUI.
+pub struct ClipsView {
+    #[allow(dead_code)] // read once the screen has content
+    app: gpui::WeakEntity<crate::app::ZeroClipApp>,
 }
 
-fn age(when: SystemTime) -> String {
-    let secs = SystemTime::now().duration_since(when).map_or(0, |d| d.as_secs());
-    match secs {
-        0..60 => "just now".to_owned(),
-        60..3_600 => format!("{} min ago", secs / 60),
-        3_600..86_400 => format!("{} h ago", secs / 3_600),
-        _ => format!("{} days ago", secs / 86_400),
+impl ClipsView {
+    pub fn new(app: gpui::WeakEntity<crate::app::ZeroClipApp>) -> Self {
+        Self { app }
     }
 }
 
-fn open_folder(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    #[cfg(windows)]
-    std::process::Command::new("explorer").arg(dir).spawn()?;
-    Ok(())
+impl gpui::Render for ClipsView {
+    fn render(
+        &mut self,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use gpui::{ParentElement as _, Styled as _};
+        gpui::div().p_4().child("Clips")
+    }
 }

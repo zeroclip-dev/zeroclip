@@ -2,7 +2,7 @@
 //!
 //! This crate is the composition root: it resolves paths, starts logging, loads
 //! settings, builds the platform adapters ([`wiring`]) and hands them to the
-//! engine, then runs the egui UI. All recording logic lives in `crates/`; see
+//! engine, then runs the GPUI UI. All recording logic lives in `crates/`; see
 //! docs/ARCHITECTURE.md.
 
 // Release builds are GUI apps: no console window. Debug builds keep the console
@@ -16,7 +16,9 @@ mod settings_store;
 mod ui;
 mod wiring;
 
-use eframe::egui;
+use gpui::{
+    AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size,
+};
 
 fn main() -> anyhow::Result<()> {
     let paths = paths::AppPaths::resolve()?;
@@ -25,17 +27,39 @@ fn main() -> anyhow::Result<()> {
 
     let settings = settings_store::load(&paths.settings_file);
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("ZeroClip")
-            .with_inner_size([980.0, 660.0])
-            .with_min_inner_size([760.0, 500.0]),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "ZeroClip",
-        options,
-        Box::new(move |cc| Ok(Box::new(app::ZeroClipApp::new(cc, paths, settings)?))),
-    )
-    .map_err(|e| anyhow::anyhow!("the UI failed: {e}"))
+    Application::new().run(move |cx| {
+        let bounds = Bounds::centered(None, size(px(980.0), px(660.0)), cx);
+        let opened = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(760.0), px(500.0))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("ZeroClip".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            |_, cx| {
+                cx.new(|cx| match app::ZeroClipApp::new(paths, settings, cx) {
+                    Ok(app) => app,
+                    Err(error) => {
+                        tracing::error!(%error, "couldn't start ZeroClip");
+                        // ponytail: a failed engine start has no error screen yet; exit.
+                        std::process::exit(1);
+                    }
+                })
+            },
+        );
+        if let Err(error) = opened {
+            tracing::error!(%error, "couldn't open the window");
+            cx.quit();
+        }
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+    });
+    Ok(())
 }
