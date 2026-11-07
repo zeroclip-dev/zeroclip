@@ -260,6 +260,7 @@ impl Render for ProfilesView {
                 div()
                     .id("profiles_scroll")
                     .flex_1()
+                    .min_h_0()
                     .overflow_y_scroll()
                     .px_4()
                     .py_3()

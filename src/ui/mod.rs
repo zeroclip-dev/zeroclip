@@ -28,7 +28,7 @@ pub fn shell(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoEleme
         .text_color(rgb(0xe6e6e6))
         .child(top_bar(app, cx))
         .children(focus_prompt::banner(app, cx))
-        .child(div().flex_1().child(app.screens.view(app.tab)))
+        .child(div().flex_1().min_h_0().overflow_hidden().child(app.screens.view(app.tab)))
         .child(status_bar(app))
 }
 
