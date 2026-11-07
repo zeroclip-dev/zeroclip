@@ -1,11 +1,11 @@
-//! The egui application: owns the engine handle and the UI state.
+//! The GPUI application root: owns the engine handle and the UI state.
 
 use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 
-use eframe::egui;
+use gpui::{Context, IntoElement, Render, Window};
 use zc_core::control::{Command, EngineEvent, EngineStatus, FocusChoice};
 use zc_core::settings::{CaptureMode, Settings};
 use zc_engine::{Engine, EngineConfig, EngineHandle};
@@ -13,6 +13,7 @@ use zc_mux::repair::{Repaired, repair_partial};
 
 use crate::paths::AppPaths;
 use crate::ui;
+use crate::ui::components::screens::Screens;
 
 /// The top-level tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,6 +22,19 @@ pub enum Tab {
     Clips,
     Profiles,
     Settings,
+}
+
+impl Tab {
+    pub const ALL: [Tab; 4] = [Tab::Home, Tab::Clips, Tab::Profiles, Tab::Settings];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::Home => "Home",
+            Tab::Clips => "Clips",
+            Tab::Profiles => "Profiles",
+            Tab::Settings => "Settings",
+        }
+    }
 }
 
 /// How a line in the activity feed is coloured.
@@ -41,6 +55,8 @@ pub struct Notice {
 const MAX_NOTICES: usize = 50;
 
 pub struct ZeroClipApp {
+    /// One view per tab; see `ui/components/screens.rs`.
+    pub screens: Screens,
     pub engine: EngineHandle,
     pub paths: AppPaths,
     /// Settings as saved to disk and applied to the engine.
@@ -53,6 +69,7 @@ pub struct ZeroClipApp {
     /// Newest first.
     pub notices: VecDeque<Notice>,
     pub clips: ui::clips::ClipList,
+    #[allow(dead_code)] // used by the Profiles screen
     pub open_apps: ui::components::open_apps::OpenAppsList,
     /// The focus prompt on screen, if a second game asked to take over (D35).
     pub focus_prompt: Option<ui::focus_prompt::FocusPrompt>,
@@ -62,13 +79,19 @@ pub struct ZeroClipApp {
 
 impl ZeroClipApp {
     pub fn new(
-        cc: &eframe::CreationContext<'_>,
         paths: AppPaths,
         settings: Settings,
+        cx: &mut Context<Self>,
     ) -> anyhow::Result<Self> {
-        // The engine wakes the UI whenever it has news; otherwise egui sleeps.
-        let ctx = cc.egui_ctx.clone();
-        let wake = Arc::new(move |()| ctx.request_repaint());
+        // The engine (and the repair thread) wake the UI by sending on `wake_tx`; the task below
+        // drains events and repaints. Otherwise the UI sleeps.
+        let (wake_tx, wake_rx) = async_channel::unbounded::<()>();
+        let wake = {
+            let wake_tx = wake_tx.clone();
+            Arc::new(move |()| {
+                let _ = wake_tx.try_send(());
+            })
+        };
         let config = EngineConfig {
             settings: settings.clone(),
             default_output_dir: paths.default_output_dir.clone(),
@@ -82,9 +105,26 @@ impl ZeroClipApp {
             .output_dir
             .clone()
             .unwrap_or_else(|| paths.default_output_dir.clone());
-        spawn_repair(output_dir, repairs_tx, cc.egui_ctx.clone());
+        spawn_repair(output_dir, repairs_tx, wake_tx);
+
+        cx.spawn(async move |this, cx| {
+            while wake_rx.recv().await.is_ok() {
+                // Several wakes can pile up; one drain handles them all.
+                while wake_rx.try_recv().is_ok() {}
+                let alive = this.update(cx, |app, cx| {
+                    app.drain_engine_events();
+                    app.drain_repair_notices();
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    return; // the app has closed
+                }
+            }
+        })
+        .detach();
 
         Ok(Self {
+            screens: Screens::new(cx.weak_entity(), cx),
             engine,
             paths,
             draft: ui::settings::Draft::from_settings(&settings),
@@ -100,6 +140,7 @@ impl ZeroClipApp {
     }
 
     /// Where recordings are written right now.
+    #[allow(dead_code)] // used by the Clips screen
     pub fn output_dir(&self) -> PathBuf {
         self.settings
             .recording
@@ -120,6 +161,7 @@ impl ZeroClipApp {
     }
 
     /// Validates the draft, writes it to disk and applies it to the engine.
+    #[allow(dead_code)] // used by the Settings screen
     pub fn save_settings(&mut self) {
         let settings = match self.draft.build() {
             Ok(settings) => settings,
@@ -170,18 +212,15 @@ impl ZeroClipApp {
         self.send(Command::FocusChoice(choice));
     }
 
-    fn drain_engine_events(&mut self, ctx: &egui::Context) {
+    fn drain_engine_events(&mut self) {
         let events: Vec<EngineEvent> = self.engine.poll_events().collect();
         for event in events {
             match event {
                 EngineEvent::Status(status) => self.status = status,
                 EngineEvent::FocusPrompt { current, candidate } => {
                     self.focus_prompt = Some(ui::focus_prompt::FocusPrompt { current, candidate });
-                    // The taskbar flashes so a fullscreen user sees it after alt-tabbing. The
-                    // window is never raised or activated (D35).
-                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
-                        egui::UserAttentionType::Informational,
-                    ));
+                    // ponytail: egui flashed the taskbar here; GPUI has no equivalent yet.
+                    // Never raise or activate the window (D35).
                 }
                 EngineEvent::ClipSaved { path, duration } => {
                     self.clips.invalidate();
@@ -229,24 +268,23 @@ impl ZeroClipApp {
     }
 }
 
-impl eframe::App for ZeroClipApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.drain_engine_events(ui.ctx());
-        self.drain_repair_notices();
-        ui::show(self, ui);
+impl Render for ZeroClipApp {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        ui::focus_prompt::clear_if_left(self);
+        ui::shell(self, cx)
     }
 }
 
 /// Runs [`repair_partials`] on a background thread and sends its notices to the UI. It asks for
 /// a repaint at the end, so the notices show even when the window is idle.
-fn spawn_repair(dir: PathBuf, notices: mpsc::Sender<Notice>, ctx: egui::Context) {
+fn spawn_repair(dir: PathBuf, notices: mpsc::Sender<Notice>, wake: async_channel::Sender<()>) {
     let spawned = std::thread::Builder::new().name("zc-repair".into()).spawn(move || {
         for notice in repair_partials(&dir) {
             if notices.send(notice).is_err() {
                 return; // the app has closed
             }
         }
-        ctx.request_repaint();
+        let _ = wake.try_send(());
     });
     if let Err(error) = spawned {
         tracing::warn!(%error, "couldn't start the startup repair");

@@ -34,16 +34,10 @@ zc-destinations = { path = "crates/zc-destinations" }
 # External crates. Add new ones here and reference them with `{ workspace = true }`
 # so every crate agrees on one version.
 anyhow = "1.0.104"
+async-channel = "2.5.0"
 directories = "6.0.0"
-# glow (OpenGL) renderer: much lighter to build than the default wgpu stack, and the
-# UI is idle while a game runs anyway. Swap "glow" for "wgpu" if OpenGL misbehaves.
-eframe = { version = "0.36.2", default-features = false, features = [
-    "accesskit",
-    "default_fonts",
-    "glow",
-    "links",
-] }
-# PNG screenshots. Already in the tree through eframe.
+gpui = "0.2.2"
+# PNG screenshots.
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 # `bundled` compiles SQLite into the binary, so there is no sqlite3.dll to ship. It needs
 # the MSVC C compiler, which the README already requires.
@@ -73,7 +67,7 @@ dbg_macro = "warn"
 print_stdout = "warn"
 
 [profile.dev.package."*"]
-# Optimise dependencies even in debug builds: egui and image decoding are
+# Optimise dependencies even in debug builds: image decoding are
 # painfully slow at opt-level 0, and dependencies are compiled only once.
 opt-level = 2
 
@@ -105,7 +99,8 @@ zc-audio.workspace = true
 zc-win.workspace = true
 anyhow.workspace = true
 directories.workspace = true
-eframe.workspace = true
+gpui.workspace = true
+async-channel.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true

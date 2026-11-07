@@ -1,10 +1,11 @@
 //! The focus prompt banner (D35): a second game has focus while one is clipped. Non-modal, under
 //! the top bar. It never takes keyboard focus, and the window is never raised for it.
 
-use eframe::egui;
+use gpui::{Context, IntoElement, ParentElement, StatefulInteractiveElement as _, Styled, div};
 use zc_core::control::FocusChoice;
 use zc_core::focus_prompt::is_shell;
 
+use super::components::button::button;
 use crate::app::ZeroClipApp;
 
 /// A focus prompt on screen: the game being clipped, and the app that has focus (file names).
@@ -30,24 +31,37 @@ pub fn clear_if_left(app: &mut ZeroClipApp) {
     }
 }
 
-/// The banner: the sentence, then the three answers. Keep is the default, so Enter picks it when
-/// no other widget has keyboard focus.
-pub fn banner(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
-    let Some(prompt) = app.focus_prompt.clone() else { return };
-    let enter_keeps =
-        ui.ctx().memory(|m| m.focused().is_none()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
-    ui.horizontal_wrapped(|ui| {
-        ui.label(format!("Clipping {}. {} is in focus.", prompt.current, prompt.candidate));
-        if ui.button(format!("Keep {}", prompt.current)).clicked() || enter_keeps {
-            app.answer_focus_prompt(FocusChoice::Keep);
-        }
-        if ui.button(format!("Switch to {}", prompt.candidate)).clicked() {
-            app.answer_focus_prompt(FocusChoice::Switch);
-        }
-        if ui.button("Clip desktop").clicked() {
-            // The tracked game stays as it is; only the capture mode changes.
-            app.answer_focus_prompt(FocusChoice::Keep);
-            app.clip_desktop();
-        }
-    });
+/// The banner: the sentence, then the three answers. Returns nothing to draw when no prompt is up.
+/// Non-modal and never takes keyboard focus. (Enter-picks-Keep from the egui version is not ported yet.)
+pub fn banner(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> Option<impl IntoElement> {
+    let prompt = app.focus_prompt.as_ref()?;
+    Some(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .bg(gpui::rgb(0x3a3320))
+            .child(format!("Clipping {}. {} is in focus.", prompt.current, prompt.candidate))
+            .child(button("fp-keep", format!("Keep {}", prompt.current)).on_click(cx.listener(
+                |app, _, _, cx| {
+                    app.answer_focus_prompt(FocusChoice::Keep);
+                    cx.notify();
+                },
+            )))
+            .child(button("fp-switch", format!("Switch to {}", prompt.candidate)).on_click(
+                cx.listener(|app, _, _, cx| {
+                    app.answer_focus_prompt(FocusChoice::Switch);
+                    cx.notify();
+                }),
+            ))
+            .child(button("fp-desktop", "Clip desktop").on_click(cx.listener(|app, _, _, cx| {
+                // The tracked game stays as it is; only the capture mode changes.
+                app.answer_focus_prompt(FocusChoice::Keep);
+                app.clip_desktop();
+                cx.notify();
+            }))),
+    )
 }
