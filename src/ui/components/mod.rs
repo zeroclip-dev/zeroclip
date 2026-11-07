@@ -2,6 +2,7 @@
 //! widget.
 
 pub mod button;
+pub mod mic_indicator;
 pub mod open_apps;
 pub mod screens;
 pub mod status_dot;
