@@ -1,5 +1,5 @@
-//! The UI, one module per tab. Immediate mode: every function here runs on each
-//! repaint, and repaints only happen on input or when the engine wakes us.
+//! The UI shell: top bar, optional focus banner, the active screen, status bar. Screens are
+//! views registered in `components/screens.rs`; this file never needs to change for a new screen.
 
 pub mod clips;
 pub mod components;
@@ -8,87 +8,105 @@ pub mod home;
 pub mod profiles;
 pub mod settings;
 
-use eframe::egui::{self, Align, Color32, Layout, RichText};
+use gpui::{Context, IntoElement, ParentElement, StatefulInteractiveElement, Styled, div, rgb};
 use zc_core::Hns;
 use zc_core::control::MicState;
 use zc_core::media::Codec;
 
-use crate::app::{NoticeLevel, Tab, ZeroClipApp};
-use components::mic_indicator::MicIndicator;
+use crate::app::{Tab, ZeroClipApp};
+use components::{status_dot::status_dot, tab_button::tab_button};
 
-pub fn show(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
-    focus_prompt::clear_if_left(app);
-    egui::Panel::top("top_bar").show(ui, |ui| top_bar(app, ui));
-    if app.focus_prompt.is_some() {
-        egui::Panel::top("focus_prompt").show(ui, |ui| focus_prompt::banner(app, ui));
-    }
-    egui::Panel::bottom("status_bar").show(ui, |ui| status_bar(app, ui));
-    egui::CentralPanel::default().show(ui, |ui| match app.tab {
-        Tab::Home => home::show(app, ui),
-        Tab::Clips => clips::show(app, ui),
-        Tab::Profiles => profiles::show(app, ui),
-        Tab::Settings => settings::show(app, ui),
-    });
+const RED: u32 = 0xf08080;
+const GREEN: u32 = 0x90ee90;
+const GRAY: u32 = 0x909090;
+
+pub fn shell(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoElement {
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .bg(rgb(0x1b1b1f))
+        .text_color(rgb(0xe6e6e6))
+        .child(top_bar(app, cx))
+        .children(focus_prompt::banner(app, cx))
+        .child(div().flex_1().child(app.screens.view(app.tab)))
+        .child(status_bar(app))
 }
 
-fn top_bar(app: &mut ZeroClipApp, ui: &mut egui::Ui) {
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("ZeroClip").size(20.0).strong());
-        ui.add_space(16.0);
-        for (tab, label) in [
-            (Tab::Home, "Home"),
-            (Tab::Clips, "Clips"),
-            (Tab::Profiles, "Profiles"),
-            (Tab::Settings, "Settings"),
-        ] {
-            ui.selectable_value(&mut app.tab, tab, label);
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let status = &app.status;
-            let (color, text) = if status.recording {
-                (Color32::LIGHT_RED, "Recording".to_owned())
-            } else if status.capturing && status.buffered == Hns::ZERO {
-                // Capturing, but the DVR has no footage yet, so there's no span to show.
-                (Color32::LIGHT_GREEN, "Capturing".to_owned())
-            } else if status.capturing {
-                (Color32::LIGHT_GREEN, format!("Buffering {}", human_duration(status.buffered)))
-            } else {
-                (Color32::GRAY, "Idle".to_owned())
-            };
-            // Right-to-left: the label is placed first, the dot to its left.
-            ui.colored_label(color, text);
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-            ui.painter().circle_filled(rect.center(), 4.0, color);
-        });
-    });
-    ui.add_space(4.0);
-}
-
-fn status_bar(app: &ZeroClipApp, ui: &mut egui::Ui) {
+fn top_bar(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoElement {
     let status = &app.status;
-    ui.horizontal(|ui| {
-        ui.weak(format!("Codec: {}", status.codec.map_or("—", Codec::name)));
-        ui.separator();
-        ui.weak(format!(
+    let (color, text) = if status.recording {
+        (RED, "Recording".to_owned())
+    } else if status.capturing && status.buffered == Hns::ZERO {
+        // Capturing, but the DVR has no footage yet, so there's no span to show.
+        (GREEN, "Capturing".to_owned())
+    } else if status.capturing {
+        (GREEN, format!("Buffering {}", human_duration(status.buffered)))
+    } else {
+        (GRAY, "Idle".to_owned())
+    };
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .child(div().text_xl().font_weight(gpui::FontWeight::BOLD).mr_4().child("ZeroClip"))
+        .children(Tab::ALL.map(|tab| {
+            tab_button(tab.label(), app.tab == tab).on_click(cx.listener(move |app, _, _, cx| {
+                app.tab = tab;
+                cx.notify();
+            }))
+        }))
+        .child(
+            div()
+                .ml_auto()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .text_color(rgb(color))
+                .child(status_dot(rgb(color)))
+                .child(text),
+        )
+}
+
+fn status_bar(app: &ZeroClipApp) -> impl IntoElement {
+    let status = &app.status;
+    let mic = match status.mic {
+        MicState::Off => None,
+        MicState::Live => Some(("Mic live", RED)),
+        MicState::Muted => Some(("Mic muted", GRAY)),
+    };
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_4()
+        .px_3()
+        .py_1()
+        .text_sm()
+        .text_color(rgb(GRAY))
+        .child(format!("Codec: {}", status.codec.map_or("—", Codec::name)))
+        .child(format!(
             "Buffer: {} of {}",
             human_duration(status.buffered),
             human_duration(status.buffer_window)
-        ));
-        ui.separator();
-        ui.weak(format!("Watchdog: {:?}", status.watchdog));
-        ui.separator();
-        ui.weak(format!("Game: {}", status.game.as_deref().unwrap_or("none")));
-        if status.mic != MicState::Off {
-            ui.separator();
-            ui.add(MicIndicator(status.mic));
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.weak(concat!("v", env!("CARGO_PKG_VERSION")));
-        });
-    });
+        ))
+        .child(format!("Watchdog: {:?}", status.watchdog))
+        .child(format!("Game: {}", status.game.as_deref().unwrap_or("none")))
+        .children(mic.map(|(label, color)| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(status_dot(rgb(color)))
+                .child(label)
+        }))
+        .child(div().ml_auto().child(concat!("v", env!("CARGO_PKG_VERSION"))))
 }
-
 /// "45 s", "2 min", "1 min 30 s".
 pub fn human_duration(t: Hns) -> String {
     let secs = t.as_millis().max(0) / 1_000;
@@ -100,11 +118,13 @@ pub fn human_duration(t: Hns) -> String {
 }
 
 /// Approximate DVR memory for `secs` at `max_kbps`, in MB (DESIGN §4 table).
+#[allow(dead_code)] // used by the Settings and Profiles screens
 pub fn dvr_megabytes(secs: u32, max_kbps: u32) -> u64 {
     u64::from(max_kbps) * 1_000 / 8 * u64::from(secs) / 1_000_000
 }
 
 /// Size of the disk-mode ring file for `secs` (P4.21), in MB. The engine sizes it the same way.
+#[allow(dead_code)]
 pub fn dvr_ring_megabytes(secs: u32, max_kbps: u32, audio_kbps: u32) -> u64 {
     let window = zc_core::Hns::from_secs(i64::from(secs));
     let config = zc_core::dvr::DvrConfig::for_window(
@@ -118,16 +138,9 @@ pub fn dvr_ring_megabytes(secs: u32, max_kbps: u32, audio_kbps: u32) -> u64 {
 /// The DVR memory limit the engine really runs under: the setting, capped at a share of this
 /// machine's RAM (D32, P4.20). The engine and the UI must agree on it, or the Profiles tab shows
 /// windows the engine then cuts.
+#[allow(dead_code)]
 pub fn effective_ceiling(setting_mib: u32) -> zc_core::profile::RamCeiling {
     zc_core::profile::effective_ram_ceiling(setting_mib, zc_win::memory::total_physical_mib())
-}
-
-pub fn notice_color(level: NoticeLevel) -> Color32 {
-    match level {
-        NoticeLevel::Info => Color32::GRAY,
-        NoticeLevel::Warning => Color32::from_rgb(230, 190, 90),
-        NoticeLevel::Error => Color32::LIGHT_RED,
-    }
 }
 
 #[cfg(test)]
