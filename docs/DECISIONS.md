@@ -62,7 +62,7 @@ The engine talks to `VideoSource` / `AudioSource` / `InputSource` traits in `zc-
 Windows crates implement them; the app wires them in. Keeps the engine testable on any
 OS and the Windows code at the edges.
 
-### D13 · egui via eframe, glow renderer
+### D13 · egui via eframe, glow renderer (superseded by D36)
 Immediate-mode UI that sleeps when nothing changes. The glow (OpenGL) backend builds far
 faster than wgpu; switch the eframe feature to `wgpu` if OpenGL misbehaves on a target
 machine.
@@ -300,3 +300,9 @@ picks it or picks Clip desktop, so the engine never retargets audio on its own.
 Costs: while a game is tracked, a game the user didn't pick keeps no buffer and no audio until they
 answer. "Clip both in one buffer" needs one ring per game and a two-track dump, a new output format; deferred.
 A workaround is saving both clips at once on a hotkey, which covers most of the need.
+
+### D36 · UI moves from egui to GPUI (supersedes D13)
+Why: the owner decided to switch the UI to GPUI. D13 chose egui for its fast glow build and its
+idle sleep; those reasons belonged to the egui UI. The zc-* crates and the engine never depended on the UI toolkit.
+Consequence: egui/eframe come out of the root crate when the GPUI migration (ROADMAP) finishes;
+zc-* crates are unaffected; screens are ported one per task.

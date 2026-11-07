@@ -27,7 +27,7 @@ The significant change from v1: **the encode path is decided.** v1 left it as "M
 | Layer | Choice | Why |
 |---|---|---|
 | Language | Rust | Memory safety, speed, fearless concurrency across capture/encode/IO threads |
-| UI | egui | Immediate-mode, fully asleep when backgrounded |
+| UI | GPUI | Sleeps when nothing changes, fully asleep when backgrounded |
 | Capture | Direct3D 11 + Windows.Graphics.Capture | Native, external, no injection |
 | Encode | Media Foundation (`mfplat`) | Takes D3D11 textures directly; true zero-copy |
 | Remux / concat | `ffmpeg` (CLI or `ffmpeg-next`) | Stream-copy only — never touches the live capture path |
@@ -37,7 +37,7 @@ The significant change from v1: **the encode path is decided.** v1 left it as "M
 | Metadata | `rusqlite` | Embedded, zero-config |
 | Foreground detection | `SetWinEventHook` | Event-driven; replaces `sysinfo` polling |
 | Process enumeration | `sysinfo` | Still useful for PID lookup, just not for the hot path |
-| Playback | `egui_video` or `libmpv` | See note below |
+| Playback | `egui_video` (egui-only, see D36) or `libmpv` | See note below |
 | Async runtime | `tokio` | Uploads, waveform extraction, background IO |
 
 **Playback decision, flagged early:** `libmpv` is a much heavier Windows runtime dependency than anything else here, and it affects packaging and installer size. Decide this before Phase 5 rather than during it. `egui_video` is lighter but less mature; if scrubbing performance disappoints, the fallback is spawning an external player for preview rather than pulling in libmpv.
@@ -204,19 +204,19 @@ Watch encoder `HRESULT` returns, frame delta times against expected frame interv
 
 ### Raw Input needs a message pump
 
-A detail that bites people: `WM_INPUT` requires a window with a running message loop. Don't rely on the sleeping egui window — give the input system a dedicated `HWND_MESSAGE` window on its own thread so hotkeys work reliably regardless of UI state.
+A detail that bites people: `WM_INPUT` requires a window with a running message loop. Don't rely on the sleeping GPUI window — give the input system a dedicated `HWND_MESSAGE` window on its own thread so hotkeys work reliably regardless of UI state.
 
 ## 9. The Lightning Editor
 
 Speed comes from never re-encoding. FFmpeg stream-copy slices and joins files essentially instantly.
 
-**Playback.** `egui_video` scrubs the clip inside the Rust UI. See the packaging note in §2 before committing to libmpv as the alternative.
+**Playback.** `egui_video` (egui-only, see D36) scrubs the clip inside the Rust UI. See the packaging note in §2 before committing to libmpv as the alternative.
 
 **Instant trimming.** The user sets in/out points; the backend cuts at the nearest IDR. Because §3 pins the keyframe interval to 1–2s, snap granularity is known and consistent rather than variable. **Show the snap points in the scrub bar** — users accept the limitation readily when they can see where cuts will land, and find it maddening when they can't.
 
 **Stitching.** FFmpeg concat demuxer joins clips instantly, provided codec and resolution match. Clips recorded under different profiles or after a codec-ladder fallback won't concat cleanly — detect the mismatch up front and either refuse with a clear reason or offer a one-time re-encode, rather than producing a broken file.
 
-**Waveform.** A background `tokio` task computes RMS peaks and hands an array to egui to draw. Cache the result in SQLite keyed by file hash so reopening a clip is instant.
+**Waveform.** A background `tokio` task computes RMS peaks and hands an array to GPUI to draw. Cache the result in SQLite keyed by file hash so reopening a clip is instant.
 
 **Worth adding:** keep the original file until the trimmed export is verified, and make trimming non-destructive by default. "Instant" editing that silently overwrites the source is how people lose the clip they were trying to save.
 
@@ -306,7 +306,7 @@ The phase order is a genuine dependency chain — each phase is unblocked by the
 
 **Phase 3 — Buffers, modes, muxing.** GOP-indexed video ring buffer, parallel audio ring buffers, the encoder-output tee, direct-to-disk fMP4 writer, interleaved muxing. *Done when:* a DVR dump taken at any arbitrary moment decodes from the first frame and has audio.
 
-**Phase 4 — UI, profiles, watchdogs.** egui frontend, SQLite metadata, `SetWinEventHook` profile engine with safe buffer resizing, the watchdog state machine, crash rescue. *Done when:* killing the game process via Task Manager reliably produces a recovery prompt with intact video.
+**Phase 4 — UI, profiles, watchdogs.** GPUI frontend (D36; was egui, D13), SQLite metadata, `SetWinEventHook` profile engine with safe buffer resizing, the watchdog state machine, crash rescue. *Done when:* killing the game process via Task Manager reliably produces a recovery prompt with intact video.
 
 **Phase 5 — Editor.** Playback, waveform extraction and caching, stream-copy trim with visible snap points, concat with codec-mismatch detection. *Done when:* trimming a 5-minute clip completes in under a second and the result plays in VLC and a browser.
 

@@ -55,7 +55,7 @@ The full design and the reasoning behind each choice: [docs/DESIGN.md](docs/DESI
 
 ```mermaid
 flowchart TD
-    app["<b>zeroclip</b><br/>egui app · composition root"]
+    app["<b>zeroclip</b><br/>GPUI app · composition root"]
     engine["<b>zc-engine</b><br/>engine actor · recorder"]
     core["<b>zc-core</b><br/>time · packets · DVR buffer<br/>watchdog · profiles · hotkeys"]
     mux["<b>zc-mux</b><br/>containers · disk I/O"]

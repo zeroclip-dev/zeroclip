@@ -24,6 +24,19 @@ cards; tick a box here when its cards are done.
 - [x] Design, architecture and decision docs
 - [x] Add the CI workflow as `.github/workflows/ci.yml` (format, lint, test and docs on Windows)
 
+## GPUI migration
+
+The UI moves from egui to GPUI (D36). One screen per task; a box is ticked when the ported screen
+matches the egui one it replaces.
+
+- [ ] Shell: window, tray, navigation
+- [ ] Home
+- [ ] Clips
+- [ ] Profiles
+- [ ] Settings
+- [ ] Focus prompt + components
+- [ ] Remove eframe/egui deps and the glow note in `Cargo.toml`
+
 ## Phase 0 — Spike (a weekend)
 
 Prove the riskiest assumption before building on it: WGC frame → Media Foundation
