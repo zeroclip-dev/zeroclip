@@ -71,7 +71,7 @@ drops, ffmpeg flags, SQLite): `docs/plan/README.md` → "Cross-cutting pitfalls"
 - Anything used twice (UI widget, layout, service logic) becomes one shared piece: UI blocks
   in `src/ui/components/`, services behind ports in `zc-core`. Extract on the second use,
   not the first.
-- UI work (egui, Phase 4+): restrained, clear hierarchy, tasteful typography, purposeful
+- UI work (GPUI, Phase 4+): restrained, clear hierarchy, tasteful typography, purposeful
   motion, honour reduced motion. Not a settings dump.
 
 ## Git
