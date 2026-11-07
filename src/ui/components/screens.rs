@@ -1,0 +1,37 @@
+//! Tab -> view dispatch. To add or replace a screen: implement `Render` for a view in
+//! `src/ui/<name>.rs` with `fn new(app: WeakEntity<ZeroClipApp>) -> Self`, keep it in the
+//! matching `Screens` field, and nothing else (`ui/mod.rs` never changes).
+
+use gpui::{AnyView, App, AppContext, Entity, WeakEntity};
+
+use crate::app::{Tab, ZeroClipApp};
+use crate::ui::{clips::ClipsView, home::HomeView, profiles::ProfilesView, settings::SettingsView};
+
+/// One live view per tab.
+pub struct Screens {
+    home: Entity<HomeView>,
+    clips: Entity<ClipsView>,
+    profiles: Entity<ProfilesView>,
+    settings: Entity<SettingsView>,
+}
+
+impl Screens {
+    pub fn new(app: WeakEntity<ZeroClipApp>, cx: &mut App) -> Self {
+        Self {
+            home: cx.new(|_| HomeView::new(app.clone())),
+            clips: cx.new(|_| ClipsView::new(app.clone())),
+            profiles: cx.new(|_| ProfilesView::new(app.clone())),
+            settings: cx.new(|_| SettingsView::new(app)),
+        }
+    }
+
+    /// The view shown for `tab`.
+    pub fn view(&self, tab: Tab) -> AnyView {
+        match tab {
+            Tab::Home => self.home.clone().into(),
+            Tab::Clips => self.clips.clone().into(),
+            Tab::Profiles => self.profiles.clone().into(),
+            Tab::Settings => self.settings.clone().into(),
+        }
+    }
+}
