@@ -236,7 +236,7 @@ the game-audio fallback is whole-system loopback (D9), so the desktop's sound ca
 The DVR ring is still sized at startup from the default profile, so a profile window longer than that is
 capped by the ring until P4.6 adds Recorder::resize.
 
-### D32 · DVR buffer storage: RAM, disk or hybrid, sized to free memory (amends D4, D21)
+### D32 · DVR buffer storage: RAM, disk or hybrid, sized to free memory (amends D4, D21) (amended by D37)
 `dvr.storage` is `ram`, `disk` or `hybrid`. **RAM** is D4 as built: pre-allocated, page-locked.
 **Disk** writes each finished GOP to a fixed-size ring file on a drive the user picks (default: a
 non-system drive if present); only the in-flight GOP stays in RAM. **Hybrid** keeps the newest
@@ -306,3 +306,9 @@ Why: the owner decided to switch the UI to GPUI. D13 chose egui for its fast glo
 idle sleep; those reasons belonged to the egui UI. The zc-* crates and the engine never depended on the UI toolkit.
 Consequence: egui/eframe come out of the root crate when the GPUI migration (ROADMAP) finishes;
 zc-* crates are unaffected; screens are ported one per task.
+
+### D37 · DVR storage default is RAM; the disk ring is not crash-readable yet (amends D32)
+The default `dvr.storage` is `ram`. Hybrid is not built. The RAM cap is 5% of total physical RAM
+(`effective_ram_ceiling`, zc-core `profile.rs`), not a share of available memory. A crash leaves no
+readable ring: `DiskRing::create` truncates an existing ring file at start, and P4.11 rescue does not
+read it. Reading the ring after a crash is future work.
