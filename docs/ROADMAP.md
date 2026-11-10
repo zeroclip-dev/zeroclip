@@ -10,7 +10,7 @@ documented core beats a perfect product that isn't finished.
 How to see what is left in the code: `cargo test -- --ignored` runs every spec that
 hasn't been implemented yet.
 
-**Current phase: Phase 3 is done on hardware except P3.28 (README GIF), P3.29 (launch post) and P3.30 (tag v0.1.0). Next code: Phase 4, start at P4.1 ([docs/plan/P4.md](plan/P4.md)).**
+**Current phase: Phase 4 is in progress. Phase 3 is done on hardware except P3.28 (README GIF), P3.29 (launch post) and P3.30 (tag v0.1.0), so v0.1 is not tagged yet. Next code: P4.12, the rescue prompt, which is the phase's done-when ([docs/plan/P4.md](plan/P4.md)).**
 
 Every box below is broken into task cards in [docs/plan/](plan/README.md). Work the
 cards; tick a box here when its cards are done.
@@ -89,7 +89,7 @@ Measured 2026-10-05 with `spike-phase2`: every track within ±11 ms of its minut
 ## Phase 4 — UI, profiles, watchdogs
 
 - [x] Specs: `Watchdog::on_event`, `ProfileSet`, `clamp_window` (`clamp_window` done early, in Phase 3: P3.16)
-- [x] `zc-store` (rusqlite, bundled) and the migrations
+- [x] `zc-store` (rusqlite, bundled) and the migrations (built, not wired in yet)
 - [x] Profile engine on foreground change, with safe buffer resizing
 - [x] Watchdog wiring and the `synthetic_harness` recovery spec (P4.9)
 - [ ] Crash rescue (`recovery.tmp` + prompt) (P4.11, P4.12)
@@ -124,7 +124,7 @@ Spread over the phases above; the cards are P2.24, P3.0a (do it before P3.1), P4
 and P5.14.
 
 - [x] Generalise `TrackId` (P3.0a)
-- [ ] `AppAudioSource`: one track per chosen app (P2.24)
+- [ ] `AppAudioSource`: one track per chosen app (P2.24) (awaiting HW check)
 - [ ] Audio tracks tab in Settings (P4.18)
 - [ ] Track mixer in the editor: volume, mute, solo, mixed export (P5.14)
 
