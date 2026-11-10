@@ -40,7 +40,7 @@ The protocol:
    All three must pass before ticking.
 4. **Tick:** check the card's box in its plan file and the matching box in
    `docs/ROADMAP.md`. Update ARCHITECTURE, DESIGN or DECISIONS when the card says to.
-   For a new DECISIONS entry, use the next free D-number. D18–D22 are taken.
+   For a new DECISIONS entry, use the next free D-number. The next free number is the one after the last entry in DECISIONS.md.
 5. **Hardware cards (HW):** run whatever can run from the terminal (`cargo run -p …`,
    `ffprobe` on the output). Then write a short list of what 0xtikaa must check by eye
    (Task Manager, VLC, alt-tab, Netflix…). Leave the box unticked and append

@@ -137,7 +137,7 @@ stateDiagram-v2
 | Manual | hotkey toggle | `Tee` → session writer | fMP4 |
 | Session | game profile | `Tee` → session writer, for the life of the game | fMP4 |
 | Screenshot | hotkey | one texture → staging → PNG | PNG |
-| Crash rescue | game died unexpectedly | `DvrBuffer` (disk mode: its staged part, then the ring file streamed on the IO thread) → `recovery.tmp` → prompt | fMP4 |
+| Crash rescue | game died unexpectedly | `DvrBuffer` (disk mode: its staged part, then the ring file streamed on the IO thread) → `recovery-<unix_ms>.<ext>.tmp` → prompt | fMP4 |
 | Recording file | while a recording runs | spool → IO thread → `<name>.mp4.partial`, synced per fragment | fMP4, renamed to `<name>.mp4` when finished |
 | Startup repair | app start, for each `*.partial` left behind | cut to the last complete fragment → `<name>.mp4`; never overwrites | fMP4 |
 

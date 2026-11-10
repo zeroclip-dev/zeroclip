@@ -27,7 +27,7 @@ game crashes.
   The separate game and mic tracks are heard in players such as VLC.
 - No MKV output. Recordings and clips are MP4 (fMP4).
 - Game audio follows the focused window only.
-- No tray, no per-game profiles, no watchdog yet.
+- No tray yet.
 
 ## What makes it different
 
@@ -44,9 +44,9 @@ systems work properly:
   the game — or ZeroClip — dies mid-write.
 - **A watchdog that is a state machine,** not a retry loop: drain → flush → re-init →
   resume, stepping down the codec ladder (AV1 → HEVC → H.264) when a GPU can't cope.
-- **Instant editing.** Trim and stitch by stream copy, with no re-encode; keyframe snap
+- **Instant editing (planned).** Trim and stitch by stream copy, with no re-encode; keyframe snap
   points are shown on the timeline.
-- **One-drop sharing.** Drag a clip onto Discord or YouTube and the link lands in your
+- **One-drop sharing (planned).** Drag a clip onto Discord or YouTube and the link lands in your
   clipboard.
 
 The full design and the reasoning behind each choice: [docs/DESIGN.md](docs/DESIGN.md).
