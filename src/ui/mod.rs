@@ -7,6 +7,7 @@ pub mod focus_prompt;
 pub mod home;
 pub mod profiles;
 pub mod settings;
+pub mod theme;
 
 use gpui::{Context, IntoElement, ParentElement, StatefulInteractiveElement, Styled, div, rgb};
 use zc_core::Hns;
