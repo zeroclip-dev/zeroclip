@@ -1,4 +1,4 @@
-//! The toast overlay: a small card in the bottom-left corner that says what just happened
+//! The toast overlay: a small card in the top-left corner that says what just happened
 //! ("Clipped last 20 min"). It lives in its own borderless window. `zc_win::overlay` makes that
 //! window click-through, non-activating and excluded from capture, so it never shows in a
 //! recording or a screenshot.
@@ -100,7 +100,7 @@ impl Render for ToastView {
     }
 }
 
-/// Opens a toast for `kind` in the bottom-left of the primary display and starts its timer:
+/// Opens a toast for `kind` in the top-left of the primary display and starts its timer:
 /// hold, fade out, close. Returns `None` if the window can't be opened or can't be excluded
 /// from capture. In that case nothing is shown.
 pub fn show(cx: &mut App, kind: ToastKind) -> Option<WindowHandle<ToastView>> {
@@ -117,7 +117,7 @@ pub fn show(cx: &mut App, kind: ToastKind) -> Option<WindowHandle<ToastView>> {
             }
         })
         .unwrap_or(Rect { x: 0.0, y: 0.0, w: 1920.0, h: 1080.0 });
-    let (x, y) = model::bottom_left_origin(area, (CARD_W, CARD_H));
+    let (x, y) = model::top_left_origin(area);
     // The card is created hidden and only shown once `zc_win` has excluded it from capture.
     let shimmer = !cx.reduce_motion() && zc_win::overlay::system_animations_enabled();
     let options = WindowOptions {
@@ -125,7 +125,13 @@ pub fn show(cx: &mut App, kind: ToastKind) -> Option<WindowHandle<ToastView>> {
             point(px(x), px(y)),
             size(px(CARD_W), px(CARD_H)),
         ))),
-        titlebar: Some(TitlebarOptions { title: Some(title.clone().into()), ..Default::default() }),
+        // The title only lets `zc_win` find this window. `appears_transparent` is what hides the
+        // Windows title bar and frame (GPUI's `hide_title_bar`); without it the card gets a frame.
+        titlebar: Some(TitlebarOptions {
+            title: Some(title.clone().into()),
+            appears_transparent: true,
+            ..Default::default()
+        }),
         focus: false,
         show: false,
         // PopUp is borderless and top-most, and is a tool window (no taskbar button).

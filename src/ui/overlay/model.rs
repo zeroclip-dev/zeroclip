@@ -13,8 +13,8 @@ pub const CARD_W: f32 = 300.0;
 pub const CARD_H: f32 = 60.0;
 /// Gap from the screen's left edge.
 pub const SIDE_MARGIN: f32 = 24.0;
-/// Gap from the bottom edge, clear of a typical taskbar.
-pub const BOTTOM_MARGIN: f32 = 64.0;
+/// Gap from the screen's top edge.
+pub const TOP_MARGIN: f32 = 24.0;
 /// Time at full opacity, after the fade-in and before the fade-out.
 pub const HOLD: Duration = Duration::from_millis(2_600);
 /// Fade-in and fade-out each. Hold + two fades is about 3 s on screen.
@@ -81,9 +81,9 @@ pub struct Rect {
     pub h: f32,
 }
 
-/// Top-left corner of a `card` (width, height) in the bottom-left of `area`.
-pub fn bottom_left_origin(area: Rect, card: (f32, f32)) -> (f32, f32) {
-    (area.x + SIDE_MARGIN, area.y + area.h - BOTTOM_MARGIN - card.1)
+/// Top-left corner of the card when it sits in the top-left of `area`.
+pub fn top_left_origin(area: Rect) -> (f32, f32) {
+    (area.x + SIDE_MARGIN, area.y + TOP_MARGIN)
 }
 
 /// Left edge of the shimmer band for `progress` in 0..=1. It starts just off the left edge
@@ -114,14 +114,14 @@ mod tests {
     }
 
     #[test]
-    fn card_sits_bottom_left_above_the_taskbar_margin() {
+    fn card_sits_top_left_inside_the_margins() {
         let screen = Rect { x: 0.0, y: 0.0, w: 1920.0, h: 1080.0 };
-        let (x, y) = bottom_left_origin(screen, (CARD_W, CARD_H));
+        let (x, y) = top_left_origin(screen);
         assert_eq!(x, SIDE_MARGIN);
-        assert_eq!(y, 1080.0 - BOTTOM_MARGIN - CARD_H);
+        assert_eq!(y, TOP_MARGIN);
         // A second monitor that starts to the right moves the card with it.
         let right = Rect { x: 1920.0, ..screen };
-        assert_eq!(bottom_left_origin(right, (CARD_W, CARD_H)).0, 1920.0 + SIDE_MARGIN);
+        assert_eq!(top_left_origin(right).0, 1920.0 + SIDE_MARGIN);
     }
 
     #[test]
