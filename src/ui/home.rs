@@ -226,7 +226,7 @@ impl Render for HomeView {
                                 .child("\u{25b6}"),
                         ),
                     )
-                    .child(div().text_sm().truncate().child(file.name.clone()))
+                    .child(div().text_sm().truncate().child(super::clips::display_name(&file.name)))
                     .child(
                         div()
                             .text_xs()
@@ -277,10 +277,9 @@ impl Render for HomeView {
                 div().flex().flex_row().flex_wrap().gap_3().children(tiles)
             });
 
-        div()
-            .id("home")
-            .size_full()
-            .overflow_y_scroll()
+        // The scroll box has no padding of its own (bottom padding of a scroll box is dropped), so
+        // the padded column sits inside it.
+        let content = div()
             .flex()
             .flex_col()
             .gap_4()
@@ -305,9 +304,10 @@ impl Render for HomeView {
                 div()
                     .flex()
                     .flex_row()
+                    .flex_wrap()
                     .gap_4()
-                    .child(buffer_card)
-                    .child(card("Hotkeys").flex_1().children(rows)),
+                    .child(buffer_card.min_w(px(320.)))
+                    .child(card("Hotkeys").flex_1().min_w(px(320.)).children(rows)),
             )
             .child(recent_section)
             .child(
@@ -321,8 +321,8 @@ impl Render for HomeView {
                         .text_sm()
                         .children(feed),
                 ),
-            )
-            .into_any_element()
+            );
+        div().id("home").size_full().overflow_y_scroll().child(content).into_any_element()
     }
 }
 

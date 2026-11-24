@@ -136,7 +136,7 @@ fn status_bar(app: &ZeroClipApp) -> impl IntoElement {
         .py_1()
         .text_sm()
         .text_color(rgb(GRAY))
-        .child(format!("Codec: {}", status.codec.map_or("—", Codec::name)))
+        .child(format!("Codec: {}", status.codec.map_or("-", Codec::name)))
         .child(format!(
             "Buffer: {} of {}",
             human_duration(status.buffered),

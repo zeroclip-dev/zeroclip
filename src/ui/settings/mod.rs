@@ -20,7 +20,7 @@ use zc_core::settings::{
 use zc_video::capture::MonitorInfo;
 
 use super::components::{
-    button::{button, button_primary},
+    button::{button, button_primary_if},
     field_row::field_row as row,
     labeled_toggle::labeled_toggle,
     number_stepper::{Stepper, number_stepper},
@@ -274,7 +274,7 @@ fn view_switch(mode: UiMode, cx: &mut Context<SettingsView>) -> gpui::Div {
 /// Save and Revert, and every problem with the draft. Shared by both views.
 fn save_bar(d: &Draft, dirty: bool, cx: &mut Context<SettingsView>) -> gpui::Div {
     let dim = if dirty { 1.0 } else { 0.4 };
-    let save = button_primary("save", "Save").opacity(dim);
+    let save = button_primary_if("save", "Save", dirty);
     let revert = button("revert", "Revert").opacity(dim);
     let (save, revert) = if dirty {
         (
