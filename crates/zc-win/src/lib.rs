@@ -30,5 +30,6 @@ pub mod message_thread;
 pub mod mf;
 pub mod overlay;
 pub mod process;
+pub mod shell;
 pub mod single_instance;
 pub mod toast;

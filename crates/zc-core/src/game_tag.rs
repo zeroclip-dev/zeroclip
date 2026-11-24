@@ -28,6 +28,11 @@ pub fn rename(from: &Path, to: &Path) {
     }
 }
 
+/// Deletes the tag of a video that was deleted.
+pub fn remove(video: &Path) {
+    let _ = std::fs::remove_file(sidecar(video));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
