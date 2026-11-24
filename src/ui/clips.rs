@@ -261,7 +261,7 @@ fn make_thumbnail(ffmpeg_path: Option<&Path>, clip: &Path, thumb: &Path) -> bool
     // that would later count as a finished thumbnail.
     let part = thumb.with_extension("part.jpg");
     let _ = std::fs::remove_file(&part);
-    let done = ffmpeg.thumbnail(clip, Hns::from_millis(500), &part).is_ok()
+    let done = ffmpeg.thumbnail(clip, Hns::from_millis(500), 192, &part).is_ok()
         && std::fs::rename(&part, thumb).is_ok();
     if !done {
         let _ = std::fs::remove_file(&part);
