@@ -161,14 +161,14 @@ impl Render for ProfilesView {
                     .truncate()
                     .on_click({
                         let handle = handle.clone();
-                        move |_, window, _| window.focus(&handle)
+                        move |_, window, cx| window.focus(&handle, cx)
                     })
                     .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
                         let k = &ev.keystroke;
                         // ponytail: typing and backspace only, no cursor movement or paste.
                         // Add when a shared text field lands (Settings needs one too).
                         match k.key.as_str() {
-                            "enter" | "escape" => window.blur(),
+                            "enter" | "escape" => window.blur(cx),
                             "backspace" => this.edit(cx, |app| {
                                 profile_mut(&mut app.draft.settings.profiles, i).exe.pop();
                             }),
@@ -292,7 +292,7 @@ impl Render for ProfilesView {
                             });
                             // Put the cursor in the new row's field.
                             let handle = cx.focus_handle();
-                            window.focus(&handle);
+                            window.focus(&handle, cx);
                             this.fields.push(handle);
                         }),
                     )))

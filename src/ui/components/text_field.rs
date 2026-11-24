@@ -38,7 +38,7 @@ pub fn text_field(
         .border_color(rgb(if focused { theme::RING } else { theme::INPUT }))
         .cursor_text()
         .text_color(rgb(if value.is_empty() { theme::MUTED_FG } else { theme::FG }))
-        .on_click(move |_, window, _| handle.focus(window))
+        .on_click(move |_, window, cx| handle.focus(window, cx))
         .on_key_down(move |ev, window, cx| {
             let k = &ev.keystroke;
             let mut text = current.clone();
