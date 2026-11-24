@@ -86,7 +86,7 @@ fn bgra_to_rgba(src: &[u8], row_pitch: usize, width: u32, height: u32) -> Vec<u8
     let row_bytes = width as usize * 4;
     let mut out = Vec::with_capacity(row_bytes * height as usize);
     for row in src.chunks(row_pitch).take(height as usize) {
-        for px in row[..row_bytes].chunks_exact(4) {
+        for px in row[..row_bytes].as_chunks::<4>().0 {
             out.extend_from_slice(&[px[2], px[1], px[0], 255]);
         }
     }
