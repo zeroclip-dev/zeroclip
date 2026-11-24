@@ -41,6 +41,8 @@ pub struct VideoPlayerView {
     name: String,
     ffmpeg: Option<Ffmpeg>,
     duration: Hns,
+    /// Moments marked while the clip was recorded, earliest first.
+    bookmarks: Vec<Hns>,
     /// The clip has sound to play.
     has_sound: bool,
     problem: Option<String>,
@@ -71,6 +73,7 @@ impl VideoPlayerView {
             name: String::new(),
             ffmpeg: None,
             duration: Hns::ZERO,
+            bookmarks: Vec::new(),
             has_sound: false,
             problem: None,
             loading: false,
@@ -98,6 +101,7 @@ impl VideoPlayerView {
         self.problem = None;
         self.loading = true;
         self.duration = Hns::ZERO;
+        self.bookmarks = zc_core::bookmarks::load(&path);
         self.boosted = false;
         self.hold = None;
         cx.notify();
@@ -181,6 +185,19 @@ impl VideoPlayerView {
             self.player.show_at(ffmpeg, path, t, t);
             self.ensure_ticking(cx);
             cx.notify();
+        }
+    }
+
+    /// Jumps to the next bookmark after the playhead, or the last one before it.
+    fn jump_to_bookmark(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let now = self.player.playhead;
+        let target = if forward {
+            self.bookmarks.iter().find(|b| **b > now + Hns::from_millis(500))
+        } else {
+            self.bookmarks.iter().rev().find(|b| **b + Hns::from_secs(1) < now)
+        };
+        if let Some(t) = target.copied() {
+            self.seek(t, cx);
         }
     }
 
@@ -328,10 +345,11 @@ impl Render for VideoPlayerView {
                     .object_fit(ObjectFit::Contain),
             ),
             (None, _) => picture.child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(theme::MUTED_FG))
-                    .child(if self.loading { "Opening the clip." } else { "Nothing to play." }),
+                div().text_sm().text_color(rgb(theme::MUTED_FG)).child(if self.loading {
+                    "Opening the clip."
+                } else {
+                    "Nothing to play."
+                }),
             ),
         };
         let picture = picture.children(self.boosted.then(|| {
@@ -354,7 +372,9 @@ impl Render for VideoPlayerView {
             .w_full()
             .h(px(14.))
             .cursor_pointer()
-            .child(canvas(move |b, _, _| bar_bounds.set(b), |_, (), _, _| {}).absolute().size_full())
+            .child(
+                canvas(move |b, _, _| bar_bounds.set(b), |_, (), _, _| {}).absolute().size_full(),
+            )
             .child(
                 div()
                     .absolute()
@@ -373,6 +393,18 @@ impl Render for VideoPlayerView {
                     .rounded_full()
                     .bg(rgb(theme::BRAND)),
             )
+            .children(self.bookmarks.iter().map(|b| {
+                let at = (b.as_secs_f64() / self.duration.as_secs_f64().max(0.001)).clamp(0.0, 1.0);
+                div()
+                    .absolute()
+                    .top(px(1.))
+                    .left(relative(at as f32))
+                    .ml(px(-1.))
+                    .w(px(3.))
+                    .h(px(12.))
+                    .rounded_full()
+                    .bg(rgb(theme::WARN))
+            }))
             .child(
                 div()
                     .absolute()
@@ -423,44 +455,57 @@ impl Render for VideoPlayerView {
             }))
         };
 
-        let controls = div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_center()
-            .gap_2()
-            .child(play)
-            .child(skip("player-back", "\u{2212}10 s", true))
-            .child(skip("player-fwd", "+10 s", false))
-            .child(div().text_sm().text_color(rgb(theme::MUTED_FG)).child(format!(
-                "{} / {}",
-                clock(at),
-                clock(self.duration)
-            )))
-            .child(div().flex_1())
-            .child(segmented(
-                "player-speed",
-                SPEEDS.iter().map(|s| speed_label(*s)).collect(),
-                SPEEDS.iter().position(|s| (*s - self.speed).abs() < 1e-9),
-                true,
-                cx.listener(|this, i: &usize, _, cx| {
-                    this.speed = SPEEDS.get(*i).copied().unwrap_or(1.0);
-                    this.restart(cx);
-                }),
-            ))
-            .child(segmented(
-                "player-volume",
-                VOLUMES.iter().map(|(l, _)| SharedString::from(*l)).collect(),
-                Some(self.volume),
-                true,
-                cx.listener(|this, i: &usize, _, cx| {
-                    this.volume = (*i).min(VOLUMES.len() - 1);
-                    this.restart(cx);
-                }),
-            ))
-            .child(button_ghost("player-fullscreen", "Fullscreen (F)").on_click(cx.listener(
-                |this, _, window, cx| this.set_fullscreen(!this.fullscreen, window, cx),
-            )));
+        let controls =
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .child(play)
+                .child(skip("player-back", "\u{2212}10 s", true))
+                .child(skip("player-fwd", "+10 s", false))
+                .children((!self.bookmarks.is_empty()).then(|| {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_1()
+                        .child(button_ghost("player-mark-prev", "\u{25c2} Bookmark").on_click(
+                            cx.listener(|this, _, _, cx| this.jump_to_bookmark(false, cx)),
+                        ))
+                        .child(button_ghost("player-mark-next", "Bookmark \u{25b8}").on_click(
+                            cx.listener(|this, _, _, cx| this.jump_to_bookmark(true, cx)),
+                        ))
+                }))
+                .child(div().text_sm().text_color(rgb(theme::MUTED_FG)).child(format!(
+                    "{} / {}",
+                    clock(at),
+                    clock(self.duration)
+                )))
+                .child(div().flex_1())
+                .child(segmented(
+                    "player-speed",
+                    SPEEDS.iter().map(|s| speed_label(*s)).collect(),
+                    SPEEDS.iter().position(|s| (*s - self.speed).abs() < 1e-9),
+                    true,
+                    cx.listener(|this, i: &usize, _, cx| {
+                        this.speed = SPEEDS.get(*i).copied().unwrap_or(1.0);
+                        this.restart(cx);
+                    }),
+                ))
+                .child(segmented(
+                    "player-volume",
+                    VOLUMES.iter().map(|(l, _)| SharedString::from(*l)).collect(),
+                    Some(self.volume),
+                    true,
+                    cx.listener(|this, i: &usize, _, cx| {
+                        this.volume = (*i).min(VOLUMES.len() - 1);
+                        this.restart(cx);
+                    }),
+                ))
+                .child(button_ghost("player-fullscreen", "Fullscreen (F)").on_click(cx.listener(
+                    |this, _, window, cx| this.set_fullscreen(!this.fullscreen, window, cx),
+                )));
 
         let header = (!self.fullscreen).then(|| {
             let path = self.path.clone();

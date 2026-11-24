@@ -439,6 +439,8 @@ struct ActiveRecording {
     path: PathBuf,
     /// The IO thread that drains the spool into the file.
     thread: JoinHandle<()>,
+    /// When it started, which is what a bookmark counts from.
+    started: Instant,
 }
 
 /// Why a DVR save produced no clip, as its IO thread reports it.
@@ -457,6 +459,7 @@ enum ClipError {
 enum HotkeyAction {
     SaveClip,
     ToggleRecording,
+    Bookmark,
     Screenshot,
     PushToTalk,
 }
@@ -474,6 +477,7 @@ fn bindings(settings: &Settings) -> Vec<Binding<HotkeyAction>> {
         press(&h.save_clip, HotkeyAction::SaveClip),
         press(&h.toggle_recording, HotkeyAction::ToggleRecording),
         press(&h.screenshot, HotkeyAction::Screenshot),
+        press(&h.bookmark, HotkeyAction::Bookmark),
     ];
     if settings.audio.mic == MicMode::PushToTalk
         && let Some(chord) = &h.push_to_talk
@@ -1453,6 +1457,7 @@ impl Actor {
             Command::FocusChoice(choice) => self.on_focus_choice(choice),
             Command::ToggleRecording => self.toggle_recording(),
             Command::Screenshot => self.take_screenshot(),
+            Command::Bookmark => self.bookmark(),
             Command::PushToTalk(down) => {
                 self.ptt_held = down;
                 if let Some(mic) = self.ports.mic.as_mut() {
@@ -1507,6 +1512,24 @@ impl Actor {
         match result {
             Ok(()) => self.emit(EngineEvent::ScreenshotSaved { path }),
             Err(e) => self.emit(EngineEvent::Error(format!("Screenshot failed: {e}"))),
+        }
+    }
+
+    /// Marks this moment of the running recording (a manual one or the game's session), for the
+    /// editor and the player to show. The time is the wall clock since the recording started, a
+    /// fraction of a second off the video's own clock.
+    fn bookmark(&mut self) {
+        let Some(recording) = self.recording.as_ref().filter(|r| r.id.is_some()) else {
+            self.emit(EngineEvent::Warning(
+                "Bookmarks need a recording: start one, or turn on session recording in the game's profile."
+                    .into(),
+            ));
+            return;
+        };
+        let at = Hns::from_millis(recording.started.elapsed().as_millis() as i64);
+        match zc_core::bookmarks::add(&recording.path, at) {
+            Ok(()) => self.emit(EngineEvent::BookmarkAdded { at }),
+            Err(e) => self.emit(EngineEvent::Error(format!("Couldn't save the bookmark: {e}"))),
         }
     }
 
@@ -1568,8 +1591,12 @@ impl Actor {
         // Attached only once the IO thread exists, so a failed spawn never leaves a writer
         // feeding a spool that nothing reads.
         let id = self.recorder.attach(Box::new(tee_writer));
-        self.recording =
-            Some(ActiveRecording { id: Some(id), path: path.clone(), thread: io_thread });
+        self.recording = Some(ActiveRecording {
+            id: Some(id),
+            path: path.clone(),
+            thread: io_thread,
+            started: Instant::now(),
+        });
         self.status.recording = true;
         self.publish_status();
         tracing::info!(path = %path.display(), "recording started");
@@ -1843,6 +1870,7 @@ impl Actor {
                     HotkeyEvent::Pressed(HotkeyAction::SaveClip) => Command::SaveClip,
                     HotkeyEvent::Pressed(HotkeyAction::ToggleRecording) => Command::ToggleRecording,
                     HotkeyEvent::Pressed(HotkeyAction::Screenshot) => Command::Screenshot,
+                    HotkeyEvent::Pressed(HotkeyAction::Bookmark) => Command::Bookmark,
                     HotkeyEvent::Pressed(HotkeyAction::PushToTalk) => Command::PushToTalk(true),
                     HotkeyEvent::Released(HotkeyAction::PushToTalk) => Command::PushToTalk(false),
                     HotkeyEvent::Released(_) => return,
@@ -3312,6 +3340,17 @@ mod tests {
         wait_for(
             &engine,
             |e| matches!(e, EngineEvent::Warning(m) if m == "Nothing to record yet."),
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_bookmark_without_a_recording_says_so() {
+        let (engine, _) = spawn(Ports::default());
+        engine.send(Command::Bookmark).unwrap();
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Warning(m) if m.starts_with("Bookmarks need")),
         );
         engine.shutdown();
     }

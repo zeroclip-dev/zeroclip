@@ -26,6 +26,8 @@ pub enum ToastKind {
     RecordingStopped { length: Hns },
     /// A screenshot was written.
     ScreenshotTaken,
+    /// A moment of the running recording was marked, `at` into it.
+    Bookmarked { at: Hns },
 }
 
 /// The two lines on a card. `detail` is optional.
@@ -51,6 +53,10 @@ pub fn toast_text(kind: ToastKind) -> ToastText {
             detail: Some(format!("{} recorded", human_duration(length))),
         },
         ToastKind::ScreenshotTaken => ToastText { title: "Screenshot saved".into(), detail: None },
+        ToastKind::Bookmarked { at } => ToastText {
+            title: "Bookmarked".into(),
+            detail: Some(format!("{} into the recording", human_duration(at))),
+        },
     }
 }
 
@@ -61,6 +67,7 @@ pub fn accent(kind: ToastKind) -> u32 {
         ToastKind::RecordingStarted => theme::DANGER,
         ToastKind::RecordingStopped { .. } => theme::MUTED_FG,
         ToastKind::ScreenshotTaken => theme::FG,
+        ToastKind::Bookmarked { .. } => theme::WARN,
     }
 }
 

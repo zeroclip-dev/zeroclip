@@ -436,6 +436,7 @@ impl ZeroClipApp {
             ui::overlay::ToastKind::RecordingStarted => Some(Chime::RecordingStarted),
             ui::overlay::ToastKind::RecordingStopped { .. } => Some(Chime::RecordingStopped),
             ui::overlay::ToastKind::ScreenshotTaken => Some(Chime::Screenshot),
+            ui::overlay::ToastKind::Bookmarked { .. } => None,
         };
         if let Some(chime) = chime {
             zc_win::chime::play(chime);
@@ -461,6 +462,13 @@ impl ZeroClipApp {
                     self.notify(
                         NoticeLevel::Info,
                         format!("Saved a {duration} clip: {}", path.display()),
+                    );
+                }
+                EngineEvent::BookmarkAdded { at } => {
+                    self.show_toast(ToastKind::Bookmarked { at }, cx);
+                    self.notify(
+                        NoticeLevel::Info,
+                        format!("Bookmarked {}", ui::human_duration(at)),
                     );
                 }
                 EngineEvent::ScreenshotSaved { path } => {

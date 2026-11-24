@@ -27,6 +27,7 @@
 //! left; see `CONTRIBUTING.md` for the workflow.
 
 pub mod backoff;
+pub mod bookmarks;
 pub mod control;
 pub mod dsp;
 pub mod dvr;
