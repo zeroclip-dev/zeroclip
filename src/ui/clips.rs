@@ -513,6 +513,14 @@ impl Render for ClipsView {
                     cx.notify();
                 },
             )))
+            .child(button("clips-change", "Change folder").on_click(cx.listener(
+                |this, _, _, cx| {
+                    let _ = this.app.update(cx, |app, cx| {
+                        app.choose_output_dir();
+                        cx.notify();
+                    });
+                },
+            )))
             .child(button("clips-open", "Open folder").on_click({
                 let dir = dir.clone();
                 cx.listener(move |this, _, _, cx| {

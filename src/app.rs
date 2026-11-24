@@ -342,6 +342,30 @@ impl ZeroClipApp {
         self.draft.settings.ui_mode = mode;
     }
 
+    /// Asks where clips should be saved and switches to it at once. Settings edits that are not
+    /// saved yet stay in the draft, as in [`Self::set_ui_mode`].
+    pub fn choose_output_dir(&mut self) {
+        let current = self.output_dir();
+        match zc_win::shell::pick_folder(Some(&current)) {
+            Ok(Some(dir)) if dir != current => {
+                let mut settings = self.settings.clone();
+                settings.recording.output_dir = Some(dir.clone());
+                let draft = self.draft.clone();
+                self.apply_settings(settings);
+                self.draft = draft;
+                self.draft.output_dir = dir.display().to_string();
+                self.notify(NoticeLevel::Info, format!("New clips go to {}", dir.display()));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                self.notify(
+                    NoticeLevel::Error,
+                    format!("Couldn't open the folder picker: {error}"),
+                );
+            }
+        }
+    }
+
     /// The window's close button (P4.15). With close-to-tray on and a tray icon to come back from,
     /// the window hides and the app keeps running. Otherwise the window closes and the app quits.
     /// Returns whether the window may close.
