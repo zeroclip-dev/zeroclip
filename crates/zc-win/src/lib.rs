@@ -17,6 +17,7 @@
 //! Every `unsafe` block must carry a `// SAFETY:` comment.
 
 pub mod autostart;
+pub mod chime;
 pub mod clock;
 pub mod com;
 pub mod drive;
