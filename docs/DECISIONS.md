@@ -312,3 +312,10 @@ The default `dvr.storage` is `ram`. Hybrid is not built. The RAM cap is 5% of to
 (`effective_ram_ceiling`, zc-core `profile.rs`), not a share of available memory. A crash leaves no
 readable ring: `DiskRing::create` truncates an existing ring file at start, and P4.11 rescue does not
 read it. Reading the ring after a crash is future work.
+### D38 · The editor may re-encode audio only; video stays stream-copy (D26 supersedes D3 for audio)
+Why: the owner decided per-track volume, muting and cutting part of an audio track are wanted in the
+editor (D26, P5.14). A volume change cannot be done by copying packets. D3 said FFmpeg is used only
+for stream-copy editing; that stays true for video.
+Consequence: export jobs use `-c:v copy`; only the audio tracks the user changed are re-encoded
+(AAC, bitrate matching the source track), untouched tracks stay stream-copied. FFmpeg is still a
+separate `ffmpeg.exe` process (D3), so its LGPL/GPL build never mixes with the app.
