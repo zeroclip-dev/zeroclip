@@ -607,6 +607,13 @@ impl Render for SettingsView {
             .child(row("Start/stop recording", f_rec))
             .child(row("Screenshot", f_shot))
             .child(row("Push-to-talk", f_ptt))
+            .child(labeled_toggle(
+                "toasts",
+                "Show a small card when a clip, recording or screenshot is saved",
+                d.settings.overlay_toasts,
+                true,
+                bind!(cx, |d, v: &bool| d.settings.overlay_toasts = *v),
+            ))
             .child(hint(
                 "Examples: Alt+F10, Ctrl+Shift+S, Mouse5. Hotkeys work while a game has focus.",
             ));

@@ -12,6 +12,7 @@
 //! - [`memory`]: page-locking the DVR buffer, so Windows can't page it out (DESIGN §4).
 //! - [`process`]: open windows and process trees, for per-app audio (DESIGN §6).
 //! - [`single_instance`]: a named mutex, so two copies can't share the DVR file.
+//! - [`overlay`]: click-through, capture-excluded toast windows.
 //!
 //! Every `unsafe` block must carry a `// SAFETY:` comment.
 
@@ -24,5 +25,6 @@ pub mod main_window;
 pub mod memory;
 pub mod message_thread;
 pub mod mf;
+pub mod overlay;
 pub mod process;
 pub mod single_instance;

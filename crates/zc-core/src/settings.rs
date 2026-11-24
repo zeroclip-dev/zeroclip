@@ -14,7 +14,7 @@ use crate::profile::ProfileSet;
 use crate::time::Hns;
 
 /// Everything the user can configure.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Where files go and in what container.
@@ -39,6 +39,33 @@ pub struct Settings {
     /// Simple mode ("clip the last N minutes") or the full settings.
     #[serde(default)]
     pub ui_mode: UiMode,
+    /// Small click-through cards for "clip saved", recording and screenshot events. They are
+    /// excluded from capture, so they never end up in a recording.
+    #[serde(default = "default_overlay_toasts")]
+    pub overlay_toasts: bool,
+}
+
+fn default_overlay_toasts() -> bool {
+    true
+}
+
+// Hand-written so `overlay_toasts` defaults to on, not to `bool::default()`.
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            recording: RecordingSettings::default(),
+            dvr: DvrSettings::default(),
+            video: VideoSettings::default(),
+            audio: AudioSettings::default(),
+            hotkeys: HotkeySettings::default(),
+            storage: StorageSettings::default(),
+            uploads: UploadSettings::default(),
+            profiles: ProfileSet::default(),
+            app: AppSettings::default(),
+            ui_mode: UiMode::default(),
+            overlay_toasts: default_overlay_toasts(),
+        }
+    }
 }
 
 /// How the app presents itself. Old settings files have no `ui_mode`, so they load as
@@ -489,6 +516,15 @@ mod tests {
         // A settings file from before the Master track has no levels: they read as zero.
         let older: Settings = toml::from_str("[audio]\nbitrate_kbps = 128\n").unwrap();
         assert_eq!(older.audio.mix_gain_db, MixGains::default());
+    }
+
+    #[test]
+    fn overlay_toasts_default_on_for_new_and_old_files() {
+        assert!(Settings::default().overlay_toasts);
+        let older: Settings = toml::from_str("[video]\nfps = 60\n").unwrap();
+        assert!(older.overlay_toasts);
+        let off: Settings = toml::from_str("overlay_toasts = false\n").unwrap();
+        assert!(!off.overlay_toasts);
     }
 
     #[test]
