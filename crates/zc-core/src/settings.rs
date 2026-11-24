@@ -33,6 +33,9 @@ pub struct Settings {
     pub uploads: UploadSettings,
     /// Per-game profiles.
     pub profiles: ProfileSet,
+    /// Tray and startup behaviour (P4.15, P4.16).
+    #[serde(default)]
+    pub app: AppSettings,
     /// Simple mode ("clip the last N minutes") or the full settings.
     #[serde(default)]
     pub ui_mode: UiMode,
@@ -113,6 +116,22 @@ impl Settings {
             }
         }
         problems
+    }
+}
+
+/// Tray and startup behaviour (P4.15, P4.16).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppSettings {
+    /// Closing the window hides it to the tray instead of quitting. The tray's Quit still quits.
+    pub close_to_tray: bool,
+    /// Start ZeroClip with Windows, hidden in the tray (the HKCU Run key).
+    pub start_with_windows: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self { close_to_tray: true, start_with_windows: false }
     }
 }
 
@@ -479,6 +498,7 @@ mod tests {
         assert_eq!(s.video.fps, 144);
         assert_eq!(s.video.max_bitrate_kbps, 20_000);
         assert_eq!(s.hotkeys, HotkeySettings::default());
+        assert!(s.app.close_to_tray);
     }
 
     #[test]
