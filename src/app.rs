@@ -399,6 +399,14 @@ impl ZeroClipApp {
         if !self.settings.overlay_toasts {
             return;
         }
+        zc_win::chime::play(match kind {
+            ui::overlay::ToastKind::ClipSaved { .. } => zc_win::chime::Chime::ClipSaved,
+            ui::overlay::ToastKind::RecordingStarted => zc_win::chime::Chime::RecordingStarted,
+            ui::overlay::ToastKind::RecordingStopped { .. } => {
+                zc_win::chime::Chime::RecordingStopped
+            }
+            ui::overlay::ToastKind::ScreenshotTaken => zc_win::chime::Chime::Screenshot,
+        });
         if let Some(old) = self.toast.take() {
             let _ = old.update(cx, |_, window, _| window.remove_window());
         }
