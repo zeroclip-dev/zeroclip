@@ -670,12 +670,51 @@ impl EditorView {
             )))
     }
 
-    /// One card per audio track: volume, mute, and a range to silence or remove.
+    /// One card for every audio track, a row each: volume and mute. A track's cut range
+    /// (silence or remove) stays folded until its "Cut a range" button is pressed, or it already has one.
     fn track_cards(&self, clip: &Clip, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        clip.edits
-            .iter()
-            .enumerate()
-            .map(|(i, edit)| {
+        if clip.edits.is_empty() {
+            return Vec::new();
+        }
+        let mut list = card("Audio tracks");
+        for (i, edit) in clip.edits.iter().enumerate() {
+            let has_cut = !edit.cut_start.trim().is_empty() || !edit.cut_end.trim().is_empty();
+            let open = edit.cut_open || has_cut;
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_3()
+                    .child(div().w(px(64.)).text_sm().child(format!("Track {}", i + 1)))
+                    .child(number_stepper(
+                        format!("gain-{i}"),
+                        edit.gain_db,
+                        Stepper { min: -30.0, max: 12.0, step: 1.0, suffix: " dB", enabled: !edit.mute },
+                        cx.listener(move |this, v: &f64, _, cx| {
+                            let v = *v;
+                            this.edit_track(i, cx, |e| e.gain_db = v);
+                        }),
+                    ))
+                    .child(labeled_toggle(
+                        ("mute", i),
+                        "Mute",
+                        edit.mute,
+                        true,
+                        cx.listener(move |this, on: &bool, _, cx| {
+                            let on = *on;
+                            this.edit_track(i, cx, |e| e.mute = on);
+                        }),
+                    ))
+                    .child(div().ml_auto().child(
+                        button_ghost(("cut-open", i), if open { "Hide cut" } else { "Cut a range" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.edit_track(i, cx, |e| e.cut_open = !e.cut_open);
+                            })),
+                    )),
+            );
+            if open {
                 let cut_field = |slot: usize, id: &'static str, value: &str, ph: &str, cx: &mut Context<Self>| {
                     text_field(
                         (id, i),
@@ -694,57 +733,34 @@ impl EditorView {
                 };
                 let start = cut_field(0, "cut-start", &edit.cut_start, "Start, s", cx);
                 let end = cut_field(1, "cut-end", &edit.cut_end, "End, s", cx);
-                card(format!("Track {}", i + 1))
-                    .child(field_row(
-                        "Volume",
-                        number_stepper(
-                            format!("gain-{i}"),
-                            edit.gain_db,
-                            Stepper { min: -30.0, max: 12.0, step: 1.0, suffix: " dB", enabled: !edit.mute },
-                            cx.listener(move |this, v: &f64, _, cx| {
-                                let v = *v;
-                                this.edit_track(i, cx, |e| e.gain_db = v);
+                list = list.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .pl(px(64.))
+                        .child(start)
+                        .child(end)
+                        .child(segmented(
+                            format!("cut-mode-{i}"),
+                            vec!["Silence".into(), "Remove".into()],
+                            Some(usize::from(edit.cut_mode == CutMode::Remove)),
+                            true,
+                            cx.listener(move |this, ix: &usize, _, cx| {
+                                let mode = if *ix == 0 { CutMode::Silence } else { CutMode::Remove };
+                                this.edit_track(i, cx, |e| e.cut_mode = mode);
                             }),
-                        ),
-                    ))
-                    .child(labeled_toggle(
-                        ("mute", i),
-                        "Mute this track",
-                        edit.mute,
-                        true,
-                        cx.listener(move |this, on: &bool, _, cx| {
-                            let on = *on;
-                            this.edit_track(i, cx, |e| e.mute = on);
-                        }),
-                    ))
-                    .child(field_row(
-                        "Cut a range",
-                        div()
-                            .flex()
-                            .flex_row()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_2()
-                            .child(start)
-                            .child(end)
-                            .child(segmented(
-                                format!("cut-mode-{i}"),
-                                vec!["Silence".into(), "Remove".into()],
-                                Some(usize::from(edit.cut_mode == CutMode::Remove)),
-                                true,
-                                cx.listener(move |this, ix: &usize, _, cx| {
-                                    let mode =
-                                        if *ix == 0 { CutMode::Silence } else { CutMode::Remove };
-                                    this.edit_track(i, cx, |e| e.cut_mode = mode);
-                                }),
-                            )),
-                    ))
-                    .child(muted(
-                        "Times are in seconds of the original clip. Silence keeps the length; remove shortens this track only.",
-                    ))
-                    .into_any_element()
-            })
-            .collect()
+                        )),
+                );
+            }
+        }
+        vec![list
+            .child(muted(
+                "Cut times are seconds of the original clip. Silence keeps the length; remove shortens only that track.",
+            ))
+            .into_any_element()]
     }
 
     fn export_card(&self, clip: &Clip, cx: &mut Context<Self>) -> gpui::Div {

@@ -103,6 +103,8 @@ pub struct TrackEdit {
     pub cut_start: String,
     pub cut_end: String,
     pub cut_mode: CutMode,
+    /// Whether the cut-range row is showing. Only a display choice; it doesn't change the edit.
+    pub cut_open: bool,
 }
 
 impl Default for TrackEdit {
@@ -113,6 +115,7 @@ impl Default for TrackEdit {
             cut_start: String::new(),
             cut_end: String::new(),
             cut_mode: CutMode::Silence,
+            cut_open: false,
         }
     }
 }
