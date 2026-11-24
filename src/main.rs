@@ -16,9 +16,7 @@ mod settings_store;
 mod ui;
 mod wiring;
 
-use gpui::{
-    AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size,
-};
+use gpui::{AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
 fn main() -> anyhow::Result<()> {
     let paths = paths::AppPaths::resolve()?;
