@@ -122,6 +122,10 @@ pub struct EditorView {
     lanes: Rc<RefCell<Vec<Bounds<Pixels>>>>,
     /// The volume point being dragged: piece, track, point.
     drag: Option<(usize, usize, usize)>,
+    /// A stretch of one track picked with the mouse (track, piece, from, to, in piece time) and
+    /// whether it is still being dragged out. Delete silences it.
+    range: Option<(usize, usize, Hns, Hns)>,
+    ranging: bool,
     /// Earlier and undone states of the pieces.
     undo: Vec<Vec<Piece>>,
     redo: Vec<Vec<Piece>>,
@@ -146,6 +150,8 @@ impl EditorView {
             scrubbing: false,
             lanes: Rc::default(),
             drag: None,
+            range: None,
+            ranging: false,
             undo: Vec::new(),
             redo: Vec::new(),
             player: Player::default(),
@@ -456,6 +462,23 @@ impl EditorView {
     fn release(&mut self) {
         self.scrubbing = false;
         self.drag = None;
+        self.ranging = false;
+        // A click, not a drag: no range.
+        if self.range.is_some_and(|(_, _, a, b)| b.max(a) - b.min(a) < Hns::from_millis(100)) {
+            self.range = None;
+        }
+    }
+
+    /// Silences the picked stretch of its track.
+    fn silence_range(&mut self, cx: &mut Context<Self>) {
+        let Some((t, i, a, b)) = self.range.take() else { return };
+        let Some(piece) = self.timeline.pieces.get(i) else { return };
+        let span = piece.span();
+        self.checkpoint();
+        self.timeline.pieces[i].tracks[t].silence(a.min(b), a.max(b), span);
+        // Playback restarts at the playhead so the new edit is heard.
+        let at = self.player.playhead;
+        self.seek(at, cx);
     }
 
     /// Where, in piece `i`, timeline x `x` falls, as time from the piece's start.
@@ -511,7 +534,9 @@ impl EditorView {
             self.drag = Some((i, t, k));
             cx.notify();
         } else {
-            self.scrubbing = true;
+            // Drag across the lane to pick a stretch; a plain click just moves the playhead.
+            self.range = Some((t, i, at, at));
+            self.ranging = true;
             self.seek(here, cx);
         }
     }
@@ -549,6 +574,7 @@ impl EditorView {
         to.push(std::mem::replace(&mut self.timeline.pieces, state));
         self.problem = None;
         self.drag = None;
+        self.range = None;
         let at = self.player.playhead.min(self.timeline.total());
         self.selected = self.timeline.locate(at).map(|l| l.0);
         self.seek(at, cx);
@@ -815,6 +841,7 @@ impl EditorView {
         match k.key.as_str() {
             "space" if plain => self.toggle_play(cx),
             "s" if plain => self.split(cx),
+            "delete" | "backspace" if plain && self.range.is_some() => self.silence_range(cx),
             "delete" | "backspace" if plain => self.delete_selected(cx),
             "j" if plain => self.join_selected(cx),
             "z" if k.modifiers.control && !k.modifiers.alt => {
@@ -1120,7 +1147,7 @@ impl EditorView {
                     .on_click(cx.listener(|this, _, _, cx| this.delete_selected(cx))),
             );
         div().flex().flex_col().gap_2().child(video).child(controls).child(muted(
-            "Space plays, S splits at the playhead, J joins, Delete removes the selected piece, Ctrl+Z undoes. On a lane, click the line to add a volume point, drag it to change the level (to the bottom mutes), Shift-click removes it. Cuts land on keyframes, so no video is re-encoded.",
+            "Space plays, S splits at the playhead, J joins, Delete removes the selected piece, Ctrl+Z undoes. Drag across a lane to pick a stretch of that track and press Delete to silence it. Click the line to add a volume point, drag it to change the level (to the bottom mutes), Shift-click removes it. Cuts land on keyframes, so no video is re-encoded.",
         ))
     }
 
@@ -1340,6 +1367,21 @@ impl EditorView {
                 }
                 lane = lane.child(block);
             }
+            if let Some((_, i, a, b)) = self.range.filter(|r| r.0 == t && r.2 != r.3)
+                && i < self.timeline.pieces.len()
+            {
+                let start = self.timeline.start_of(i);
+                let (x0, x1) = (x_of(start + a.min(b)), x_of(start + a.max(b)));
+                lane = lane.child(
+                    div()
+                        .absolute()
+                        .left(px(x0))
+                        .w(px((x1 - x0).max(1.0)))
+                        .h_full()
+                        .bg(rgb(theme::BRAND))
+                        .opacity(0.3),
+                );
+            }
             lanes.push(
                 div()
                     .flex()
@@ -1401,6 +1443,14 @@ impl EditorView {
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
                 if this.drag.is_some() && ev.dragging() {
                     this.drag_point(ev);
+                    cx.notify();
+                } else if this.ranging && ev.dragging() {
+                    if let Some(i) = this.range.map(|r| r.1) {
+                        let at = this.piece_time(i, ev.position.x);
+                        if let Some(r) = this.range.as_mut() {
+                            r.3 = at;
+                        }
+                    }
                     cx.notify();
                 } else if this.scrubbing && ev.dragging() {
                     let t = this.time_at(ev.position.x);
