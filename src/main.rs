@@ -22,7 +22,7 @@ use gpui::{
 
 fn main() -> anyhow::Result<()> {
     let paths = paths::AppPaths::resolve()?;
-    let _log_guard = logging::init(&paths.logs_dir)?;
+    let (_log_guard, recorder) = logging::init(&paths.logs_dir)?;
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "ZeroClip starting");
 
     let settings = settings_store::load(&paths.settings_file);
@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
                 ..Default::default()
             },
             |_, cx| {
-                cx.new(|cx| match app::ZeroClipApp::new(paths, settings, cx) {
+                cx.new(|cx| match app::ZeroClipApp::new(paths, settings, recorder, cx) {
                     Ok(app) => app,
                     Err(error) => {
                         tracing::error!(%error, "couldn't start ZeroClip");
