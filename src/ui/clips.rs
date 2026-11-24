@@ -466,9 +466,8 @@ impl ClipsView {
     pub fn begin_rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let text = path.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
         self.renaming = Some(Renaming { path, text, error: None });
-        if let Some(focus) = &self.rename_focus {
-            focus.focus(window, cx);
-        }
+        // Created here too: Rename from Home runs before Clips has ever rendered.
+        self.rename_focus.get_or_insert_with(|| cx.focus_handle()).focus(window, cx);
         cx.notify();
     }
 }
