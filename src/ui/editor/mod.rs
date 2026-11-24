@@ -21,7 +21,7 @@ use std::time::Duration;
 use gpui::{
     AnyElement, Bounds, Context, ExternalPaths, FocusHandle, FontWeight, ImageSource,
     InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ObjectFit, ParentElement, Pixels, Render, SharedString,
+    MouseMoveEvent, ObjectFit, ParentElement, Pixels, Render, RenderImage, SharedString,
     StatefulInteractiveElement as _, Styled, StyledImage as _, WeakEntity, Window, canvas, div,
     img, px, rgb,
 };
@@ -52,6 +52,9 @@ const FALLBACK_WIDTH: f32 = 720.0;
 const HEAD_HEIGHT: f32 = 24.0;
 const VIDEO_LANE_HEIGHT: f32 = 44.0;
 const LANE_HEIGHT: f32 = 40.0;
+/// Size of one thumbnail in the video lane (16:9 at the lane's inner height).
+const THUMB_H: f32 = 40.0;
+const THUMB_W: f32 = 72.0;
 /// One waveform bar is at least this far from the previous one.
 const BAR_STEP: f32 = 3.0;
 /// The picture's height is this share of the window's, within these limits.
@@ -73,6 +76,8 @@ struct Source {
     info: ProbeInfo,
     /// One per audio track; `None` until computed, or if the track has no usable audio.
     waves: Vec<Option<Vec<f32>>>,
+    /// Small pictures along the clip (source time, picture), in time order, for the video lane.
+    thumbs: Vec<(Hns, Arc<RenderImage>)>,
 }
 
 enum Export {
@@ -122,6 +127,9 @@ pub struct EditorView {
     /// Every audio track is shown and editable; otherwise only Master.
     tracks_open: bool,
     focus: Option<FocusHandle>,
+    /// The picture is showing over the whole window, with a bar to seek by.
+    fullscreen: bool,
+    full_bar: Rc<Cell<Bounds<Pixels>>>,
     /// Each audio lane's bounds from the last paint, to turn a mouse position into a level.
     lanes: Rc<RefCell<Vec<Bounds<Pixels>>>>,
     /// The volume point being dragged: piece, track, point.
@@ -143,6 +151,9 @@ struct TrimDrag {
     x0: f32,
     per_px: f64,
     orig: Piece,
+    /// Where every piece started, and the timeline's length, when the edge was grabbed.
+    starts: Vec<Hns>,
+    total: Hns,
 }
 
 impl EditorView {
@@ -180,7 +191,18 @@ impl EditorView {
             listen: 0,
             tracks_open: false,
             focus: None,
+            fullscreen: false,
+            full_bar: Rc::new(Cell::new(Bounds::default())),
         }
+    }
+
+    /// Shows the picture over the whole window (and the window itself fullscreen) or puts it back.
+    fn set_fullscreen(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.fullscreen = on;
+        if window.is_fullscreen() != on {
+            window.toggle_fullscreen();
+        }
+        cx.notify();
     }
 
     /// Starts a new project with `path` on the timeline.
@@ -284,7 +306,9 @@ impl EditorView {
                 }
                 let own = usize::from(info.stream.audio_tracks);
                 let tracks = self.timeline.pieces.first().map_or(own, |p| p.tracks.len().min(own));
-                if tracks < own || self.timeline.pieces.first().is_some_and(|p| p.tracks.len() > tracks) {
+                if tracks < own
+                    || self.timeline.pieces.first().is_some_and(|p| p.tracks.len() > tracks)
+                {
                     self.problem = Some(format!(
                         "The clips have different numbers of audio tracks, so the joined video keeps                          the first {tracks} of each."
                     ));
@@ -302,10 +326,17 @@ impl EditorView {
                     b: info.duration,
                     tracks: vec![TrackEdit::default(); tracks],
                 });
-                self.sources.push(Source { path, name, info, waves: vec![None; own] });
+                self.sources.push(Source {
+                    path,
+                    name,
+                    info,
+                    waves: vec![None; own],
+                    thumbs: Vec::new(),
+                });
                 for track in 0..own {
                     self.spawn_waveform(generation, &ffmpeg, index, track, cx);
                 }
+                self.spawn_thumbs(generation, &ffmpeg, index, cx);
                 let first = self.ffmpeg.is_none();
                 self.ffmpeg = Some(ffmpeg);
                 if first {
@@ -350,6 +381,49 @@ impl EditorView {
                     cx.notify();
                 }
             });
+        })
+        .detach();
+    }
+
+    /// Makes the video lane's thumbnails, one ffmpeg still at a time on a background thread, so
+    /// they appear one by one and never hold up the editor.
+    fn spawn_thumbs(
+        &mut self,
+        generation: u64,
+        ffmpeg: &Ffmpeg,
+        source: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(s) = self.sources.get(source) else { return };
+        let (path, duration) = (s.path.clone(), s.info.duration);
+        let count = ((duration.as_secs_f64() / 2.0) as usize).clamp(8, 40);
+        let ffmpeg = ffmpeg.clone();
+        cx.spawn(async move |this, cx| {
+            for k in 0..count {
+                // Mid-slot, so the first and last pictures sit inside the clip.
+                let at =
+                    Hns::from_secs_f64(duration.as_secs_f64() * (k as f64 + 0.5) / count as f64);
+                let (ffmpeg, path) = (ffmpeg.clone(), path.clone());
+                let image = cx
+                    .background_executor()
+                    .spawn(async move {
+                        player::still(&ffmpeg, &path, at, THUMB_W as u32, THUMB_H as u32)
+                    })
+                    .await;
+                let alive = this.update(cx, |this, cx| {
+                    if generation != this.generation {
+                        return false;
+                    }
+                    if let (Some(image), Some(s)) = (image, this.sources.get_mut(source)) {
+                        s.thumbs.push((at, image));
+                        cx.notify();
+                    }
+                    true
+                });
+                if !alive.unwrap_or(false) {
+                    break;
+                }
+            }
         })
         .detach();
     }
@@ -886,10 +960,12 @@ impl EditorView {
         });
     }
 
-    fn key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
         let plain = !(k.modifiers.control || k.modifiers.alt || k.modifiers.platform);
         match k.key.as_str() {
+            "f" if plain => self.set_fullscreen(!self.fullscreen, window, cx),
+            "escape" if self.fullscreen => self.set_fullscreen(false, window, cx),
             "space" if plain => self.toggle_play(cx),
             "s" if plain => self.split(cx),
             "delete" | "backspace" if plain && self.range.is_some() => self.silence_range(cx),
@@ -946,6 +1022,28 @@ fn waveform(
 
 /// What track `i` of `source` is called: the name the recorder wrote into the file (Master, Game,
 /// Mic, then each app's label), else a generic one.
+/// The thumbnails that tile a piece `width` px wide: one `THUMB_W` slot at a time, each taking the
+/// picture nearest the middle of its slot. Returns each slot's x within the piece.
+fn thumb_tiles(
+    thumbs: &[(Hns, Arc<RenderImage>)],
+    a: Hns,
+    span: Hns,
+    width: f32,
+) -> Vec<(f32, Arc<RenderImage>)> {
+    if thumbs.is_empty() || width < 1.0 {
+        return Vec::new();
+    }
+    (0..(width / THUMB_W).ceil() as usize)
+        .filter_map(|k| {
+            let x = k as f32 * THUMB_W;
+            let mid = ((x + THUMB_W / 2.0).min(width) / width).clamp(0.0, 1.0);
+            let t = a.ticks() + (span.ticks() as f64 * f64::from(mid)) as i64;
+            let (_, image) = thumbs.iter().min_by_key(|(at, _)| (at.ticks() - t).abs())?;
+            Some((x, image.clone()))
+        })
+        .collect()
+}
+
 fn track_label(source: &Source, i: usize) -> String {
     match source.info.audio_names.get(i) {
         Some(name) if !name.is_empty() => name.clone(),
@@ -1018,7 +1116,9 @@ impl Render for EditorView {
                     }
                 }),
             )
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| this.key(ev, cx)))
+            .on_key_down(
+                cx.listener(|this, ev: &KeyDownEvent, window, cx| this.key(ev, window, cx)),
+            )
             .child(self.header(cx));
         if let Some(problem) = &self.problem {
             page =
@@ -1054,7 +1154,9 @@ impl Render for EditorView {
                 if wide { top.flex_row().child(side.w(px(SIDE_WIDTH))) } else { top.child(side) };
             page = page.child(top).child(self.timeline_view(cx));
         }
-        page
+        div().relative().size_full().child(page).children(
+            (self.fullscreen && !self.timeline.pieces.is_empty()).then(|| self.full_view(cx)),
+        )
     }
 }
 
@@ -1254,46 +1356,161 @@ impl EditorView {
             .hover(|s| s.opacity(0.9))
             .child(icon(if self.player.playing { "pause" } else { "play" }, theme::PRIMARY_FG))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_play(cx)));
-        let controls = div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_center()
-            .gap_2()
-            .child(play)
-            .child(div().text_sm().text_color(rgb(theme::MUTED_FG)).child(format!(
-                "{} / {}",
-                clock(self.player.playhead),
-                clock(total)
-            )))
-            .child(div().flex_1())
-            .child(
-                button("editor-split", "Split")
-                    .child(icon("scissors", theme::FG))
-                    .on_click(cx.listener(|this, _, _, cx| this.split(cx))),
-            )
-            .child(
-                button_ghost("editor-delete", "Delete piece")
-                    .child(icon("trash-2", theme::MUTED_FG))
-                    .on_click(cx.listener(|this, _, _, cx| this.delete_selected(cx))),
-            );
+        let controls =
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .child(play)
+                .child(div().text_sm().text_color(rgb(theme::MUTED_FG)).child(format!(
+                    "{} / {}",
+                    clock(self.player.playhead),
+                    clock(total)
+                )))
+                .child(div().flex_1())
+                .child(button_ghost("editor-fullscreen", "Fullscreen (F)").on_click(
+                    cx.listener(|this, _, window, cx| this.set_fullscreen(true, window, cx)),
+                ))
+                .child(
+                    button("editor-split", "Split")
+                        .child(icon("scissors", theme::FG))
+                        .on_click(cx.listener(|this, _, _, cx| this.split(cx))),
+                )
+                .child(
+                    button_ghost("editor-delete", "Delete piece")
+                        .child(icon("trash-2", theme::MUTED_FG))
+                        .on_click(cx.listener(|this, _, _, cx| this.delete_selected(cx))),
+                );
         div().flex().flex_col().gap_2().child(video).child(controls).child(muted(
             "Space plays, S splits, J joins, Delete removes, Ctrl+Z undoes. On a lane, drag to pick a stretch and press Delete to silence it; click the line to add a volume point.",
         ))
     }
 
+    /// The picture over the whole editor: play, the time, and a bar of the pieces to seek by, so
+    /// an edit can be watched at full size. Esc or F goes back.
+    fn full_view(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let total = self.timeline.total();
+        let bar = self.full_bar.clone();
+        let width = f32::from(bar.get().size.width).max(1.0);
+        let mut strip = div()
+            .id("editor-full-bar")
+            .relative()
+            .w_full()
+            .h(px(18.))
+            .rounded(px(theme::RADIUS_SM))
+            .overflow_hidden()
+            .cursor_pointer()
+            .child(canvas(move |b, _, _| bar.set(b), |_, (), _, _| {}).absolute().size_full())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                    let bounds = this.full_bar.get();
+                    let x = f32::from(ev.position.x - bounds.origin.x);
+                    let t =
+                        model::x_to_time(x, this.timeline.total(), f32::from(bounds.size.width));
+                    this.seek(t, cx);
+                }),
+            );
+        for (i, piece) in self.timeline.pieces.iter().enumerate() {
+            let x0 = model::time_to_x(self.timeline.start_of(i), total, width);
+            let x1 = model::time_to_x(self.timeline.start_of(i) + piece.span(), total, width);
+            strip =
+                strip.child(
+                    div().absolute().left(px(x0)).w(px((x1 - x0 - 1.0).max(1.0))).h_full().bg(rgb(
+                        if self.selected == Some(i) { theme::BRAND } else { TINTS[i % 2] },
+                    )),
+                );
+        }
+        strip = strip.child(
+            div()
+                .absolute()
+                .left(px(model::time_to_x(self.player.playhead, total, width) - 1.0))
+                .w(px(2.))
+                .h_full()
+                .bg(rgb(theme::FG)),
+        );
+        let picture = match &self.player.shown {
+            Some(frame) => div().flex_1().min_h_0().child(
+                img(ImageSource::Render(frame.clone()))
+                    .w_full()
+                    .h_full()
+                    .object_fit(ObjectFit::Contain),
+            ),
+            None => div().flex_1().child(muted("Loading the picture.")),
+        };
+        let play = div()
+            .id("editor-full-play")
+            .w(px(40.))
+            .h(px(32.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(theme::RADIUS_MD))
+            .bg(rgb(theme::PRIMARY))
+            .cursor_pointer()
+            .child(icon(if self.player.playing { "pause" } else { "play" }, theme::PRIMARY_FG))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_play(cx)));
+        let bar_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .child(play)
+            .child(div().text_sm().text_color(rgb(theme::MUTED_FG)).child(format!(
+                "{} / {}   Piece {}",
+                clock(self.player.playhead),
+                clock(total),
+                self.selected.map_or(String::new(), model::piece_label)
+            )))
+            .child(div().flex_1())
+            .child(button("editor-full-exit", "Exit fullscreen").on_click(
+                cx.listener(|this, _, window, cx| this.set_fullscreen(false, window, cx)),
+            ));
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .bg(rgb(0x000000))
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(picture)
+            .child(strip)
+            .child(bar_row)
+    }
+
     /// The pieces on a ruler with an extract button above each, then one lane per audio track.
     fn timeline_view(&self, cx: &mut Context<Self>) -> gpui::Div {
         let width = if self.drawn_width > 0.0 { self.drawn_width } else { FALLBACK_WIDTH };
-        let total = self.timeline.total();
+        // While an edge is dragged the scale and the other pieces stay put, so the edge follows the
+        // mouse and what was cut off shows as a gray area; the pieces close up on release.
+        let total = self.trim.as_ref().map_or_else(|| self.timeline.total(), |t| t.total);
         let x_of = |t: Hns| model::time_to_x(t, total, width);
+        let place = |i: usize| -> (f32, f32) {
+            let span = self.timeline.pieces[i].span();
+            let start = match &self.trim {
+                Some(t) if i < t.starts.len() => {
+                    let moved = if t.left && i == t.index {
+                        self.timeline.pieces[i].a - t.orig.a
+                    } else {
+                        Hns::ZERO
+                    };
+                    t.starts[i] + moved
+                }
+                _ => self.timeline.start_of(i),
+            };
+            (x_of(start), x_of(start + span))
+        };
         let tracks = self.timeline.pieces.first().map_or(0, |p| p.tracks.len());
 
         // Above the ruler: each piece's letter, its length and the extract button.
         let mut head = div().relative().w_full().h(px(HEAD_HEIGHT));
         for (i, piece) in self.timeline.pieces.iter().enumerate() {
-            let (x0, x1) =
-                (x_of(self.timeline.start_of(i)), x_of(self.timeline.start_of(i) + piece.span()));
+            let (x0, x1) = place(i);
             let w = (x1 - x0).max(1.0);
             let label = if w >= 150.0 {
                 format!("{}  {}", model::piece_label(i), model::secs_label(piece.span()))
@@ -1349,8 +1566,7 @@ impl EditorView {
             .overflow_hidden()
             .child(canvas(move |b, _, _| bounds.set(b), |_, (), _, _| {}).absolute().size_full());
         for (i, piece) in self.timeline.pieces.iter().enumerate() {
-            let x0 = x_of(self.timeline.start_of(i));
-            let x1 = x_of(self.timeline.start_of(i) + piece.span());
+            let (x0, x1) = place(i);
             let selected = self.selected == Some(i);
             // Handles on the selected piece's two edges: drag to trim it.
             let handles: Vec<gpui::Stateful<gpui::Div>> = if selected {
@@ -1358,6 +1574,10 @@ impl EditorView {
                     .into_iter()
                     .map(|left| {
                         let piece = piece.clone();
+                        let starts: Vec<Hns> = (0..self.timeline.pieces.len())
+                            .map(|k| self.timeline.start_of(k))
+                            .collect();
+                        let total_now = self.timeline.total();
                         let per_px = f64::from(self.timeline.total().ticks() as f32)
                             / f64::from(f32::from(self.strip.get().size.width).max(1.0));
                         let side = div().id(("trim", i * 2 + usize::from(left))).absolute().top_0();
@@ -1380,6 +1600,8 @@ impl EditorView {
                                         x0: f32::from(ev.position.x),
                                         per_px,
                                         orig: piece.clone(),
+                                        starts: starts.clone(),
+                                        total: total_now,
                                     });
                                     cx.stop_propagation();
                                 }),
@@ -1389,12 +1611,30 @@ impl EditorView {
             } else {
                 Vec::new()
             };
+            // The part of the piece being cut off stays as a gray area until the mouse is let go.
+            if let Some(t) = self.trim.as_ref().filter(|t| t.index == i && i < t.starts.len()) {
+                let was = t.starts[i];
+                let (g0, g1) =
+                    if t.left { (x_of(was), x0) } else { (x1, x_of(was + t.orig.span())) };
+                video_lane = video_lane.child(
+                    div()
+                        .absolute()
+                        .left(px(g0.min(g1)))
+                        .w(px((g1 - g0).abs()))
+                        .h_full()
+                        .bg(rgb(theme::MUTED))
+                        .opacity(0.8),
+                );
+            }
+            let tiles =
+                thumb_tiles(&self.sources[piece.source].thumbs, piece.a, piece.span(), x1 - x0);
             video_lane = video_lane.child(
                 div()
                     .absolute()
                     .left(px(x0))
                     .w(px((x1 - x0 - 1.0).max(1.0)))
                     .h_full()
+                    .overflow_hidden()
                     .bg(rgb(TINTS[i % 2]))
                     .border_2()
                     .border_color(rgb(if selected { theme::BRAND } else { TINTS[i % 2] }))
@@ -1403,6 +1643,16 @@ impl EditorView {
                     .items_center()
                     .text_sm()
                     .text_color(rgb(theme::FG))
+                    .children(tiles.into_iter().map(|(x, image)| {
+                        img(ImageSource::Render(image))
+                            .absolute()
+                            .left(px(x))
+                            .top_0()
+                            .w(px(THUMB_W))
+                            .h_full()
+                            .object_fit(ObjectFit::Cover)
+                            .opacity(0.6)
+                    }))
                     .child(model::piece_label(i))
                     .children(handles),
             );
@@ -1441,8 +1691,7 @@ impl EditorView {
                     }),
                 );
             for (i, piece) in self.timeline.pieces.iter().enumerate() {
-                let x0 = x_of(self.timeline.start_of(i));
-                let x1 = x_of(self.timeline.start_of(i) + piece.span());
+                let (x0, x1) = place(i);
                 let w = (x1 - x0 - 1.0).max(1.0);
                 let edit = &piece.tracks[t];
                 let source = &self.sources[piece.source];
