@@ -1,6 +1,7 @@
 //! The Editor tab (Phase 5): open a clip, trim it on keyframes, edit its audio tracks, and save
 //! the result as a copy. Video is always stream-copied; only edited audio tracks are re-encoded
-//! (D38). Playback is external (D22): "Preview" opens ffplay or the default player.
+//! (D38). The picture and play controls come from the in-app player (`player.rs`); "Preview"
+//! still opens ffplay or the default player (D22).
 //!
 //! Every ffmpeg call runs on a background thread. The view polls nothing: the task that started
 //! the job updates the view when the job returns.
@@ -8,6 +9,7 @@
 //! ponytail: no thumbnail strip yet (P5.13); the timeline shows a tick per keyframe.
 
 mod model;
+mod player;
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -16,10 +18,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, Bounds, Context, FocusHandle, FontWeight, InteractiveElement as _, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Render, SharedString,
-    StatefulInteractiveElement as _, Styled, StyledImage as _, WeakEntity, Window, canvas, div,
-    img, px, rgb,
+    AnyElement, Bounds, Context, FocusHandle, FontWeight, ImageSource, InteractiveElement as _,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels,
+    Render, SharedString, StatefulInteractiveElement as _, Styled, StyledImage as _, WeakEntity,
+    Window, canvas, div, img, px, rgb,
 };
 use zc_core::Hns;
 use zc_editor::ffmpeg::{Ffmpeg, FfmpegError, ProbeInfo};
@@ -27,6 +29,7 @@ use zc_editor::waveform::{file_key, rms_peaks};
 use zc_store::Store;
 
 use self::model::{CutMode, Handle, Plan, TrackEdit};
+use self::player::Player;
 use super::components::{
     button::{button, button_ghost, button_primary},
     card::card,
@@ -36,6 +39,7 @@ use super::components::{
     segmented::segmented,
     text_field::text_field,
 };
+use super::icons::icon;
 use super::{human_duration, theme};
 use crate::app::{NoticeLevel, ZeroClipApp};
 
@@ -49,8 +53,12 @@ const LANE_HEIGHT: f32 = 40.0;
 /// One waveform bar and one keyframe tick are at least this far from the previous one.
 const BAR_STEP: f32 = 3.0;
 const TICK_GAP: f32 = 3.0;
-const FRAME_HEIGHT: f32 = 300.0;
-static FRAME_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const VIDEO_HEIGHT: f32 = 360.0;
+/// A press this close (in px) to a trim handle grabs it; anywhere else on the bar moves the
+/// playhead.
+const GRAB: f32 = 10.0;
+/// How often the picture is refreshed while playing.
+const TICK: Duration = Duration::from_millis(16);
 
 enum Load {
     Loading,
@@ -76,11 +84,6 @@ struct Clip {
     edits: Vec<TrackEdit>,
     /// One per audio track; `None` until computed, or if the track has no usable audio.
     waves: Vec<Option<Vec<f32>>>,
-    /// The video frame shown above the timeline, and the time it was taken at.
-    frame: Option<PathBuf>,
-    /// Where the preview should be. A new frame is made when this differs from what is shown.
-    frame_want: Hns,
-    frame_busy: bool,
 }
 
 pub struct EditorView {
@@ -96,6 +99,11 @@ pub struct EditorView {
     /// The ruler's bounds from the last paint, to turn mouse positions into times.
     ruler: Rc<Cell<Bounds<Pixels>>>,
     drag: Option<Handle>,
+    /// A drag that started away from the handles, moving the playhead.
+    scrubbing: bool,
+    player: Player,
+    /// Whether a task is already ticking the player.
+    ticking: bool,
     picking: bool,
     export: Export,
     /// Cut fields, two per track; made on render.
@@ -114,6 +122,9 @@ impl EditorView {
             generation: 0,
             ruler: Rc::new(Cell::new(Bounds::default())),
             drag: None,
+            scrubbing: false,
+            player: Player::default(),
+            ticking: false,
             picking: false,
             export: Export::Idle,
             focus: Vec::new(),
@@ -136,6 +147,8 @@ impl EditorView {
         self.bitrate_bps = bitrate_bps;
         self.picking = false;
         self.drag = None;
+        self.scrubbing = false;
+        self.player.reset();
         self.export = Export::Idle;
         let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         self.clip = Some(Clip {
@@ -147,9 +160,6 @@ impl EditorView {
             out_pt: Hns::ZERO,
             edits: Vec::new(),
             waves: Vec::new(),
-            frame: None,
-            frame_want: Hns::ZERO,
-            frame_busy: false,
         });
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -188,7 +198,7 @@ impl EditorView {
                     self.spawn_waveform(generation, &ffmpeg, track, cx);
                 }
                 self.ffmpeg = Some(ffmpeg);
-                self.request_frame(Hns::ZERO, cx);
+                self.seek(Hns::ZERO, cx);
             }
             Err(error) => {
                 let hint = if matches!(error, FfmpegError::NotFound) {
@@ -230,7 +240,8 @@ impl EditorView {
         .detach();
     }
 
-    /// The mouse is at window x `x` over the ruler: start (`press`) or continue a handle drag.
+    /// The mouse is at window x `x` over the ruler. A press near a trim handle grabs it; a press
+    /// anywhere else pauses and moves the playhead. Moving with the button down continues either.
     fn pointer(&mut self, x: Pixels, press: bool, cx: &mut Context<Self>) {
         let bounds = self.ruler.get();
         let width = f32::from(bounds.size.width);
@@ -246,14 +257,21 @@ impl EditorView {
                 model::time_to_x(clip.in_pt, duration, width),
                 model::time_to_x(clip.out_pt, duration, width),
             );
-            self.drag = Some(model::nearest_handle(x, in_x, out_x));
+            let handle = model::nearest_handle(x, in_x, out_x);
+            let handle_x = if handle == Handle::In { in_x } else { out_x };
+            if (x - handle_x).abs() <= GRAB {
+                self.drag = Some(handle);
+            } else {
+                self.scrubbing = true;
+            }
         }
         if let Some(handle) = self.drag {
             (clip.in_pt, clip.out_pt) =
                 model::move_handle(handle, t, clip.in_pt, clip.out_pt, duration);
             let shown = if handle == Handle::In { clip.in_pt } else { clip.out_pt };
-            self.request_frame(shown, cx);
-            cx.notify();
+            self.seek(shown, cx);
+        } else if self.scrubbing {
+            self.seek(t, cx);
         }
     }
 
@@ -269,52 +287,70 @@ impl EditorView {
                 duration,
             );
             let shown = if handle == Handle::In { clip.in_pt } else { clip.out_pt };
-            self.request_frame(shown, cx);
-            cx.notify();
+            self.seek(shown, cx);
         }
     }
 
-    /// Shows the video frame at `at`. One ffmpeg job runs at a time; while it runs, only the
-    /// latest wanted time is kept, so dragging a handle never queues a pile of jobs.
-    fn request_frame(&mut self, at: Hns, cx: &mut Context<Self>) {
-        let (Some(clip), Some(ffmpeg)) = (self.clip.as_mut(), self.ffmpeg.clone()) else { return };
-        clip.frame_want = at;
-        if clip.frame_busy {
+    /// Pauses and shows the frame at `at`.
+    fn seek(&mut self, at: Hns, cx: &mut Context<Self>) {
+        let (Some(clip), Some(ffmpeg)) = (self.clip.as_ref(), self.ffmpeg.as_ref()) else { return };
+        self.player.show_at(ffmpeg, &clip.path, at);
+        self.ensure_ticking(cx);
+        cx.notify();
+    }
+
+    /// Play from the playhead, or pause. Play stops at the end of the selection when the playhead
+    /// is inside it, else at the end of the clip.
+    fn toggle_play(&mut self, cx: &mut Context<Self>) {
+        if self.player.playing {
+            self.player.pause();
+            cx.notify();
             return;
         }
-        clip.frame_busy = true;
-        let (generation, path) = (self.generation, clip.path.clone());
-        let out = std::env::temp_dir().join(format!(
-            "zeroclip-editor-{}-{}.jpg",
-            std::process::id(),
-            FRAME_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        let (Some(clip), Some(ffmpeg)) = (self.clip.as_ref(), self.ffmpeg.as_ref()) else { return };
+        let Some(duration) = clip.info.as_ref().map(|i| i.duration) else { return };
+        let mut from = self.player.playhead;
+        let limit = if from < clip.out_pt { clip.out_pt } else { duration };
+        // At the very end there is nothing left to play: start over from the selection.
+        if limit - from < Hns::from_millis(200) {
+            from = clip.in_pt;
+        }
+        self.player.play(ffmpeg, &clip.path, from, limit);
+        self.ensure_ticking(cx);
+        cx.notify();
+    }
+
+    /// Starts the task that refreshes the picture while the player has work, unless one runs.
+    fn ensure_ticking(&mut self, cx: &mut Context<Self>) {
+        if self.ticking {
+            return;
+        }
+        self.ticking = true;
         cx.spawn(async move |this, cx| {
-            let target = out.clone();
-            let done = cx
-                .background_executor()
-                .spawn(async move {
-                    ffmpeg.thumbnail(&path, at, 960, &target).is_ok() && target.is_file()
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                if generation != this.generation {
-                    let _ = std::fs::remove_file(&out);
-                    return;
+            loop {
+                cx.background_executor().timer(TICK).await;
+                let keep = this
+                    .update(cx, |this, cx| {
+                        let busy = this.player.tick();
+                        cx.notify();
+                        if !busy {
+                            this.ticking = false;
+                        }
+                        busy
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
                 }
-                let Some(clip) = this.clip.as_mut() else { return };
-                clip.frame_busy = false;
-                if done && let Some(old) = clip.frame.replace(out) {
-                    let _ = std::fs::remove_file(old);
-                }
-                if clip.frame_want != at {
-                    let want = clip.frame_want;
-                    this.request_frame(want, cx);
-                }
-                cx.notify();
-            });
+            }
         })
         .detach();
+    }
+
+    /// The button is up: whatever was being dragged is let go.
+    fn release(&mut self) {
+        self.drag = None;
+        self.scrubbing = false;
     }
 
     fn edit_track(&mut self, track: usize, cx: &mut Context<Self>, f: impl FnOnce(&mut TrackEdit)) {
@@ -494,6 +530,10 @@ fn run_export(
 
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Frames that left the screen are removed from the GPU cache, or playback fills it.
+        for old in self.player.spent.drain(..) {
+            let _ = window.drop_image(old);
+        }
         let tracks = self.clip.as_ref().map_or(0, |c| c.edits.len());
         while self.focus.len() < tracks * 2 {
             self.focus.push(cx.focus_handle());
@@ -518,7 +558,7 @@ impl Render for EditorView {
                     page.child(div().text_sm().text_color(rgb(theme::DANGER)).child(error.clone()))
                 }
                 Load::Ready => page
-                    .child(self.frame_view(clip))
+                    .child(self.player_view(clip, cx))
                     .child(self.timeline(clip, cx))
                     .child(self.selection_card(clip, cx))
                     .children(self.track_cards(clip, window, cx))
@@ -606,27 +646,76 @@ impl EditorView {
 
     /// Keyframe ticks, the selection, the two handles and the snapped start, with one waveform
     /// lane per audio track under the ruler.
-    /// The video frame at the handle you last moved.
-    fn frame_view(&self, clip: &Clip) -> gpui::Div {
-        let frame = div()
+    /// The picture, with play/pause, the time, and buttons that set the trim from the playhead.
+    fn player_view(&self, clip: &Clip, cx: &mut Context<Self>) -> gpui::Div {
+        let video = div()
             .w_full()
-            .h(px(FRAME_HEIGHT))
-            // The page scrolls, so without this the flex column squeezes the frame to nothing.
+            .h(px(VIDEO_HEIGHT))
             .flex_none()
+            // The page scrolls, so without this the flex column squeezes the picture to nothing.
             .rounded(px(theme::RADIUS_MD))
-            .bg(rgb(theme::BG))
+            .bg(rgb(0x000000))
             .border_1()
             .border_color(rgb(theme::BORDER))
             .overflow_hidden()
             .flex()
             .items_center()
             .justify_center();
-        match &clip.frame {
-            Some(path) => {
-                frame.child(img(path.clone()).h_full().object_fit(gpui::ObjectFit::Contain))
-            }
-            None => frame.child(muted("Loading the picture.")),
-        }
+        let video = match &self.player.shown {
+            Some(frame) => video.child(
+                img(ImageSource::Render(frame.clone()))
+                    .w_full()
+                    .h_full()
+                    .object_fit(ObjectFit::Contain),
+            ),
+            None => video.child(muted("Loading the picture.")),
+        };
+        let total = clip.info.as_ref().map_or(Hns::ZERO, |i| i.duration);
+        let play = div()
+            .id("editor-play")
+            .w(px(40.))
+            .h(px(32.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(theme::RADIUS_MD))
+            .bg(rgb(theme::PRIMARY))
+            .cursor_pointer()
+            .hover(|s| s.opacity(0.9))
+            .child(icon(if self.player.playing { "pause" } else { "play" }, theme::PRIMARY_FG))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_play(cx)));
+        let at = self.player.playhead;
+        let controls = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(play)
+            .child(div().text_sm().text_color(rgb(theme::MUTED_FG)).child(format!(
+                "{} / {}",
+                clock(at),
+                clock(total)
+            )))
+            .child(
+                div()
+                    .ml_auto()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(button_ghost("editor-set-in", "Start here").on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            let secs = this.player.playhead.as_secs_f64();
+                            this.set_handle(Handle::In, secs, cx);
+                        },
+                    )))
+                    .child(button_ghost("editor-set-out", "End here").on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            let secs = this.player.playhead.as_secs_f64();
+                            this.set_handle(Handle::Out, secs, cx);
+                        },
+                    ))),
+            );
+        div().flex().flex_col().gap_2().child(video).child(controls)
     }
 
     fn timeline(&self, clip: &Clip, cx: &mut Context<Self>) -> gpui::Div {
@@ -669,6 +758,7 @@ impl EditorView {
             .child(marker(x_of(snapped), theme::WARN, 2.))
             .child(marker(x_of(clip.in_pt), theme::BRAND, 4.))
             .child(marker(x_of(clip.out_pt), theme::BRAND, 4.))
+            .child(marker(x_of(self.player.playhead), theme::FG, 2.))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, _, cx| {
@@ -680,8 +770,8 @@ impl EditorView {
                     this.pointer(ev.position.x, false, cx);
                 }
             }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.drag = None))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| this.drag = None));
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.release()))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| this.release()));
 
         let lanes = clip.waves.iter().enumerate().map(|(i, wave)| {
             let lane = div()
@@ -928,6 +1018,13 @@ impl EditorView {
 }
 
 /// A vertical line on the ruler, `thickness` px wide, centred on `x`.
+/// `m:ss.t`, for the player's clock.
+fn clock(t: Hns) -> String {
+    let secs = t.as_secs_f64().max(0.0);
+    let whole = secs as u64;
+    format!("{}:{:02}.{}", whole / 60, whole % 60, ((secs - whole as f64) * 10.0) as u64)
+}
+
 fn marker(x: f32, colour: u32, thickness: f32) -> gpui::Div {
     div().absolute().top_0().h_full().left(px(x - thickness / 2.0)).w(px(thickness)).bg(rgb(colour))
 }

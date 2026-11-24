@@ -447,6 +447,39 @@ pub fn thumbnail_args(input: &Path, at: Hns, width: u32, output: &Path) -> Vec<O
     args
 }
 
+/// Arguments that decode video from `at` onward and write raw BGRA frames to stdout, `fps` a
+/// second, each letterboxed to exactly `width` x `height`. `max_frames` stops after that many
+/// frames (one makes a still). The editor's player reads these frames.
+#[must_use]
+pub fn frames_args(
+    input: &Path,
+    at: Hns,
+    width: u32,
+    height: u32,
+    fps: u32,
+    max_frames: Option<u32>,
+) -> Vec<OsString> {
+    let mut args = common_args();
+    args.push("-ss".into());
+    args.push(ffmpeg_time(at).into());
+    args.push("-i".into());
+    args.push(os(input));
+    args.extend(["-an", "-sn", "-map", "0:v:0", "-vf"].map(OsString::from));
+    args.push(
+        format!(
+            "fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,\
+             pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
+        )
+        .into(),
+    );
+    if let Some(n) = max_frames {
+        args.push("-frames:v".into());
+        args.push(n.to_string().into());
+    }
+    args.extend(["-pix_fmt", "bgra", "-f", "rawvideo", "pipe:1"].map(OsString::from));
+    args
+}
+
 /// What the editor does to one audio track (D38). Anything but `Keep` re-encodes that track to
 /// AAC; video is never re-encoded.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -602,6 +635,18 @@ mod tests {
         assert_eq!(args[at + 1], "0.5000000");
         assert!(args.windows(2).any(|w| w == ["-frames:v", "1"]));
         assert_eq!(args.last().map(String::as_str), Some("out.jpg"));
+    }
+
+    #[test]
+    fn frames_are_raw_bgra_of_a_fixed_size_on_stdout() {
+        let still =
+            strs(&frames_args(Path::new("in.mp4"), Hns::from_millis(500), 640, 360, 24, Some(1)));
+        assert!(still.windows(2).any(|w| w == ["-frames:v", "1"]));
+        assert!(still.windows(2).any(|w| w == ["-pix_fmt", "bgra"]));
+        assert!(still.iter().any(|a| a.contains("pad=640:360")));
+        assert_eq!(still.last().map(String::as_str), Some("pipe:1"));
+        let open = strs(&frames_args(Path::new("in.mp4"), Hns::ZERO, 640, 360, 24, None));
+        assert!(!open.iter().any(|a| a == "-frames:v"));
     }
 
     #[test]
