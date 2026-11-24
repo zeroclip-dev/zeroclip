@@ -6,6 +6,8 @@ use gpui::{
     Styled, Window, div, px, rgb,
 };
 
+use crate::ui::theme;
+
 pub fn labeled_toggle(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
@@ -13,7 +15,7 @@ pub fn labeled_toggle(
     enabled: bool,
     on_change: impl Fn(&bool, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
-    let knob = div().size(px(14.)).rounded_full().bg(rgb(0xffffff));
+    let knob = div().size(px(14.)).rounded_full().bg(rgb(theme::FG));
     let mut track = div()
         .w(px(34.))
         .h(px(18.))
@@ -22,7 +24,7 @@ pub fn labeled_toggle(
         .flex()
         .items_center()
         .px(px(2.))
-        .bg(rgb(if on { 0x4f8cff } else { 0x4a4a55 }));
+        .bg(rgb(if on { theme::BRAND } else { theme::INPUT }));
     if on {
         track = track.justify_end();
     }
@@ -35,7 +37,9 @@ pub fn labeled_toggle(
         .child(track.child(knob))
         .child(div().child(label.into()));
     if enabled {
-        row.cursor_pointer().on_click(move |_, window, cx| on_change(&!on, window, cx))
+        row.cursor_pointer()
+            .hover(|s| s.opacity(0.85))
+            .on_click(move |_, window, cx| on_change(&!on, window, cx))
     } else {
         row.opacity(0.4)
     }

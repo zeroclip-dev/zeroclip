@@ -7,6 +7,8 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div, px, rgb,
 };
 
+use crate::ui::theme;
+
 pub fn text_field(
     id: impl Into<ElementId>,
     focus: &FocusHandle,
@@ -24,18 +26,18 @@ pub fn text_field(
         .id(id)
         .track_focus(focus)
         .w(px(width))
-        .h(px(28.))
+        .h(px(32.))
         .px_2()
         .flex()
         .flex_row()
         .items_center()
         .overflow_hidden()
-        .rounded_md()
-        .bg(rgb(0x15151a))
+        .rounded(px(theme::RADIUS_MD))
+        .bg(rgb(theme::BG))
         .border_1()
-        .border_color(rgb(if focused { 0x4f8cff } else { 0x34343c }))
+        .border_color(rgb(if focused { theme::RING } else { theme::INPUT }))
         .cursor_text()
-        .text_color(rgb(if value.is_empty() { 0x707078 } else { 0xe6e6e6 }))
+        .text_color(rgb(if value.is_empty() { theme::MUTED_FG } else { theme::FG }))
         .on_click(move |_, window, _| handle.focus(window))
         .on_key_down(move |ev, window, cx| {
             let k = &ev.keystroke;
