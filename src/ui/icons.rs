@@ -1,11 +1,11 @@
 //! Lucide icons (<https://lucide.dev>, ISC licence), embedded in the exe.
 //!
 //! To add one: put `<name>.svg` from lucide-static in `assets/icons/`, add it to `ICONS`, then
-//! call `icon("<name>")`. The colour comes from the parent's `text_color`.
+//! call `icon("<name>", colour)`.
 
 use std::borrow::Cow;
 
-use gpui::{AssetSource, Result, SharedString, Styled, Svg, px, svg};
+use gpui::{AssetSource, Result, SharedString, Styled, Svg, px, rgb, svg};
 
 const ICONS: [(&str, &[u8]); 11] = [
     ("icons/house.svg", include_bytes!("../../assets/icons/house.svg")),
@@ -34,7 +34,8 @@ impl AssetSource for Icons {
     }
 }
 
-/// A 16 px icon by file name, without folder or extension.
-pub fn icon(name: &str) -> Svg {
-    svg().path(format!("icons/{name}.svg")).size(px(16.)).flex_none()
+/// A 16 px icon by file name, without folder or extension, in colour `color`. GPUI paints an SVG
+/// with its own text colour, not the parent's, so the colour is given here.
+pub fn icon(name: &str, color: u32) -> Svg {
+    svg().path(format!("icons/{name}.svg")).size(px(16.)).flex_none().text_color(rgb(color))
 }

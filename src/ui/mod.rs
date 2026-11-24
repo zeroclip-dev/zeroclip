@@ -110,7 +110,7 @@ fn window_button(
             }
         })
         .window_control_area(area)
-        .child(icon(name))
+        .child(icon(name, theme::MUTED_FG))
 }
 
 fn status_bar(app: &ZeroClipApp) -> impl IntoElement {
