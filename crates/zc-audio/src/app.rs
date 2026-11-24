@@ -78,7 +78,14 @@ impl AppAudioSource {
     /// its process tree, or `None` when the app isn't running.
     #[must_use]
     pub fn new(track: TrackId, exe: String, resolve: PidResolver) -> Self {
-        Self { track, exe, resolve: Arc::new(Mutex::new(resolve)), mix: None, worker: None, last_audible: Arc::new(AtomicI64::new(i64::MIN)) }
+        Self {
+            track,
+            exe,
+            resolve: Arc::new(Mutex::new(resolve)),
+            mix: None,
+            worker: None,
+            last_audible: Arc::new(AtomicI64::new(i64::MIN)),
+        }
     }
 
     /// Puts this source in the Master mix as `mix`. Set it before `start`. `None` keeps the
@@ -159,14 +166,14 @@ impl AudioSource for AppAudioSource {
                 }
                 match &stream {
                     Some(s) => {
-                        if let Err(e) =
-                            s.read(|pcm, frames, qpc| {
-                                if pcm.is_some_and(|p| p.iter().any(|v| v.unsigned_abs() > AUDIBLE as u16)) {
-                                    heard.store(zc_win::clock::now().ticks(), Ordering::Relaxed);
-                                }
-                                encode.push(pcm, frames, qpc, &*sink)
-                            })
-                        {
+                        if let Err(e) = s.read(|pcm, frames, qpc| {
+                            if pcm.is_some_and(|p| {
+                                p.iter().any(|v| v.unsigned_abs() > AUDIBLE as u16)
+                            }) {
+                                heard.store(zc_win::clock::now().ticks(), Ordering::Relaxed);
+                            }
+                            encode.push(pcm, frames, qpc, &*sink)
+                        }) {
                             // Drop the stream and retry on the next tick.
                             tracing::warn!(%exe, %e, "app audio capture stopped");
                             stream = None;

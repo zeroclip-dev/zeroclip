@@ -20,6 +20,7 @@ pub mod autostart;
 pub mod chime;
 pub mod clock;
 pub mod com;
+pub mod drag;
 pub mod drive;
 pub mod error;
 pub mod icon;
