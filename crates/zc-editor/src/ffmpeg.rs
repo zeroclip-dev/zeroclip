@@ -121,8 +121,14 @@ impl Ffmpeg {
     /// # Errors
     /// See [`FfmpegError`]. A time past the end of the clip writes nothing and is not an error,
     /// so callers check that `output` exists.
-    pub fn thumbnail(&self, input: &Path, at: Hns, output: &Path) -> Result<(), FfmpegError> {
-        run(&self.exe, &thumbnail_args(input, at, output)).map(drop)
+    pub fn thumbnail(
+        &self,
+        input: &Path,
+        at: Hns,
+        width: u32,
+        output: &Path,
+    ) -> Result<(), FfmpegError> {
+        run(&self.exe, &thumbnail_args(input, at, width, output)).map(drop)
     }
 
     /// Edits audio tracks and stream-copies the video (D38); see [`audio_edit_args`].
@@ -426,17 +432,17 @@ pub fn remux_args(input: &Path, output: &Path) -> Vec<OsString> {
 }
 
 /// Arguments that decode the first video frame at `at` and write it to `output` (a `.jpg`),
-/// scaled to 192 px wide. Seeking before `-i` is fast and lands on the nearest earlier keyframe.
+/// scaled to `width` px wide. Seeking before `-i` is fast and lands on the nearest earlier keyframe.
 #[must_use]
-pub fn thumbnail_args(input: &Path, at: Hns, output: &Path) -> Vec<OsString> {
+pub fn thumbnail_args(input: &Path, at: Hns, width: u32, output: &Path) -> Vec<OsString> {
     let mut args = common_args();
     args.push("-ss".into());
     args.push(ffmpeg_time(at).into());
     args.push("-i".into());
     args.push(os(input));
-    args.extend(
-        ["-map", "0:v:0", "-frames:v", "1", "-vf", "scale=192:-2", "-q:v", "5"].map(OsString::from),
-    );
+    args.extend(["-map", "0:v:0", "-frames:v", "1", "-vf"].map(OsString::from));
+    args.push(format!("scale={width}:-2").into());
+    args.extend(["-q:v", "5"].map(OsString::from));
     args.push(os(output));
     args
 }
@@ -585,8 +591,13 @@ mod tests {
 
     #[test]
     fn thumbnail_takes_one_scaled_frame_and_ends_with_the_output() {
-        let args =
-            strs(&thumbnail_args(Path::new("in.mp4"), Hns::from_millis(500), Path::new("out.jpg")));
+        let args = strs(&thumbnail_args(
+            Path::new("in.mp4"),
+            Hns::from_millis(500),
+            192,
+            Path::new("out.jpg"),
+        ));
+        assert!(args.contains(&"scale=192:-2".to_string()));
         let at = args.iter().position(|a| a == "-ss").unwrap();
         assert_eq!(args[at + 1], "0.5000000");
         assert!(args.windows(2).any(|w| w == ["-frames:v", "1"]));

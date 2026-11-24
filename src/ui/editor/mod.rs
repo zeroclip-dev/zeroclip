@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyElement, Bounds, Context, FocusHandle, FontWeight, InteractiveElement as _, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Render, SharedString,
-    StatefulInteractiveElement as _, Styled, WeakEntity, Window, canvas, div, px, rgb,
+    StatefulInteractiveElement as _, Styled, WeakEntity, Window, canvas, div, img, px, rgb,
 };
 use zc_core::Hns;
 use zc_editor::ffmpeg::{Ffmpeg, FfmpegError, ProbeInfo};
@@ -48,6 +48,8 @@ const LANE_HEIGHT: f32 = 40.0;
 /// One waveform bar and one keyframe tick are at least this far from the previous one.
 const BAR_STEP: f32 = 3.0;
 const TICK_GAP: f32 = 3.0;
+const FRAME_HEIGHT: f32 = 300.0;
+static FRAME_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 enum Load {
     Loading,
@@ -73,6 +75,11 @@ struct Clip {
     edits: Vec<TrackEdit>,
     /// One per audio track; `None` until computed, or if the track has no usable audio.
     waves: Vec<Option<Vec<f32>>>,
+    /// The video frame shown above the timeline, and the time it was taken at.
+    frame: Option<PathBuf>,
+    /// Where the preview should be. A new frame is made when this differs from what is shown.
+    frame_want: Hns,
+    frame_busy: bool,
 }
 
 pub struct EditorView {
@@ -139,6 +146,9 @@ impl EditorView {
             out_pt: Hns::ZERO,
             edits: Vec::new(),
             waves: Vec::new(),
+            frame: None,
+            frame_want: Hns::ZERO,
+            frame_busy: false,
         });
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -177,6 +187,7 @@ impl EditorView {
                     self.spawn_waveform(generation, &ffmpeg, track, cx);
                 }
                 self.ffmpeg = Some(ffmpeg);
+                self.request_frame(Hns::ZERO, cx);
             }
             Err(error) => {
                 let hint = if matches!(error, FfmpegError::NotFound) {
@@ -239,6 +250,8 @@ impl EditorView {
         if let Some(handle) = self.drag {
             (clip.in_pt, clip.out_pt) =
                 model::move_handle(handle, t, clip.in_pt, clip.out_pt, duration);
+            let shown = if handle == Handle::In { clip.in_pt } else { clip.out_pt };
+            self.request_frame(shown, cx);
             cx.notify();
         }
     }
@@ -254,8 +267,53 @@ impl EditorView {
                 clip.out_pt,
                 duration,
             );
+            let shown = if handle == Handle::In { clip.in_pt } else { clip.out_pt };
+            self.request_frame(shown, cx);
             cx.notify();
         }
+    }
+
+    /// Shows the video frame at `at`. One ffmpeg job runs at a time; while it runs, only the
+    /// latest wanted time is kept, so dragging a handle never queues a pile of jobs.
+    fn request_frame(&mut self, at: Hns, cx: &mut Context<Self>) {
+        let (Some(clip), Some(ffmpeg)) = (self.clip.as_mut(), self.ffmpeg.clone()) else { return };
+        clip.frame_want = at;
+        if clip.frame_busy {
+            return;
+        }
+        clip.frame_busy = true;
+        let (generation, path) = (self.generation, clip.path.clone());
+        let out = std::env::temp_dir().join(format!(
+            "zeroclip-editor-{}-{}.jpg",
+            std::process::id(),
+            FRAME_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        cx.spawn(async move |this, cx| {
+            let target = out.clone();
+            let done = cx
+                .background_executor()
+                .spawn(async move {
+                    ffmpeg.thumbnail(&path, at, 960, &target).is_ok() && target.is_file()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if generation != this.generation {
+                    let _ = std::fs::remove_file(&out);
+                    return;
+                }
+                let Some(clip) = this.clip.as_mut() else { return };
+                clip.frame_busy = false;
+                if done && let Some(old) = clip.frame.replace(out) {
+                    let _ = std::fs::remove_file(old);
+                }
+                if clip.frame_want != at {
+                    let want = clip.frame_want;
+                    this.request_frame(want, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn edit_track(&mut self, track: usize, cx: &mut Context<Self>, f: impl FnOnce(&mut TrackEdit)) {
@@ -459,6 +517,7 @@ impl Render for EditorView {
                     page.child(div().text_sm().text_color(rgb(theme::DANGER)).child(error.clone()))
                 }
                 Load::Ready => page
+                    .child(self.frame_view(clip))
                     .child(self.timeline(clip, cx))
                     .child(self.selection_card(clip, cx))
                     .children(self.track_cards(clip, window, cx))
@@ -546,6 +605,27 @@ impl EditorView {
 
     /// Keyframe ticks, the selection, the two handles and the snapped start, with one waveform
     /// lane per audio track under the ruler.
+    /// The video frame at the handle you last moved.
+    fn frame_view(&self, clip: &Clip) -> gpui::Div {
+        let frame = div()
+            .w_full()
+            .h(px(FRAME_HEIGHT))
+            .rounded(px(theme::RADIUS_MD))
+            .bg(rgb(theme::BG))
+            .border_1()
+            .border_color(rgb(theme::BORDER))
+            .overflow_hidden()
+            .flex()
+            .items_center()
+            .justify_center();
+        match &clip.frame {
+            Some(path) => {
+                frame.child(img(path.clone()).h_full().object_fit(gpui::ObjectFit::Contain))
+            }
+            None => frame.child(muted("Loading the picture.")),
+        }
+    }
+
     fn timeline(&self, clip: &Clip, cx: &mut Context<Self>) -> gpui::Div {
         let Some(info) = clip.info.as_ref() else { return div() };
         let measured = f32::from(self.ruler.get().size.width);
