@@ -42,7 +42,7 @@ const HINT: u32 = theme::MUTED_FG;
 #[derive(Clone, Debug)]
 pub struct Draft {
     pub settings: Settings,
-    output_dir: String,
+    pub output_dir: String,
     save_clip: String,
     toggle_recording: String,
     screenshot: String,
@@ -389,6 +389,16 @@ impl Render for SettingsView {
         let f_out = field(0, "f-out", &d.output_dir, &default_dir, 380., |d, v| {
             d.output_dir = v.to_owned()
         });
+        let browse = button("f-out-browse", "Browse").on_click(cx.listener(|this, _, _, cx| {
+            let start =
+                this.app.upgrade().map(|a| PathBuf::from(a.read(cx).draft.output_dir.clone()));
+            match zc_win::shell::pick_folder(start.as_deref()) {
+                Ok(Some(dir)) => this.edit(cx, |d| d.output_dir = dir.display().to_string()),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(%error, "folder picker failed"),
+            }
+        }));
+        let f_out = div().flex().flex_row().items_center().gap_2().child(f_out).child(browse);
         let f_save =
             field(1, "f-save", &d.save_clip, "none", 200., |d, v| d.save_clip = v.to_owned());
         let f_rec = field(2, "f-rec", &d.toggle_recording, "none", 200., |d, v| {
