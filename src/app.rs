@@ -75,6 +75,8 @@ pub struct ZeroClipApp {
     pub focus_prompt: Option<ui::focus_prompt::FocusPrompt>,
     /// Footage waiting for Keep / Discard / Later (P4.12); the first one is on screen.
     pub rescues: Vec<ui::rescue::Rescue>,
+    /// Recent log lines, dumped next to a rescue (P4.13).
+    flight: Arc<crate::logging::FlightRecorder>,
     /// The startup scan's result, moved into `notices` and `rescues` when it arrives.
     repairs: mpsc::Receiver<StartupScan>,
 }
@@ -83,6 +85,7 @@ impl ZeroClipApp {
     pub fn new(
         paths: AppPaths,
         settings: Settings,
+        flight: Arc<crate::logging::FlightRecorder>,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<Self> {
         // The engine (and the repair thread) wake the UI by sending on `wake_tx`; the task below
@@ -138,6 +141,7 @@ impl ZeroClipApp {
             open_apps: Default::default(),
             focus_prompt: None,
             rescues: Vec::new(),
+            flight,
             repairs,
         })
     }
@@ -281,9 +285,20 @@ impl ZeroClipApp {
                     );
                 }
                 EngineEvent::RecoveryReady { path, game, duration } => {
+                    // A failed dump is a log line, never a blocked prompt.
+                    let log_note = match self.flight.dump_to_dir(&self.paths.logs_dir, "") {
+                        Ok(log) => format!(
+                            " Diagnostics: {}",
+                            log.file_name().unwrap_or_default().to_string_lossy()
+                        ),
+                        Err(error) => {
+                            tracing::warn!(%error, "couldn't dump the flight recorder");
+                            String::new()
+                        }
+                    };
                     self.notify(
                         NoticeLevel::Warning,
-                        format!("{game} closed unexpectedly; its footage was saved."),
+                        format!("{game} closed unexpectedly; its footage was saved.{log_note}"),
                     );
                     self.add_rescue(ui::rescue::Rescue {
                         path,
