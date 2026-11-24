@@ -491,7 +491,8 @@ pub fn trim_args(
     args.push(os(input));
     args.push("-t".into());
     args.push(ffmpeg_time(end - start).into());
-    args.extend(["-map", "0", "-c", "copy", "-avoid_negative_ts", "make_zero"].map(OsString::from));
+    args.extend(["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy"].map(OsString::from));
+    args.extend(["-avoid_negative_ts", "make_zero"].map(OsString::from));
     args.extend(["-movflags", "+faststart"].map(OsString::from));
     args.push(os(output));
     Ok(args)
@@ -528,7 +529,7 @@ pub fn trim_exact_args(
     args.push(os(input));
     args.push("-t".into());
     args.push(ffmpeg_time(end - start).into());
-    args.extend(["-map", "0", "-c", "copy"].map(OsString::from));
+    args.extend(["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy"].map(OsString::from));
     args.extend(video.iter().map(OsString::from));
     args.extend(["-avoid_negative_ts", "make_zero", "-movflags", "+faststart"].map(OsString::from));
     args.push(os(output));
@@ -546,13 +547,16 @@ pub fn concat_args(list: &Path, output: &Path) -> Vec<OsString> {
     args
 }
 
-/// Arguments for a stream-copy remux to a plain MP4 with the index up front.
+/// Arguments for a stream-copy remux of the video and the Master audio track (others are left out) to a plain MP4 with the index up front.
 #[must_use]
 pub fn remux_args(input: &Path, output: &Path) -> Vec<OsString> {
     let mut args = common_args();
     args.push("-i".into());
     args.push(os(input));
-    args.extend(["-map", "0", "-c", "copy", "-movflags", "+faststart"].map(OsString::from));
+    args.extend(
+        ["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-movflags", "+faststart"]
+            .map(OsString::from),
+    );
     args.push(os(output));
     args
 }
@@ -863,7 +867,9 @@ mod tests {
                 "-t",
                 "2.3000000",
                 "-map",
-                "0",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
                 "-c",
                 "copy",
                 "-avoid_negative_ts",
@@ -929,7 +935,9 @@ mod tests {
                 "-i",
                 "in.mp4",
                 "-map",
-                "0",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
                 "-c",
                 "copy",
                 "-movflags",

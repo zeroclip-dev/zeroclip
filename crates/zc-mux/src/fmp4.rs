@@ -125,7 +125,7 @@ fn mvhd(next_track_id: u32) -> io::Result<Vec<u8>> {
     full_box(b"mvhd", 0, 0, &body)
 }
 
-/// `tkhd` (version 0, flags 3: enabled and in the movie). Audio is at full volume and
+/// `tkhd` (version 0, flags 3: enabled and in the movie; 2 for audio other than Master). Audio is at full volume and
 /// video has none. `size` is the encoded size in pixels, zero for audio.
 fn tkhd(track_id: u32, track: &TrackInfo, size: (u16, u16)) -> io::Result<Vec<u8>> {
     let mut body = vec![0; 8]; // creation_time, modification_time
@@ -141,7 +141,11 @@ fn tkhd(track_id: u32, track: &TrackInfo, size: (u16, u16)) -> io::Result<Vec<u8
     // Width and height are 16.16 fixed point.
     body.extend_from_slice(&(u32::from(size.0) << 16).to_be_bytes());
     body.extend_from_slice(&(u32::from(size.1) << 16).to_be_bytes());
-    full_box(b"tkhd", 0, 3, &body)
+    // Players play the first enabled audio track. Only Master is enabled (flags 3); the other
+    // audio tracks are in the movie but switched off (flags 2), so a clip sounds right everywhere.
+    // The editor and ffmpeg still see them all.
+    let flags = if track.track.is_audio() && track.track != TrackId::Master { 2 } else { 3 };
+    full_box(b"tkhd", 0, flags, &body)
 }
 
 /// `mdhd` (version 0): the media timescale and the `und` language.

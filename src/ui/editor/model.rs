@@ -526,7 +526,8 @@ pub fn plan_piece(
     let off_keyframe = (snapped_start(keyframes, start).ticks() - start.ticks()).abs() > 10_000;
     let whole = start == Hns::ZERO && piece.b >= duration;
     let tracks =
-        piece.tracks.iter().map(|t| AudioTrack { edit: t.audio_edit(), bitrate_bps }).collect();
+        // Only the Master track (the first) goes into an export; the other tracks are left out.
+        piece.tracks.iter().take(1).map(|t| AudioTrack { edit: t.audio_edit(), bitrate_bps }).collect();
     Ok(PiecePlan {
         source: piece.source,
         trim: (!whole).then_some((start, piece.b)),
