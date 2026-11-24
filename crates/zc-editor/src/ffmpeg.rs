@@ -585,11 +585,8 @@ mod tests {
 
     #[test]
     fn thumbnail_takes_one_scaled_frame_and_ends_with_the_output() {
-        let args = strs(&thumbnail_args(
-            Path::new("in.mp4"),
-            Hns::from_millis(500),
-            Path::new("out.jpg"),
-        ));
+        let args =
+            strs(&thumbnail_args(Path::new("in.mp4"), Hns::from_millis(500), Path::new("out.jpg")));
         let at = args.iter().position(|a| a == "-ss").unwrap();
         assert_eq!(args[at + 1], "0.5000000");
         assert!(args.windows(2).any(|w| w == ["-frames:v", "1"]));
