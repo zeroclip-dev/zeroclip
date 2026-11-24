@@ -188,7 +188,6 @@ impl ZeroClipApp {
     }
 
     /// Where recordings are written right now.
-    #[allow(dead_code)] // used by the Clips screen
     pub fn output_dir(&self) -> PathBuf {
         self.settings
             .recording
@@ -209,7 +208,6 @@ impl ZeroClipApp {
     }
 
     /// Validates the draft, writes it to disk and applies it to the engine.
-    #[allow(dead_code)] // used by the Settings screen
     pub fn save_settings(&mut self) {
         let settings = match self.draft.build() {
             Ok(settings) => settings,
