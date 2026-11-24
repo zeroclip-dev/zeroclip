@@ -27,6 +27,8 @@ pub const SHIMMER_BAND: f32 = 80.0;
 /// The three events the overlay reports. Each variant carries only what its text needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToastKind {
+    /// The save hotkey was pressed; the clip is being written.
+    Saving,
     /// A DVR clip was written; `length` is the real length of that clip.
     ClipSaved { length: Hns },
     /// A manual or session recording started.
@@ -47,6 +49,7 @@ pub struct ToastText {
 /// What the card says.
 pub fn toast_text(kind: ToastKind) -> ToastText {
     match kind {
+        ToastKind::Saving => ToastText { title: "Saving clip…".into(), detail: None },
         ToastKind::ClipSaved { length } => ToastText {
             title: format!("Clipped last {}", human_duration(length)),
             detail: Some("Saved to Clips".into()),
@@ -65,7 +68,7 @@ pub fn toast_text(kind: ToastKind) -> ToastText {
 /// The colour of the status dot. Red marks recording, as it does in the top bar.
 pub fn accent(kind: ToastKind) -> u32 {
     match kind {
-        ToastKind::ClipSaved { .. } => theme::BRAND,
+        ToastKind::Saving | ToastKind::ClipSaved { .. } => theme::BRAND,
         ToastKind::RecordingStarted => theme::DANGER,
         ToastKind::RecordingStopped { .. } => theme::MUTED_FG,
         ToastKind::ScreenshotTaken => theme::FG,
@@ -106,6 +109,7 @@ mod tests {
 
     #[test]
     fn each_event_has_its_own_text() {
+        assert_eq!(toast_text(ToastKind::Saving).title, "Saving clip…");
         assert_eq!(toast_text(ToastKind::RecordingStarted).title, "Recording started");
         let stopped = toast_text(ToastKind::RecordingStopped { length: Hns::from_secs(90) });
         assert_eq!(stopped.title, "Recording stopped");

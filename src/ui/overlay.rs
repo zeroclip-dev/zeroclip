@@ -9,6 +9,7 @@
 mod model;
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt, App, AppContext, Bounds, Context, FontWeight, IntoElement,
@@ -151,13 +152,18 @@ pub fn show(cx: &mut App, kind: ToastKind) -> Option<WindowHandle<ToastView>> {
             return None;
         }
     };
+    let title_for_timer = title.clone();
     if let Err(error) = zc_win::overlay::prepare_toast(&title, x, y, CARD_W, CARD_H) {
         tracing::warn!(%error, "toast not shown: it can't be excluded from capture");
         let _ = handle.update(cx, |_, window, _| window.remove_window());
         return None;
     }
     cx.spawn(async move |cx| {
-        cx.background_executor().timer(HOLD).await;
+        // Re-raise now and then, so a game that takes the top-most place back does not hide it.
+        for _ in 0..(HOLD.as_millis() / 200) {
+            cx.background_executor().timer(Duration::from_millis(200)).await;
+            zc_win::overlay::keep_on_top(&title_for_timer);
+        }
         // A window closed by the user or the app makes `update` fail; that is fine.
         let _ = handle.update(cx, |view, _, cx| {
             view.closing = true;

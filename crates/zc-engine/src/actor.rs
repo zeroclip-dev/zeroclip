@@ -1650,6 +1650,7 @@ impl Actor {
             self.emit(EngineEvent::Warning("Nothing to save yet: capture hasn't started.".into()));
             return;
         };
+        self.emit(EngineEvent::ClipSaving);
         self.spawn_clip("clip", self.status.buffer_window, video);
     }
 

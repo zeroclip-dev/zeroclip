@@ -119,6 +119,19 @@ pub fn prepare_toast(title: &str, x: f32, y: f32, w: f32, h: f32) -> windows::co
     Ok(())
 }
 
+/// Puts the toast titled `title` back above every other top-most window, without activating it.
+/// A borderless game can re-assert its own top-most place after the toast showed, so the app calls
+/// this a few times while the card is up. Does nothing if the window is gone.
+pub fn keep_on_top(title: &str) {
+    let title = HSTRING::from(title);
+    // SAFETY: `title` is a valid NUL-terminated wide string that lives across the call.
+    let Ok(hwnd) = (unsafe { FindWindowW(PCWSTR::null(), &title) }) else { return };
+    // SAFETY: `hwnd` was just found; no move, resize or activation, only the z-order changes.
+    let _ = unsafe {
+        SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+    };
+}
+
 /// Whether the user has "Show animations in Windows" on
 /// ([`SPI_GETCLIENTAREAANIMATION`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-systemparametersinfow)).
 /// Returns `true` if the query fails, so motion is the default.
