@@ -24,6 +24,8 @@ pub enum Tab {
     Profiles,
     Editor,
     Settings,
+    /// Not in the top bar: reached by playing a clip.
+    Player,
 }
 
 impl Tab {
@@ -37,6 +39,7 @@ impl Tab {
             Tab::Profiles => "sliders-horizontal",
             Tab::Editor => "scissors",
             Tab::Settings => "settings",
+            Tab::Player => "play",
         }
     }
 
@@ -47,6 +50,7 @@ impl Tab {
             Tab::Profiles => "Profiles",
             Tab::Editor => "Editor",
             Tab::Settings => "Settings",
+            Tab::Player => "Player",
         }
     }
 }
@@ -222,6 +226,14 @@ impl ZeroClipApp {
             editor.open(path, watch, Some(prefs), ffmpeg, store, bitrate_bps, cx)
         });
         self.tab = Tab::Editor;
+        cx.notify();
+    }
+
+    /// Plays `path` in the video player.
+    pub fn play_clip(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let ffmpeg = self.settings.editor.ffmpeg_path.clone();
+        self.screens.player().update(cx, |player, cx| player.open(path, ffmpeg, cx));
+        self.tab = Tab::Player;
         cx.notify();
     }
 

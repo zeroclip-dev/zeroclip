@@ -12,6 +12,7 @@ pub mod profiles;
 pub mod rescue;
 pub mod settings;
 pub mod theme;
+pub mod video_player;
 
 use gpui::{
     Context, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled,
@@ -71,6 +72,9 @@ fn top_bar(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoElement
                 // Leaving the Editor stops its playback; it isn't drawn, so nothing else would.
                 if app.tab == Tab::Editor && tab != Tab::Editor {
                     app.screens.editor().clone().update(cx, |editor, cx| editor.pause(cx));
+                }
+                if app.tab == Tab::Player {
+                    app.screens.player().clone().update(cx, |player, cx| player.pause(cx));
                 }
                 app.tab = tab;
                 cx.notify();

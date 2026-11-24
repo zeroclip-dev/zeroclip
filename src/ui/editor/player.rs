@@ -144,9 +144,17 @@ pub struct Player {
     base: Hns,
     /// When the current piece began.
     started: Option<Instant>,
+    /// How fast it plays: 1.0 is normal. Zero (a fresh player) reads as 1.0. Takes effect on the
+    /// next `play`.
+    pub speed: f64,
 }
 
 impl Player {
+    /// The playback speed, 1.0 when none was set.
+    fn rate(&self) -> f64 {
+        if self.speed > 0.0 { self.speed } else { 1.0 }
+    }
+
     /// Whether the view still needs ticks: playing, or a frame is still on its way.
     pub fn busy(&self) -> bool {
         self.playing || self.decoder.is_some()
@@ -209,7 +217,8 @@ impl Player {
         if self.decoder.is_none() {
             return false;
         }
-        self.audio = item.sound.clone().and_then(|s| spawn_audio(ffmpeg, item, s));
+        let rate = self.rate();
+        self.audio = item.sound.clone().and_then(|s| spawn_audio(ffmpeg, item, s, rate));
         self.started = Some(Instant::now());
         true
     }
@@ -236,7 +245,9 @@ impl Player {
         }
         if self.playing {
             let Some(began) = self.started else { return self.busy() };
-            let mut elapsed = began.elapsed().as_secs_f64();
+            let rate = self.rate();
+            // Source seconds played: the wall clock, sped up or slowed down.
+            let mut elapsed = began.elapsed().as_secs_f64() * rate;
             while let Some(item) = self.items.front() {
                 let len = (item.to - item.from).as_secs_f64();
                 if elapsed < len {
@@ -324,7 +335,7 @@ fn stop_audio(mut audio: Child) {
 
 /// Starts `ffplay` with no window, for the sound of `item`'s track `sound.track`. `None` when
 /// ffplay isn't beside ffmpeg: the picture then plays without sound.
-fn spawn_audio(ffmpeg: &Ffmpeg, item: &Item, sound: Sound) -> Option<Child> {
+fn spawn_audio(ffmpeg: &Ffmpeg, item: &Item, sound: Sound, rate: f64) -> Option<Child> {
     let ffplay = ffmpeg.exe.with_file_name(if cfg!(windows) { "ffplay.exe" } else { "ffplay" });
     if !ffplay.is_file() {
         return None;
@@ -338,10 +349,27 @@ fn spawn_audio(ffmpeg: &Ffmpeg, item: &Item, sound: Sound) -> Option<Child> {
         .arg(format!("{:.3}", (item.to - item.from).as_secs_f64()));
     // The clock restarts at the seek, so a volume line counts from the start of what plays.
     let line = sound.line.as_deref().and_then(|l| zc_editor::ffmpeg::envelope_filter(l).ok());
+    let mut filters = Vec::new();
     if let Some(filter) = line {
-        cmd.arg("-af").arg(format!("asetpts=PTS-STARTPTS,{filter}"));
+        filters.push(format!("asetpts=PTS-STARTPTS,{filter}"));
     } else if sound.gain_db != 0.0 {
-        cmd.arg("-af").arg(format!("volume={}dB", sound.gain_db));
+        filters.push(format!("volume={}dB", sound.gain_db));
+    }
+    // atempo takes 0.5 to 2.0 a step, so faster or slower plays chain steps.
+    let mut left = rate;
+    while left > 2.0 {
+        filters.push("atempo=2.0".to_owned());
+        left /= 2.0;
+    }
+    while left < 0.5 {
+        filters.push("atempo=0.5".to_owned());
+        left /= 0.5;
+    }
+    if (left - 1.0).abs() > 1e-6 {
+        filters.push(format!("atempo={left:.4}"));
+    }
+    if !filters.is_empty() {
+        cmd.arg("-af").arg(filters.join(","));
     }
     // Its complaints go to a file, so a silent preview can be explained (see `tick`).
     let log = std::fs::File::create(audio_log()).map_or_else(|_| Stdio::null(), Stdio::from);

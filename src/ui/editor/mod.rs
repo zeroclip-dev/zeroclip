@@ -10,7 +10,7 @@
 
 mod export;
 mod model;
-mod player;
+pub mod player;
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -1540,7 +1540,20 @@ impl EditorView {
             let (x0, x1) = place(i);
             let w = (x1 - x0).max(1.0);
             let label = if w >= 150.0 {
-                format!("{}  {}", model::piece_label(i), model::secs_label(piece.span()))
+                let src = &self.sources[piece.source].info.duration;
+                let (cut_l, cut_r) = (piece.a, (*src - piece.b).max(Hns::ZERO));
+                let trimmed = if self.selected == Some(i)
+                    && (cut_l >= Hns::from_millis(200) || cut_r >= Hns::from_millis(200))
+                {
+                    format!(
+                        "  (trimmed {} / {})",
+                        model::secs_label(cut_l),
+                        model::secs_label(cut_r)
+                    )
+                } else {
+                    String::new()
+                };
+                format!("{}  {}{trimmed}", model::piece_label(i), model::secs_label(piece.span()))
             } else if w >= 60.0 {
                 model::piece_label(i)
             } else {
@@ -1652,6 +1665,41 @@ impl EditorView {
                         .bg(rgb(theme::MUTED))
                         .opacity(0.8),
                 );
+            }
+            // What was trimmed off the selected piece stays visible, grayed out, beside its edges
+            // (as much as fits in the free space around it); the handles above still trim it.
+            if selected && self.trim.is_none() {
+                let cut_l = piece.a;
+                let cut_r = (self.sources[piece.source].info.duration - piece.b).max(Hns::ZERO);
+                // Only the free space beside the piece: up to its neighbours or the lane's ends.
+                let room_l = if i > 0 { place(i - 1).1 } else { 0.0 };
+                let room_r =
+                    if i + 1 < self.timeline.pieces.len() { place(i + 1).0 } else { width };
+                for (cut, left) in [(cut_l, true), (cut_r, false)] {
+                    if cut < Hns::from_millis(200) {
+                        continue;
+                    }
+                    let want = x_of(cut) - x_of(Hns::ZERO);
+                    let (g0, g1) = if left {
+                        ((x0 - want).max(room_l), x0)
+                    } else {
+                        (x1, (x1 + want).min(room_r))
+                    };
+                    if g1 - g0 < 4.0 {
+                        continue;
+                    }
+                    video_lane = video_lane.child(
+                        div()
+                            .absolute()
+                            .left(px(g0))
+                            .w(px(g1 - g0))
+                            .h_full()
+                            .bg(rgb(theme::MUTED))
+                            .opacity(0.55)
+                            .border_1()
+                            .border_color(rgb(theme::MUTED_FG)),
+                    );
+                }
             }
             let tiles =
                 thumb_tiles(&self.sources[piece.source].thumbs, piece.a, piece.span(), x1 - x0);
