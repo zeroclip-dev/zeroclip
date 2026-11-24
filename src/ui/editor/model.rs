@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use zc_core::Hns;
-use zc_editor::ffmpeg::{AudioEdit, AudioTrack};
+use zc_editor::ffmpeg::{AudioEdit, AudioTrack, EnvelopePoint, SILENT_DB};
 use zc_editor::snap::snap_in_point;
 
 /// The shortest piece a split may leave.
@@ -31,31 +31,30 @@ pub fn x_to_time(x: f32, duration: Hns, width: f32) -> Hns {
     Hns::from_secs_f64(duration.as_secs_f64() * fraction)
 }
 
-/// Reduces `peaks` to `columns` values (the loudest peak of each group) for drawing.
-pub fn downsample(peaks: &[f32], columns: usize) -> Vec<f32> {
-    if peaks.is_empty() || columns == 0 {
-        return Vec::new();
+/// The loudest peak behind each of `columns` equal slices of `[a, b)` of the clip, for drawing a
+/// waveform. `peaks` cover one audio track, which starts at `span.0` and runs for `span.1`: that
+/// is not the clip's own length (a track starts a few milliseconds late and may end early), so
+/// time is placed by the track's span. A slice outside the track is 0.
+pub fn column_peaks(peaks: &[f32], span: (Hns, Hns), a: Hns, b: Hns, columns: usize) -> Vec<f32> {
+    if peaks.is_empty() || span.1 <= Hns::ZERO || b <= a || columns == 0 {
+        return vec![0.0; columns];
     }
-    let columns = columns.min(peaks.len());
+    let (start, len) = (span.0.as_secs_f64(), span.1.as_secs_f64());
+    let (a, b) = (a.as_secs_f64(), b.as_secs_f64());
+    let index = |t: f64| (t - start) / len * peaks.len() as f64;
     (0..columns)
         .map(|c| {
-            let span = &peaks[c * peaks.len() / columns..(c + 1) * peaks.len() / columns];
-            span.iter().copied().fold(0.0_f32, f32::max)
+            let t0 = a + (b - a) * c as f64 / columns as f64;
+            let t1 = a + (b - a) * (c + 1) as f64 / columns as f64;
+            let (i0, i1) = (index(t0), index(t1));
+            if i1 <= 0.0 || i0 >= peaks.len() as f64 {
+                return 0.0;
+            }
+            let from = i0.max(0.0) as usize;
+            let to = (i1.ceil() as usize).clamp(from + 1, peaks.len());
+            peaks[from..to].iter().copied().fold(0.0_f32, f32::max)
         })
         .collect()
-}
-
-/// The part of `peaks` (which spans `duration`) that covers `[a, b)`.
-pub fn peaks_between(peaks: &[f32], duration: Hns, a: Hns, b: Hns) -> &[f32] {
-    if peaks.is_empty() || duration <= Hns::ZERO {
-        return &[];
-    }
-    let at = |t: Hns| {
-        let f = (t.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0);
-        ((f * peaks.len() as f64) as usize).min(peaks.len())
-    };
-    let (from, to) = (at(a), at(b));
-    &peaks[from..to.max(from)]
 }
 
 /// "12.7 s".
@@ -63,30 +62,218 @@ pub fn secs_label(t: Hns) -> String {
     format!("{:.1} s", t.as_secs_f64())
 }
 
-/// One audio track of one piece, as the UI holds it.
+/// The loudest and quietest level a volume line may take, in decibels. The bottom is silence.
+pub const MIN_DB: f64 = SILENT_DB;
+pub const MAX_DB: f64 = 12.0;
+/// The closest two points of a volume line may be.
+const MIN_GAP: Hns = Hns::from_millis(50);
+
+/// A point of a volume line: where in the piece, and the level there.
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EnvPoint {
+    /// Time from the start of the piece.
+    pub at: Hns,
+    pub db: f64,
+}
+
+/// A level in dB as a fraction of the lane's height from the top: 0 is the loudest, 1 is silence.
+pub fn db_to_frac(db: f64) -> f32 {
+    ((MAX_DB - db.clamp(MIN_DB, MAX_DB)) / (MAX_DB - MIN_DB)) as f32
+}
+
+/// The inverse of [`db_to_frac`].
+pub fn frac_to_db(frac: f32) -> f64 {
+    MAX_DB - f64::from(frac.clamp(0.0, 1.0)) * (MAX_DB - MIN_DB)
+}
+
+/// One audio track of one piece, as the UI holds it: a flat level, or a line through `points`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct TrackEdit {
     pub gain_db: f64,
     /// A muted piece of a track is "deleted": it plays as silence and keeps its length.
     pub mute: bool,
+    /// A volume line, sorted by time, the first at 0 and the last at the end of the piece. Fewer
+    /// than two means no line: the track is flat at `gain_db`.
+    pub points: Vec<EnvPoint>,
 }
 
 impl Default for TrackEdit {
     fn default() -> Self {
-        Self { gain_db: 0.0, mute: false }
+        Self { gain_db: 0.0, mute: false, points: Vec::new() }
     }
 }
 
 impl TrackEdit {
+    /// The flat level: the bottom when muted.
+    pub fn flat_db(&self) -> f64 {
+        if self.mute { MIN_DB } else { self.gain_db }
+    }
+
+    /// Whether the volume follows a line, not a flat level.
+    pub fn has_line(&self) -> bool {
+        !self.mute && self.points.len() >= 2
+    }
+
+    /// Sets the flat level. At the bottom it mutes; anything above unmutes.
+    pub fn set_level(&mut self, db: f64) {
+        let db = db.clamp(MIN_DB, MAX_DB);
+        if db <= MIN_DB + 2.0 {
+            self.mute = true;
+            self.gain_db = 0.0;
+        } else {
+            self.mute = false;
+            self.gain_db = (db * 10.0).round() / 10.0;
+        }
+    }
+
+    /// The level `t` into a piece.
+    pub fn db_at(&self, t: Hns) -> f64 {
+        if !self.has_line() {
+            return self.flat_db();
+        }
+        let p = &self.points;
+        if t <= p[0].at {
+            return p[0].db;
+        }
+        for w in p.windows(2) {
+            if t <= w[1].at {
+                let f = (t - w[0].at).as_secs_f64() / (w[1].at - w[0].at).as_secs_f64();
+                return w[0].db + (w[1].db - w[0].db) * f;
+            }
+        }
+        p[p.len() - 1].db
+    }
+
+    /// Puts a point at `at` (a piece `span` long) at level `db`; the first one also pins both ends
+    /// at the old flat level. Returns the new point's index.
+    pub fn add_point(&mut self, at: Hns, db: f64, span: Hns) -> usize {
+        if self.points.len() < 2 {
+            let base = if self.mute { 0.0 } else { self.gain_db };
+            self.mute = false;
+            self.points =
+                vec![EnvPoint { at: Hns::ZERO, db: base }, EnvPoint { at: span, db: base }];
+        }
+        let at = at.clamp(MIN_GAP, span - MIN_GAP);
+        let i = self.points.partition_point(|p| p.at < at);
+        self.points.insert(i, EnvPoint { at, db: db.clamp(MIN_DB, MAX_DB) });
+        self.move_point(i, at, db, span);
+        i
+    }
+
+    /// Moves point `i`. The ends keep their place in time; the others stay between their
+    /// neighbours.
+    pub fn move_point(&mut self, i: usize, at: Hns, db: f64, span: Hns) {
+        let last = self.points.len().saturating_sub(1);
+        if i > last {
+            return;
+        }
+        let at = if i == 0 {
+            Hns::ZERO
+        } else if i == last {
+            span
+        } else {
+            at.clamp(self.points[i - 1].at + MIN_GAP, self.points[i + 1].at - MIN_GAP)
+        };
+        self.points[i] = EnvPoint { at, db: db.clamp(MIN_DB, MAX_DB) };
+    }
+
+    /// Removes point `i`. With nothing left to draw a line through, the track goes flat.
+    pub fn remove_point(&mut self, i: usize) {
+        if i < self.points.len() {
+            self.points.remove(i);
+        }
+        self.simplify();
+    }
+
+    /// Drops a line that does nothing: fewer than two points, or all at one level.
+    pub fn simplify(&mut self) {
+        let flat = match self.points.as_slice() {
+            [] => return,
+            [only] => Some(only.db),
+            [first, rest @ ..] if rest.iter().all(|p| (p.db - first.db).abs() < 0.05) => {
+                Some(first.db)
+            }
+            _ => None,
+        };
+        if let Some(db) = flat {
+            self.points.clear();
+            self.set_level(db);
+        }
+    }
+
+    /// The line to draw and hit-test: the points, or the flat level across a piece `span` long.
+    pub fn line(&self, span: Hns) -> Vec<EnvPoint> {
+        if self.has_line() {
+            self.points.clone()
+        } else {
+            let db = self.flat_db();
+            vec![EnvPoint { at: Hns::ZERO, db }, EnvPoint { at: span, db }]
+        }
+    }
+
     /// What ffmpeg does to the track.
-    pub fn audio_edit(self) -> AudioEdit {
+    pub fn audio_edit(&self) -> AudioEdit {
         if self.mute {
             AudioEdit::Mute
+        } else if self.points.len() >= 2 {
+            AudioEdit::Envelope {
+                points: self
+                    .points
+                    .iter()
+                    .map(|p| EnvelopePoint { secs: p.at.as_secs_f64(), db: p.db })
+                    .collect(),
+            }
         } else if self.gain_db != 0.0 {
             AudioEdit::Gain { db: self.gain_db }
         } else {
             AudioEdit::Keep
         }
+    }
+
+    /// The two halves when the piece (`span` long) is cut `at` into it. A line is cut with a point
+    /// on the cut in both halves, so the sound is the same either side of it.
+    pub fn split(&self, at: Hns, span: Hns) -> (Self, Self) {
+        if !self.has_line() {
+            return (self.clone(), self.clone());
+        }
+        let db = self.db_at(at);
+        let mut left = self.clone();
+        left.points = self.points.iter().copied().filter(|p| p.at < at).collect();
+        left.points.push(EnvPoint { at, db });
+        let mut right = self.clone();
+        right.points = std::iter::once(EnvPoint { at: Hns::ZERO, db })
+            .chain(
+                self.points
+                    .iter()
+                    .filter(|p| p.at > at)
+                    .map(|p| EnvPoint { at: p.at - at, db: p.db }),
+            )
+            .collect();
+        debug_assert!(right.points.last().is_some_and(|p| p.at <= span - at));
+        left.simplify();
+        right.simplify();
+        (left, right)
+    }
+
+    /// This track of a piece `len` long followed by `next` of the piece after it: one track for the
+    /// joined piece. Equal flat levels stay flat; anything else becomes a line.
+    pub fn joined(&self, len: Hns, next: &Self, next_len: Hns) -> Self {
+        if !self.has_line() && !next.has_line() && self.flat_db() == next.flat_db() {
+            return self.clone();
+        }
+        let mut points = self.line(len);
+        // The step at the join gets a short ramp, so two points never share a time.
+        points.extend(
+            next.line(next_len)
+                .into_iter()
+                .map(|p| EnvPoint { at: len + p.at + MIN_GAP, db: p.db }),
+        );
+        if let Some(p) = points.last_mut() {
+            p.at = len + next_len;
+        }
+        let mut out = Self { gain_db: 0.0, mute: false, points };
+        out.simplify();
+        out
     }
 }
 
@@ -146,17 +333,50 @@ impl Timeline {
     pub fn split(&mut self, t: Hns, keyframes: &[Hns]) -> Result<usize, String> {
         let (i, at) = self.locate(t).ok_or("There is nothing to split.")?;
         let piece = &self.pieces[i];
-        let cut = snap_in_point(keyframes, at).unwrap_or(Hns::ZERO);
-        if cut < piece.a + MIN_PIECE || cut > piece.b - MIN_PIECE || at > piece.b - MIN_PIECE {
-            return Err("Cuts land on keyframes, and there is none here. Move the playhead \
-                        a little further in."
-                .to_owned());
-        }
+        // A stream copy can only start on a keyframe, so the cut goes on the keyframe nearest the
+        // playhead (before or after it) that leaves both pieces long enough.
+        let distance = |k: Hns| (k.as_secs_f64() - at.as_secs_f64()).abs();
+        let cut = keyframes
+            .iter()
+            .copied()
+            .filter(|&k| k >= piece.a + MIN_PIECE && k <= piece.b - MIN_PIECE)
+            .min_by(|&x, &y| distance(x).total_cmp(&distance(y)))
+            .ok_or("There is no keyframe inside this piece to cut on, so it can't be split.")?;
+        let (span, offset) = (piece.span(), cut - piece.a);
+        let halves: Vec<(TrackEdit, TrackEdit)> =
+            piece.tracks.iter().map(|t| t.split(offset, span)).collect();
         let mut second = piece.clone();
         second.a = cut;
+        second.tracks = halves.iter().map(|h| h.1.clone()).collect();
         self.pieces[i].b = cut;
+        self.pieces[i].tracks = halves.into_iter().map(|h| h.0).collect();
         self.pieces.insert(i + 1, second);
         Ok(i + 1)
+    }
+
+    /// Joins piece `i` and the one after it back into one, when they are neighbours in the same
+    /// clip (what a split made). Returns the joined piece's index.
+    pub fn join(&mut self, i: usize) -> Result<usize, String> {
+        let (Some(first), Some(second)) = (self.pieces.get(i), self.pieces.get(i + 1)) else {
+            return Err("There is no piece after this one to join.".to_owned());
+        };
+        let gap = (second.a.as_secs_f64() - first.b.as_secs_f64()).abs();
+        if first.source != second.source || gap > 0.001 {
+            return Err("These two pieces aren't side by side in the same clip, so they can't \
+                        be joined. Undo the changes between them, or add the clip again."
+                .to_owned());
+        }
+        let (len, next_len) = (first.span(), second.span());
+        let tracks = first
+            .tracks
+            .iter()
+            .zip(&second.tracks)
+            .map(|(x, y)| x.joined(len, y, next_len))
+            .collect();
+        let joined = Piece { source: first.source, a: first.a, b: second.b, tracks };
+        self.pieces[i] = joined;
+        self.pieces.remove(i + 1);
+        Ok(i)
     }
 
     /// Removes piece `i`; the ones after it move up.
@@ -291,27 +511,75 @@ mod tests {
     }
 
     #[test]
-    fn downsample_keeps_the_loudest_of_each_group() {
-        assert_eq!(downsample(&[0.1, 0.9, 0.2, 0.3], 2), [0.9, 0.3]);
-        assert_eq!(downsample(&[0.5], 10), [0.5]);
-        assert!(downsample(&[], 4).is_empty());
+    fn waveform_columns_follow_the_tracks_own_span() {
+        // Ten peaks over a track that starts at 1 s and runs 10 s; the clip is longer.
+        let peaks: Vec<f32> = (1..=10).map(|i| i as f32).collect();
+        let span = (secs(1), secs(10));
+        // Before the track starts there is silence; then peak 1, 2, ... in order.
+        assert_eq!(column_peaks(&peaks, span, secs(0), secs(3), 3), [0.0, 1.0, 2.0]);
+        // Past the end is silence again.
+        assert_eq!(column_peaks(&peaks, span, secs(10), secs(13), 3), [10.0, 0.0, 0.0]);
+        assert_eq!(column_peaks(&[], span, secs(0), secs(3), 2), [0.0, 0.0]);
     }
 
     #[test]
-    fn a_piece_takes_its_share_of_the_peaks() {
-        let peaks: Vec<f32> = (0..10).map(|i| i as f32).collect();
-        assert_eq!(peaks_between(&peaks, secs(10), secs(2), secs(5)), [2.0, 3.0, 4.0]);
-        assert!(peaks_between(&[], secs(10), secs(0), secs(5)).is_empty());
-        assert!(peaks_between(&peaks, secs(10), secs(7), secs(3)).is_empty());
+    fn a_volume_line_is_cut_and_rejoined_without_changing_the_sound() {
+        let mut t = one(20);
+        let span = secs(20);
+        // Dip to -20 dB in the middle of the 20 s piece.
+        t.pieces[0].tracks[0].add_point(secs(10), -20.0, span);
+        let before: Vec<f64> = (0..=20).map(|s| t.pieces[0].tracks[0].db_at(secs(s))).collect();
+        t.split(secs(10), &keyframes()).unwrap();
+        // Each half carries a point on the cut at the same level.
+        assert_eq!(t.pieces[0].tracks[0].db_at(secs(10)), -20.0);
+        assert_eq!(t.pieces[1].tracks[0].db_at(Hns::ZERO), -20.0);
+        t.join(0).unwrap();
+        assert_eq!(t.pieces.len(), 1);
+        assert_eq!((t.pieces[0].a, t.pieces[0].b), (Hns::ZERO, secs(20)));
+        let after: Vec<f64> = (0..=20).map(|s| t.pieces[0].tracks[0].db_at(secs(s))).collect();
+        for (x, y) in before.iter().zip(&after) {
+            assert!((x - y).abs() < 1.5, "{before:?} vs {after:?}");
+        }
     }
 
     #[test]
-    fn splitting_cuts_on_the_keyframe_before_the_playhead() {
+    fn pieces_from_different_places_do_not_join() {
+        let mut t = one(20);
+        t.split(secs(6), &keyframes()).unwrap();
+        t.split(secs(12), &keyframes()).unwrap();
+        t.delete(1);
+        assert!(t.join(0).is_err());
+        assert!(t.join(1).is_err(), "nothing after the last piece");
+    }
+
+    #[test]
+    fn dragging_a_flat_level_to_the_bottom_mutes_and_back_up_unmutes() {
+        let mut e = TrackEdit::default();
+        e.set_level(-59.0);
+        assert!(e.mute);
+        assert_eq!(e.audio_edit(), AudioEdit::Mute);
+        e.set_level(-6.04);
+        assert!(!e.mute);
+        assert_eq!(e.audio_edit(), AudioEdit::Gain { db: -6.0 });
+    }
+
+    #[test]
+    fn a_line_with_every_point_at_one_level_goes_flat() {
+        let mut e = TrackEdit::default();
+        let i = e.add_point(secs(5), -10.0, secs(10));
+        assert!(e.has_line());
+        e.remove_point(i);
+        assert!(!e.has_line());
+        assert_eq!(e.audio_edit(), AudioEdit::Keep);
+    }
+
+    #[test]
+    fn splitting_cuts_on_the_keyframe_nearest_the_playhead() {
         let mut t = one(20);
         let second = t.split(Hns::from_millis(5_300), &keyframes()).unwrap();
         assert_eq!(second, 1);
-        assert_eq!((t.pieces[0].a, t.pieces[0].b), (Hns::ZERO, secs(4)));
-        assert_eq!((t.pieces[1].a, t.pieces[1].b), (secs(4), secs(20)));
+        assert_eq!((t.pieces[0].a, t.pieces[0].b), (Hns::ZERO, secs(6)));
+        assert_eq!((t.pieces[1].a, t.pieces[1].b), (secs(6), secs(20)));
         // Nothing is lost or repeated.
         assert_eq!(t.total(), secs(20));
     }
@@ -319,9 +587,12 @@ mod tests {
     #[test]
     fn a_split_with_no_keyframe_between_is_refused() {
         let mut t = one(20);
-        assert!(t.split(Hns::from_millis(300), &keyframes()).is_err());
-        assert!(t.split(secs(20), &keyframes()).is_err());
+        assert!(t.split(Hns::from_millis(300), &[Hns::ZERO]).is_err());
         assert_eq!(t.pieces.len(), 1);
+        // Splitting again right after a split still works: the next keyframe is used.
+        t.split(secs(10), &keyframes()).unwrap();
+        t.split(Hns::from_millis(10_500), &keyframes()).unwrap();
+        assert_eq!(t.pieces.len(), 3);
     }
 
     #[test]

@@ -113,7 +113,16 @@ impl Ffmpeg {
             .map_err(|stderr| FfmpegError::Failed { stderr })?;
         let packets = run(&ffprobe, &keyframe_args(path))?;
         let keyframes = parse_keyframes(&String::from_utf8_lossy(&packets), start);
-        Ok(ProbeInfo { stream, duration, keyframes })
+        let audio_names = parse_audio_names(&String::from_utf8_lossy(&streams));
+        // A second, small query: the format section of the first one would blur which `duration`
+        // belongs to which stream. An unreadable span just means that track gets the whole clip.
+        let spans = run(&ffprobe, &audio_span_args(path))
+            .map(|out| parse_audio_spans(&String::from_utf8_lossy(&out)))
+            .unwrap_or_default();
+        let audio_spans = (0..usize::from(stream.audio_tracks))
+            .map(|i| spans.get(i).copied().flatten().unwrap_or((Hns::ZERO, duration)))
+            .collect();
+        Ok(ProbeInfo { stream, duration, keyframes, audio_names, audio_spans })
     }
 
     /// Writes the frame of `input` at `at` to `output` as a small JPEG, for the clip list.
@@ -185,6 +194,13 @@ pub struct ProbeInfo {
     pub duration: Hns,
     /// Keyframe times, relative to the first frame (sorted).
     pub keyframes: Vec<Hns>,
+    /// The name of each audio track (the recorder writes Master, Game, Mic, then app labels).
+    /// Empty when the file has none, or only the muxer's default.
+    pub audio_names: Vec<String>,
+    /// Where each audio track starts in the file and how long it runs. The tracks start a few
+    /// milliseconds late and can end well before the video, so a waveform is placed by these, not
+    /// by the container's length.
+    pub audio_spans: Vec<(Hns, Hns)>,
 }
 
 /// The first existing `name` beside the running executable (a bundled ffmpeg).
@@ -232,7 +248,7 @@ fn last_lines(text: &str, n: usize) -> String {
 fn stream_args(path: &Path) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["-v", "error", "-show_entries"].map(OsString::from).to_vec();
     args.push(
-        "stream=codec_type,codec_name,width,height,avg_frame_rate:format=duration,start_time"
+        "stream=codec_type,codec_name,width,height,avg_frame_rate:stream_tags=handler_name:format=duration,start_time"
             .into(),
     );
     args.extend(["-of", "default=noprint_wrappers=1"].map(OsString::from));
@@ -308,6 +324,62 @@ fn parse_streams(text: &str) -> Result<(StreamInfo, Hns, Hns), String> {
     let stream =
         StreamInfo { codec, size, fps, audio_tracks: u8::try_from(audio).unwrap_or(u8::MAX) };
     Ok((stream, duration, start))
+}
+
+/// ffprobe arguments for each audio stream's start time and duration, in stream order.
+fn audio_span_args(path: &Path) -> Vec<OsString> {
+    let mut args: Vec<OsString> =
+        ["-v", "error", "-select_streams", "a", "-show_entries"].map(OsString::from).to_vec();
+    args.push("stream=start_time,duration".into());
+    args.extend(["-of", "default=noprint_wrappers=1"].map(OsString::from));
+    args.push(os(path));
+    args
+}
+
+/// Start and length of each audio stream from [`audio_span_args`] output. `None` for a stream
+/// whose values ffprobe reports as `N/A`.
+fn parse_audio_spans(text: &str) -> Vec<Option<(Hns, Hns)>> {
+    let mut spans: Vec<(Option<f64>, Option<f64>)> = Vec::new();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        match key {
+            "start_time" => spans.push((value.parse().ok(), None)),
+            "duration" => {
+                if let Some(last) = spans.last_mut() {
+                    last.1 = value.parse().ok();
+                }
+            }
+            _ => {}
+        }
+    }
+    spans
+        .into_iter()
+        .map(|(start, len)| Some((Hns::from_secs_f64(start?), Hns::from_secs_f64(len?))))
+        .collect()
+}
+
+/// The track name of each audio stream, from the `handler_name` tag, in stream order. A stream
+/// with no tag, or only the default `SoundHandler`, gets an empty name.
+fn parse_audio_names(text: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut in_audio = false;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        match key {
+            "codec_name" => in_audio = false,
+            "codec_type" if value == "audio" => {
+                in_audio = true;
+                names.push(String::new());
+            }
+            "TAG:handler_name" if in_audio && value != "SoundHandler" => {
+                if let Some(last) = names.last_mut() {
+                    *last = value.to_owned();
+                }
+            }
+            _ => {}
+        }
+    }
+    names
 }
 
 fn parse_dim(value: Option<&str>) -> Result<u32, String> {
@@ -482,7 +554,7 @@ pub fn frames_args(
 
 /// What the editor does to one audio track (D38). Anything but `Keep` re-encodes that track to
 /// AAC; video is never re-encoded.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum AudioEdit {
     /// Stream-copy the track as it is.
     Keep,
@@ -493,6 +565,13 @@ pub enum AudioEdit {
     },
     /// Silence the whole track.
     Mute,
+    /// A volume that follows a line through `points`: straight between them in decibels, flat
+    /// before the first and after the last. At least two, in time order. A level at or below
+    /// [`SILENT_DB`] is silence.
+    Envelope {
+        /// The points of the line.
+        points: Vec<EnvelopePoint>,
+    },
     /// Silence `[start, end)`. The track keeps its length, so it stays in sync with the video.
     Silence {
         /// Where the silence starts.
@@ -510,8 +589,20 @@ pub enum AudioEdit {
     },
 }
 
-/// One audio track of the source, with its bitrate so a re-encode can match it.
+/// The level at and below which an [`AudioEdit::Envelope`] is silent, in decibels.
+pub const SILENT_DB: f64 = -60.0;
+
+/// One point of a volume line: a time into the piece (seconds) and a level (decibels).
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EnvelopePoint {
+    /// Seconds from the start of the piece.
+    pub secs: f64,
+    /// Decibels; finite.
+    pub db: f64,
+}
+
+/// One audio track of the source, with its bitrate so a re-encode can match it.
+#[derive(Clone, Debug, PartialEq)]
 pub struct AudioTrack {
     /// What to do to this track.
     pub edit: AudioEdit,
@@ -532,7 +623,7 @@ pub fn audio_edit_args(
 ) -> Result<Vec<OsString>, FfmpegError> {
     let mut chains = Vec::new();
     for (i, track) in tracks.iter().enumerate() {
-        if let Some(chain) = track_chain(i, track.edit)? {
+        if let Some(chain) = track_chain(i, &track.edit)? {
             chains.push(chain);
         }
     }
@@ -566,10 +657,10 @@ pub fn audio_edit_args(
 }
 
 /// The filter chain for audio track `i`, labelled `[a{i}]`. `None` for `Keep`.
-fn track_chain(i: usize, edit: AudioEdit) -> Result<Option<String>, FfmpegError> {
+fn track_chain(i: usize, edit: &AudioEdit) -> Result<Option<String>, FfmpegError> {
     let input = format!("[0:a:{i}]");
     let out = format!("[a{i}]");
-    let chain = match edit {
+    let chain = match *edit {
         AudioEdit::Keep => return Ok(None),
         AudioEdit::Gain { db } => {
             if !db.is_finite() {
@@ -578,6 +669,9 @@ fn track_chain(i: usize, edit: AudioEdit) -> Result<Option<String>, FfmpegError>
             format!("{input}volume={db}dB{out}")
         }
         AudioEdit::Mute => format!("{input}volume=0{out}"),
+        AudioEdit::Envelope { ref points } => {
+            format!("{input}volume=volume='{}':eval=frame{out}", envelope_expr(points)?)
+        }
         AudioEdit::Silence { start, end } => {
             let (a, b) = cut_times(start, end)?;
             // `\,` keeps the comma inside `between(...)` from ending the filter option.
@@ -600,6 +694,36 @@ fn track_chain(i: usize, edit: AudioEdit) -> Result<Option<String>, FfmpegError>
         }
     };
     Ok(Some(chain))
+}
+
+/// The `volume` filter expression for a volume line: the gain (linear) at time `t`. The level in
+/// decibels is a chain of `if(lt(t,..))` straight pieces, and silence is written as exactly 0.
+/// Commas are escaped (`\,`) so they don't end the filter option.
+fn envelope_expr(points: &[EnvelopePoint]) -> Result<String, FfmpegError> {
+    if points.len() < 2 {
+        return Err(bad_audio("a volume line needs at least two points"));
+    }
+    if points.iter().any(|p| !p.secs.is_finite() || !p.db.is_finite() || p.secs < 0.0)
+        || points.windows(2).any(|w| w[1].secs <= w[0].secs)
+    {
+        return Err(bad_audio("volume line points must be finite and in time order"));
+    }
+    let last = points[points.len() - 1];
+    let mut db = format!("{:.3}", last.db);
+    for w in points.windows(2).rev() {
+        let (a, b) = (w[0], w[1]);
+        db = format!(
+            r"if(lt(t\,{:.4})\,{:.3}+({:.3})*(t-{:.4})/{:.4}\,{db})",
+            b.secs,
+            a.db,
+            b.db - a.db,
+            a.secs,
+            b.secs - a.secs
+        );
+    }
+    let first = points[0];
+    let db = format!(r"if(lt(t\,{:.4})\,{:.3}\,{db})", first.secs, first.db);
+    Ok(format!(r"if(lte({db}\,{SILENT_DB})\,0\,pow(10\,({db})/20))"))
 }
 
 /// Checks a cut range and formats both ends as ffmpeg seconds.
@@ -805,6 +929,23 @@ mod tests {
     }
 
     #[test]
+    fn an_envelope_becomes_a_timed_volume_expression() {
+        let points =
+            vec![EnvelopePoint { secs: 0.0, db: 0.0 }, EnvelopePoint { secs: 2.0, db: -60.0 }];
+        let tracks = [AudioTrack { edit: AudioEdit::Envelope { points }, bitrate_bps: 128_000 }];
+        let args = audio_edit_args(Path::new("in.mp4"), Path::new("o.mp4"), &tracks).unwrap();
+        let chain = &strs(&args)[8];
+        assert!(chain.starts_with("[0:a:0]volume=volume='if(lte("), "{chain}");
+        assert!(chain.ends_with(":eval=frame[a0]"), "{chain}");
+        assert!(chain.contains(r"if(lt(t\,2.0000)\,0.000+(-60.000)*(t-0.0000)/2.0000\,-60.000)"));
+        let one = [EnvelopePoint { secs: 0.0, db: 0.0 }];
+        assert!(envelope_expr(&one).is_err());
+        let backwards =
+            [EnvelopePoint { secs: 1.0, db: 0.0 }, EnvelopePoint { secs: 1.0, db: -3.0 }];
+        assert!(envelope_expr(&backwards).is_err());
+    }
+
+    #[test]
     fn mute_silences_the_whole_track() {
         let tracks = [AudioTrack { edit: AudioEdit::Mute, bitrate_bps: 96_000 }];
         let args = audio_edit_args(Path::new("in.mp4"), Path::new("o.mp4"), &tracks).unwrap();
@@ -851,7 +992,7 @@ mod tests {
         let negative = AudioEdit::Remove { start: Hns(-1), end: Hns::from_secs(1) };
         let nan = AudioEdit::Gain { db: f64::NAN };
         for edit in [bad_cut, negative, nan] {
-            let tracks = [AudioTrack { edit, bitrate_bps: 128_000 }];
+            let tracks = [AudioTrack { edit: edit.clone(), bitrate_bps: 128_000 }];
             assert!(audio_edit_args(Path::new("i"), Path::new("o"), &tracks).is_err(), "{edit:?}");
         }
     }
@@ -889,6 +1030,37 @@ start_time=0.250000
         assert_eq!(stream.audio_tracks, 2);
         assert_eq!(duration, Hns::from_millis(12_500));
         assert_eq!(start, Hns::from_millis(250));
+    }
+
+    #[test]
+    fn audio_spans_pair_each_start_with_its_duration() {
+        let text = "start_time=0.020904\nduration=2.132904\nstart_time=N/A\nduration=1.0\n";
+        let spans = parse_audio_spans(text);
+        assert_eq!(spans[0], Some((Hns::from_secs_f64(0.020904), Hns::from_secs_f64(2.132904))));
+        assert_eq!(spans[1], None);
+    }
+
+    #[test]
+    fn audio_track_names_come_from_the_handler_tags() {
+        let text = [
+            "codec_name=h264",
+            "codec_type=video",
+            "codec_name=aac",
+            "codec_type=audio",
+            "TAG:handler_name=Master",
+            "codec_name=aac",
+            "codec_type=audio",
+            "TAG:handler_name=SoundHandler",
+            "codec_name=aac",
+            "codec_type=audio",
+            "TAG:handler_name=Spotify",
+            "duration=5.0",
+        ]
+        .join(
+            "
+",
+        );
+        assert_eq!(parse_audio_names(&text), ["Master", "", "Spotify"]);
     }
 
     #[test]

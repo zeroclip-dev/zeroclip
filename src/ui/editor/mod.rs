@@ -12,7 +12,7 @@ mod export;
 mod model;
 mod player;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -54,7 +54,13 @@ const VIDEO_LANE_HEIGHT: f32 = 44.0;
 const LANE_HEIGHT: f32 = 40.0;
 /// One waveform bar is at least this far from the previous one.
 const BAR_STEP: f32 = 3.0;
-const VIDEO_HEIGHT: f32 = 360.0;
+/// The picture's height is this share of the window's, within these limits.
+const VIDEO_SHARE: f32 = 0.5;
+const VIDEO_MIN: f32 = 300.0;
+const VIDEO_MAX: f32 = 760.0;
+/// The editing panel beside the picture, and the window width from which it sits beside it.
+const SIDE_WIDTH: f32 = 380.0;
+const WIDE: f32 = 1_100.0;
 /// How often the picture is refreshed while playing.
 const TICK: Duration = Duration::from_millis(16);
 /// Pieces are tinted in turn so neighbours read as separate.
@@ -109,7 +115,16 @@ pub struct EditorView {
     /// The remembered choice for Done, and the audio track the preview plays.
     finish: FinishChoice,
     listen: usize,
+    /// Every audio track is shown and editable; otherwise only Master.
+    tracks_open: bool,
     focus: Option<FocusHandle>,
+    /// Each audio lane's bounds from the last paint, to turn a mouse position into a level.
+    lanes: Rc<RefCell<Vec<Bounds<Pixels>>>>,
+    /// The volume point being dragged: piece, track, point.
+    drag: Option<(usize, usize, usize)>,
+    /// Earlier and undone states of the pieces.
+    undo: Vec<Vec<Piece>>,
+    redo: Vec<Vec<Piece>>,
 }
 
 impl EditorView {
@@ -129,6 +144,10 @@ impl EditorView {
             strip: Rc::new(Cell::new(Bounds::default())),
             drawn_width: 0.0,
             scrubbing: false,
+            lanes: Rc::default(),
+            drag: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
             player: Player::default(),
             ticking: false,
             picking: false,
@@ -137,6 +156,7 @@ impl EditorView {
             remember: false,
             finish: FinishChoice::Ask,
             listen: 0,
+            tracks_open: false,
             focus: None,
         }
     }
@@ -156,6 +176,9 @@ impl EditorView {
         self.bitrate_bps = bitrate_bps;
         self.sources.clear();
         self.timeline = Timeline::default();
+        self.undo.clear();
+        self.redo.clear();
+        self.drag = None;
         self.selected = None;
         self.loading.clear();
         self.problem = None;
@@ -228,6 +251,7 @@ impl EditorView {
                 let index = self.sources.len();
                 let name =
                     path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                self.checkpoint();
                 self.timeline.pieces.push(Piece {
                     source: index,
                     a: Hns::ZERO,
@@ -348,6 +372,14 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Stops playback, picture and sound. Called when the user leaves the Editor tab.
+    pub fn pause(&mut self, cx: &mut Context<Self>) {
+        if self.player.playing {
+            self.player.pause();
+            cx.notify();
+        }
+    }
+
     /// Play from the playhead, or pause. At the very end it starts over.
     fn toggle_play(&mut self, cx: &mut Context<Self>) {
         if self.player.playing {
@@ -383,7 +415,8 @@ impl EditorView {
     /// What the preview plays for `piece`: the listened-to track, unless it is muted.
     fn sound_of(&self, piece: &Piece) -> Option<Sound> {
         let track = self.listen.min(piece.tracks.len().checked_sub(1)?);
-        let edit = piece.tracks[track];
+        let edit = &piece.tracks[track];
+        // ponytail: the preview plays the flat level; a volume line is heard only in the export.
         (!edit.mute).then_some(Sound { track, gain_db: edit.gain_db })
     }
 
@@ -417,14 +450,136 @@ impl EditorView {
         .detach();
     }
 
+    fn release(&mut self) {
+        self.scrubbing = false;
+        self.drag = None;
+    }
+
+    /// Where, in piece `i`, timeline x `x` falls, as time from the piece's start.
+    fn piece_time(&self, i: usize, x: Pixels) -> Hns {
+        let t = self.time_at(x) - self.timeline.start_of(i);
+        t.clamp(Hns::ZERO, self.timeline.pieces[i].span())
+    }
+
+    /// A press on audio lane `t`: grabs a volume point (Shift removes it), starts a new one on the
+    /// line, or else scrubs.
+    fn press_lane(&mut self, t: usize, ev: &MouseDownEvent, cx: &mut Context<Self>) {
+        const GRAB: f32 = 9.0;
+        let lane = self.lanes.borrow().get(t).copied();
+        let here = self.time_at(ev.position.x);
+        let (Some(lane), Some((i, _))) = (lane, self.timeline.locate(here)) else {
+            self.scrubbing = true;
+            self.seek(here, cx);
+            return;
+        };
+        let span = self.timeline.pieces[i].span();
+        let bounds = self.strip.get();
+        let total = self.timeline.total();
+        let to_x = |at: Hns| {
+            model::time_to_x(self.timeline.start_of(i) + at, total, f32::from(bounds.size.width))
+        };
+        let (mx, my) =
+            (f32::from(ev.position.x - bounds.origin.x), f32::from(ev.position.y - lane.origin.y));
+        let y_of = |db: f64| model::db_to_frac(db) * LANE_HEIGHT;
+        let edit = &self.timeline.pieces[i].tracks[t];
+        let line = edit.line(span);
+        let near = |pt: &model::EnvPoint| {
+            (to_x(pt.at) - mx).abs() <= GRAB && (y_of(pt.db) - my).abs() <= GRAB
+        };
+        let grabbed = if edit.has_line() { line.iter().position(near) } else { None };
+        let at = self.piece_time(i, ev.position.x);
+        let on_line = (y_of(edit.db_at(at)) - my).abs() <= GRAB && at > Hns::ZERO && at < span;
+        if let Some(k) = grabbed {
+            self.checkpoint();
+            self.selected = Some(i);
+            if ev.modifiers.shift {
+                if k != 0 && k + 1 != line.len() {
+                    self.timeline.pieces[i].tracks[t].remove_point(k);
+                }
+            } else {
+                self.drag = Some((i, t, k));
+            }
+            cx.notify();
+        } else if on_line {
+            self.checkpoint();
+            self.selected = Some(i);
+            let db = model::frac_to_db(my / LANE_HEIGHT);
+            let k = self.timeline.pieces[i].tracks[t].add_point(at, db, span);
+            self.drag = Some((i, t, k));
+            cx.notify();
+        } else {
+            self.scrubbing = true;
+            self.seek(here, cx);
+        }
+    }
+
+    /// Moves the grabbed volume point to the mouse.
+    fn drag_point(&mut self, ev: &MouseMoveEvent) {
+        let Some((i, t, k)) = self.drag else { return };
+        let Some(lane) = self.lanes.borrow().get(t).copied() else { return };
+        if i >= self.timeline.pieces.len() {
+            return;
+        }
+        let span = self.timeline.pieces[i].span();
+        let at = self.piece_time(i, ev.position.x);
+        let frac = f32::from(ev.position.y - lane.origin.y) / LANE_HEIGHT;
+        self.timeline.pieces[i].tracks[t].move_point(k, at, model::frac_to_db(frac), span);
+    }
+
+    /// Remembers the pieces as they are, before a change.
+    fn checkpoint(&mut self) {
+        self.undo.push(self.timeline.pieces.clone());
+        if self.undo.len() > 100 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    /// Steps back (`forward` false) or forward through the history.
+    fn step_history(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let (from, to) = if forward {
+            (&mut self.redo, &mut self.undo)
+        } else {
+            (&mut self.undo, &mut self.redo)
+        };
+        let Some(state) = from.pop() else { return };
+        to.push(std::mem::replace(&mut self.timeline.pieces, state));
+        self.problem = None;
+        self.drag = None;
+        let at = self.player.playhead.min(self.timeline.total());
+        self.selected = self.timeline.locate(at).map(|l| l.0);
+        self.seek(at, cx);
+        cx.notify();
+    }
+
+    /// Joins the selected piece to the one after it.
+    fn join_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(i) = self.selected else { return };
+        self.checkpoint();
+        match self.timeline.join(i) {
+            Ok(j) => {
+                self.problem = None;
+                self.selected = Some(j);
+            }
+            Err(message) => {
+                self.undo.pop();
+                self.problem = Some(message);
+            }
+        }
+        cx.notify();
+    }
+
     /// Cuts the piece under the playhead in two.
     fn split(&mut self, cx: &mut Context<Self>) {
         let Some(i) = self.selected else { return };
         let Some(piece) = self.timeline.pieces.get(i) else { return };
         let keyframes = &self.sources[piece.source].info.keyframes;
         let at = self.player.playhead;
+        let before = self.timeline.pieces.clone();
         match self.timeline.split(at, keyframes) {
             Ok(new) => {
+                self.undo.push(before);
+                self.redo.clear();
                 self.problem = None;
                 self.selected = Some(new);
             }
@@ -437,6 +592,7 @@ impl EditorView {
     fn delete_selected(&mut self, cx: &mut Context<Self>) {
         let Some(i) = self.selected else { return };
         let at = self.timeline.start_of(i);
+        self.checkpoint();
         self.timeline.delete(i);
         self.problem = None;
         self.seek(at, cx);
@@ -448,7 +604,11 @@ impl EditorView {
 
     fn shift_selected(&mut self, by: isize, cx: &mut Context<Self>) {
         if let Some(i) = self.selected
-            && let Some(j) = self.timeline.shift(i, by)
+            && i.checked_add_signed(by).is_some_and(|j| j < self.timeline.pieces.len())
+            && let Some(j) = {
+                self.checkpoint();
+                self.timeline.shift(i, by)
+            }
         {
             let at = self.timeline.start_of(j);
             self.seek(at, cx);
@@ -462,6 +622,7 @@ impl EditorView {
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut TrackEdit),
     ) {
+        self.checkpoint();
         if let Some(edit) =
             self.timeline.pieces.get_mut(piece).and_then(|p| p.tracks.get_mut(track))
         {
@@ -647,10 +808,16 @@ impl EditorView {
 
     fn key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
+        let plain = !(k.modifiers.control || k.modifiers.alt || k.modifiers.platform);
         match k.key.as_str() {
-            "space" => self.toggle_play(cx),
-            "s" => self.split(cx),
-            "delete" | "backspace" => self.delete_selected(cx),
+            "space" if plain => self.toggle_play(cx),
+            "s" if plain => self.split(cx),
+            "delete" | "backspace" if plain => self.delete_selected(cx),
+            "j" if plain => self.join_selected(cx),
+            "z" if k.modifiers.control && !k.modifiers.alt => {
+                self.step_history(k.modifiers.shift, cx);
+            }
+            "y" if k.modifiers.control => self.step_history(true, cx),
             "v" if k.modifiers.control => self.paste(cx),
             _ => {}
         }
@@ -696,7 +863,16 @@ fn waveform(
     Some(peaks)
 }
 
-/// What a track is called: the recorder always makes Master first, then Game and Mic.
+/// What track `i` of `source` is called: the name the recorder wrote into the file (Master, Game,
+/// Mic, then each app's label), else a generic one.
+fn track_label(source: &Source, i: usize) -> String {
+    match source.info.audio_names.get(i) {
+        Some(name) if !name.is_empty() => name.clone(),
+        _ => track_name(i),
+    }
+}
+
+/// The name for track `i` when the file doesn't carry one: Master first, then Game and Mic.
 fn track_name(i: usize) -> String {
     match i {
         0 => "Master".to_owned(),
@@ -730,6 +906,13 @@ impl Render for EditorView {
             cx.notify();
         }
         let focus = self.focus.get_or_insert_with(|| cx.focus_handle()).clone();
+        // Keys only reach the page while it has focus, which coming back from another tab loses.
+        if !focus.contains_focused(window, cx) {
+            window.focus(&focus, cx);
+        }
+        let viewport = window.viewport_size();
+        let video_height = (f32::from(viewport.height) * VIDEO_SHARE).clamp(VIDEO_MIN, VIDEO_MAX);
+        let wide = f32::from(viewport.width) >= WIDE;
 
         let mut page = div()
             .id("editor-page")
@@ -767,11 +950,22 @@ impl Render for EditorView {
             page = page.child(self.picker(cx));
         }
         if !self.timeline.pieces.is_empty() {
-            page = page
-                .child(self.player_view(cx))
-                .child(self.timeline_view(cx))
+            // Wide windows put the editing panel beside the picture; narrow ones stack it below.
+            let side = div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .flex_none()
                 .children(self.inspector(cx))
                 .child(self.finish_card(cx));
+            let top = div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(div().flex_1().min_w_0().child(self.player_view(video_height, cx)));
+            let top =
+                if wide { top.flex_row().child(side.w(px(SIDE_WIDTH))) } else { top.child(side) };
+            page = page.child(top).child(self.timeline_view(cx));
         }
         page
     }
@@ -861,10 +1055,10 @@ impl EditorView {
     }
 
     /// The picture, with play/pause, the clock, and the buttons that edit at the playhead.
-    fn player_view(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn player_view(&self, height: f32, cx: &mut Context<Self>) -> gpui::Div {
         let video = div()
             .w_full()
-            .h(px(VIDEO_HEIGHT))
+            .h(px(height))
             .flex_none()
             // The page scrolls, so without this the flex column squeezes the picture to nothing.
             .rounded(px(theme::RADIUS_MD))
@@ -922,7 +1116,7 @@ impl EditorView {
                     .on_click(cx.listener(|this, _, _, cx| this.delete_selected(cx))),
             );
         div().flex().flex_col().gap_2().child(video).child(controls).child(muted(
-            "Space plays, S splits at the playhead, Delete removes the selected piece. Cuts land on keyframes, so no video is re-encoded.",
+            "Space plays, S splits at the playhead, J joins, Delete removes the selected piece, Ctrl+Z undoes. On a lane, click the line to add a volume point, drag it to change the level (to the bottom mutes), Shift-click removes it. Cuts land on keyframes, so no video is re-encoded.",
         ))
     }
 
@@ -941,7 +1135,7 @@ impl EditorView {
             let w = (x1 - x0).max(1.0);
             let label = if w >= 150.0 {
                 format!("{}  {}", model::piece_label(i), model::secs_label(piece.span()))
-            } else if w >= 36.0 {
+            } else if w >= 60.0 {
                 model::piece_label(i)
             } else {
                 String::new()
@@ -970,7 +1164,7 @@ impl EditorView {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .justify_between()
+                    .justify_center()
                     .overflow_hidden()
                     .text_xs()
                     .text_color(rgb(if self.selected == Some(i) {
@@ -978,7 +1172,7 @@ impl EditorView {
                     } else {
                         theme::MUTED_FG
                     }))
-                    .child(label)
+                    .child(div().absolute().left(px(4.)).child(label))
                     .children(extract),
             );
         }
@@ -1015,19 +1209,42 @@ impl EditorView {
         }
 
         let mut lanes = Vec::new();
-        for t in 0..tracks {
+        let shown = if self.tracks_open { tracks } else { tracks.min(1) };
+        for t in 0..shown {
             let mut lane = div()
                 .relative()
                 .w_full()
                 .h(px(LANE_HEIGHT))
                 .rounded(px(theme::RADIUS_SM))
                 .bg(rgb(theme::CARD))
-                .overflow_hidden();
+                .overflow_hidden()
+                .child({
+                    let lanes = self.lanes.clone();
+                    canvas(
+                        move |b, _, _| {
+                            let mut all = lanes.borrow_mut();
+                            if all.len() <= t {
+                                all.resize(t + 1, Bounds::default());
+                            }
+                            all[t] = b;
+                        },
+                        |_, (), _, _| {},
+                    )
+                    .absolute()
+                    .size_full()
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        this.press_lane(t, ev, cx);
+                        cx.stop_propagation();
+                    }),
+                );
             for (i, piece) in self.timeline.pieces.iter().enumerate() {
                 let x0 = x_of(self.timeline.start_of(i));
                 let x1 = x_of(self.timeline.start_of(i) + piece.span());
                 let w = (x1 - x0 - 1.0).max(1.0);
-                let edit = piece.tracks[t];
+                let edit = &piece.tracks[t];
                 let source = &self.sources[piece.source];
                 let mut block = div()
                     .absolute()
@@ -1038,8 +1255,14 @@ impl EditorView {
                     .bg(rgb(if self.selected == Some(i) { theme::ACCENT } else { theme::CARD }))
                     .opacity(if edit.mute { 0.35 } else { 1.0 });
                 if let Some(Some(peaks)) = source.waves.get(t) {
-                    let slice = model::peaks_between(peaks, source.info.duration, piece.a, piece.b);
-                    let columns = model::downsample(slice, (w / BAR_STEP) as usize);
+                    let span = source
+                        .info
+                        .audio_spans
+                        .get(t)
+                        .copied()
+                        .unwrap_or((Hns::ZERO, source.info.duration));
+                    let columns =
+                        model::column_peaks(peaks, span, piece.a, piece.b, (w / BAR_STEP) as usize);
                     let n = columns.len().max(1);
                     block = block.children(columns.into_iter().enumerate().map(|(c, peak)| {
                         let h = (peak.min(1.0) * LANE_HEIGHT).max(1.0);
@@ -1050,6 +1273,39 @@ impl EditorView {
                             .w(px(2.))
                             .h(px(h))
                             .bg(rgb(if t == self.listen { theme::BRAND } else { theme::MUTED_FG }))
+                    }));
+                }
+                // The volume line, drawn as thin steps (no path primitive needed), with a dot on
+                // each point.
+                let line = edit.line(piece.span());
+                let px_of = |at: Hns| model::time_to_x(at, piece.span(), w);
+                let y_of = |db: f64| model::db_to_frac(db) * LANE_HEIGHT;
+                block = block.children(line.windows(2).flat_map(|seg| {
+                    let (x0, x1) = (px_of(seg[0].at), px_of(seg[1].at));
+                    let steps = ((x1 - x0) / 2.0).ceil().max(1.0) as usize;
+                    let (d0, d1) = (seg[0].db, seg[1].db);
+                    (0..steps).map(move |k| {
+                        let f = (k as f64 + 0.5) / steps as f64;
+                        let y = y_of(d0 + (d1 - d0) * f);
+                        div()
+                            .absolute()
+                            .left(px(x0 + (x1 - x0) * k as f32 / steps as f32))
+                            .top(px(y - 1.0))
+                            .w(px(((x1 - x0) / steps as f32).max(1.0) + 0.5))
+                            .h(px(2.))
+                            .bg(rgb(theme::FG))
+                    })
+                }));
+                if edit.has_line() {
+                    block = block.children(line.iter().map(|pt| {
+                        div()
+                            .absolute()
+                            .left(px(px_of(pt.at) - 4.0))
+                            .top(px(y_of(pt.db) - 4.0))
+                            .w(px(8.))
+                            .h(px(8.))
+                            .rounded_full()
+                            .bg(rgb(theme::BRAND))
                     }));
                 }
                 if w >= 40.0 {
@@ -1085,7 +1341,28 @@ impl EditorView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(div().text_xs().text_color(rgb(theme::MUTED_FG)).child(track_name(t)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .text_xs()
+                            .text_color(rgb(theme::MUTED_FG))
+                            .child(icon("volume-2", theme::MUTED_FG))
+                            .child(
+                                self.sources
+                                    .first()
+                                    .map_or_else(|| track_name(t), |s| track_label(s, t)),
+                            )
+                            .children((t == 0).then(|| {
+                                muted(if self.tracks_open {
+                                    "the whole mix"
+                                } else {
+                                    "the whole mix, plays by default"
+                                })
+                            })),
+                    )
                     .child(lane),
             );
         }
@@ -1118,18 +1395,46 @@ impl EditorView {
                 }),
             )
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
-                if this.scrubbing && ev.dragging() {
+                if this.drag.is_some() && ev.dragging() {
+                    this.drag_point(ev);
+                    cx.notify();
+                } else if this.scrubbing && ev.dragging() {
                     let t = this.time_at(ev.position.x);
                     this.seek(t, cx);
                 }
             }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.scrubbing = false))
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|this, _, _, _| this.scrubbing = false),
-            );
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.release()))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| this.release()));
 
-        div().flex().flex_col().gap_1().child(head).child(strip)
+        let toggle = (tracks > 1).then(|| {
+            button_ghost(
+                "tracks-toggle",
+                if self.tracks_open {
+                    "Hide the other tracks".to_owned()
+                } else {
+                    format!("Edit {} tracks separately", tracks - 1)
+                },
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.tracks_open = !this.tracks_open;
+                cx.notify();
+            }))
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Timeline"))
+                    .child(div().flex_1())
+                    .children(toggle),
+            )
+            .child(head)
+            .child(strip)
     }
 
     /// The selected piece: where it comes from, order, and each audio track's volume and mute.
@@ -1159,9 +1464,22 @@ impl EditorView {
                         button_ghost("piece-right", "Move later")
                             .child(icon("chevron-right", theme::MUTED_FG))
                             .on_click(cx.listener(|this, _, _, cx| this.shift_selected(1, cx))),
+                    )
+                    .child(
+                        button_ghost("piece-join", "Join with next")
+                            .on_click(cx.listener(|this, _, _, cx| this.join_selected(cx))),
+                    )
+                    .child(
+                        button_ghost("undo", "Undo")
+                            .on_click(cx.listener(|this, _, _, cx| this.step_history(false, cx))),
+                    )
+                    .child(
+                        button_ghost("redo", "Redo")
+                            .on_click(cx.listener(|this, _, _, cx| this.step_history(true, cx))),
                     ),
             );
-        for (t, edit) in piece.tracks.iter().enumerate() {
+        let shown = if self.tracks_open { piece.tracks.len() } else { piece.tracks.len().min(1) };
+        for (t, edit) in piece.tracks.iter().enumerate().take(shown) {
             let listening = self.listen == t;
             list = list.child(
                 div()
@@ -1170,7 +1488,7 @@ impl EditorView {
                     .flex_wrap()
                     .items_center()
                     .gap_3()
-                    .child(div().w(px(72.)).text_sm().child(track_name(t)))
+                    .child(div().w(px(84.)).truncate().text_sm().child(track_label(source, t)))
                     .child(number_stepper(
                         format!("gain-{t}"),
                         edit.gain_db,
@@ -1218,7 +1536,7 @@ impl EditorView {
         }
         Some(
             list.child(muted(
-                "Master is the whole mix and plays by default. Muting a track here only silences this piece of it.",
+                "Master is the whole mix and plays by default. Open the other tracks to edit each one alone. Muting here only silences this piece.",
             ))
             .into_any_element(),
         )

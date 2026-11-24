@@ -28,6 +28,8 @@ const RED: u32 = theme::DANGER;
 const GREEN: u32 = theme::BRAND;
 const GRAY: u32 = theme::MUTED_FG;
 
+gpui::actions!(zeroclip, [ToggleFullscreen]);
+
 pub fn shell(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoElement {
     div()
         .size_full()
@@ -35,6 +37,8 @@ pub fn shell(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoEleme
         .flex_col()
         .bg(rgb(theme::BG))
         .text_color(rgb(theme::FG))
+        // F11 (bound in main.rs) toggles fullscreen.
+        .on_action(|_: &ToggleFullscreen, window, _| window.toggle_fullscreen())
         .child(top_bar(app, cx))
         .children(focus_prompt::banner(app, cx))
         .children(rescue::banner(app, cx))
@@ -64,6 +68,10 @@ fn top_bar(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoElement
         .child(div().text_xl().font_weight(gpui::FontWeight::BOLD).mr_4().child("ZeroClip"))
         .children(Tab::ALL.into_iter().map(|tab| {
             tab_button(tab.icon(), tab.label(), app.tab == tab).on_click(cx.listener(move |app, _, _, cx| {
+                // Leaving the Editor stops its playback; it isn't drawn, so nothing else would.
+                if app.tab == Tab::Editor && tab != Tab::Editor {
+                    app.screens.editor().clone().update(cx, |editor, cx| editor.pause(cx));
+                }
                 app.tab = tab;
                 cx.notify();
             }))

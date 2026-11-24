@@ -23,8 +23,8 @@ use zc_core::Hns;
 use zc_editor::ffmpeg::{Ffmpeg, frames_args};
 
 /// Size every frame is made at. Small, because it is only a preview.
-const WIDTH: u32 = 640;
-const HEIGHT: u32 = 360;
+const WIDTH: u32 = 960;
+const HEIGHT: u32 = 540;
 const FPS: u32 = 24;
 /// Frames that may wait between the reader thread and the screen.
 const BACKLOG: usize = 6;
@@ -153,9 +153,8 @@ impl Player {
         self.decoder = None;
         self.queue.clear();
         self.items.clear();
-        if let Some(mut audio) = self.audio.take() {
-            let _ = audio.kill();
-            let _ = audio.wait();
+        if let Some(audio) = self.audio.take() {
+            stop_audio(audio);
         }
         self.playing = false;
         self.started = None;
@@ -187,9 +186,8 @@ impl Player {
     fn start_item(&mut self) -> bool {
         self.decoder = None;
         self.queue.clear();
-        if let Some(mut audio) = self.audio.take() {
-            let _ = audio.kill();
-            let _ = audio.wait();
+        if let Some(audio) = self.audio.take() {
+            stop_audio(audio);
         }
         let (Some(item), Some(ffmpeg)) = (self.items.front(), self.ffmpeg.as_ref()) else {
             return false;
@@ -274,6 +272,32 @@ impl Drop for Player {
     fn drop(&mut self) {
         self.halt();
     }
+}
+
+/// Stops an `ffplay` and everything it started. Killing only the process we spawned is not
+/// enough when `ffplay.exe` is a launcher (Chocolatey and Scoop put one on PATH): the real player
+/// is its child and would keep playing after a pause. `taskkill /T` takes the whole tree; it is
+/// started here and waited for on a thread, so a pause never stalls the UI.
+/// <https://learn.microsoft.com/windows-server/administration/windows-commands/taskkill>
+fn stop_audio(mut audio: Child) {
+    #[cfg(windows)]
+    let tree = {
+        let mut cmd = Command::new("taskkill");
+        cmd.args(["/F", "/T", "/PID", &audio.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        no_window(&mut cmd);
+        cmd.spawn().ok()
+    };
+    std::thread::spawn(move || {
+        #[cfg(windows)]
+        if let Some(mut tree) = tree {
+            let _ = tree.wait();
+        }
+        let _ = audio.kill();
+        let _ = audio.wait();
+    });
 }
 
 /// Starts `ffplay` with no window, for the sound of `item`'s track `sound.track`. `None` when

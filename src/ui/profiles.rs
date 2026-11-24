@@ -3,16 +3,18 @@
 
 use gpui::{
     AnyElement, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, ParentElement,
-    Render, StatefulInteractiveElement, Styled, WeakEntity, Window, div, px, rgb,
+    Render, StatefulInteractiveElement, Styled, WeakEntity, Window, deferred, div, px, rgb,
 };
 use zc_core::Hns;
 use zc_core::profile::{GameProfile, ProfileSet, exe_name};
 use zc_core::settings::MAX_APP_TRACKS;
 
 use super::components::button::{button, button_primary};
+use super::components::exe_icon;
 use super::components::open_apps::{
     has_live_track, same_exe, set_audio_track, set_game_profile, track_slot_free,
 };
+use super::components::slider::{SliderState, slider};
 use super::components::toggle::toggle;
 use super::settings::Draft;
 use super::theme;
@@ -30,11 +32,29 @@ pub struct ProfilesView {
     app: WeakEntity<ZeroClipApp>,
     /// One focus handle per game row, for its executable field.
     fields: Vec<FocusHandle>,
+    /// One slider state per row, default row first.
+    sliders: Vec<SliderState>,
+    /// The row whose duration dropdown is open.
+    menu: Option<usize>,
+    /// Minutes typed into the open dropdown's custom field.
+    custom: String,
+    custom_focus: FocusHandle,
+    /// When each executable's icon was last looked for, so a game that isn't running isn't
+    /// searched for on every frame.
+    icon_tried: std::collections::HashMap<String, std::time::Instant>,
 }
 
 impl ProfilesView {
-    pub fn new(app: WeakEntity<ZeroClipApp>) -> Self {
-        Self { app, fields: Vec::new() }
+    pub fn new(app: WeakEntity<ZeroClipApp>, cx: &mut Context<Self>) -> Self {
+        Self {
+            app,
+            fields: Vec::new(),
+            sliders: Vec::new(),
+            menu: None,
+            custom: String::new(),
+            custom_focus: cx.focus_handle(),
+            icon_tried: Default::default(),
+        }
     }
 
     /// Runs `f` on the app (where the draft lives) and repaints it and this screen.
@@ -49,16 +69,23 @@ impl ProfilesView {
     }
 }
 
-/// +10 s below a minute, +30 s above; the reverse going down. 60 s is the pivot both ways.
-fn step_secs(secs: u32, up: bool) -> u32 {
-    let next = match (up, secs < 60) {
-        (true, true) => secs + 10,
-        (true, false) => secs + 30,
-        (false, true) => secs.saturating_sub(10),
-        (false, false) if secs == 60 => 50,
-        (false, false) => secs - 30,
+/// Slider position `0.0..=1.0` to seconds. Squared, so the short end (10 s to 2 min) gets as much
+/// room as the long end, then snapped: 10 s steps below 2 min, 30 s below 10 min, 1 min above.
+fn secs_at(fraction: f32) -> u32 {
+    let raw = MIN_SECS as f32 + (MAX_SECS - MIN_SECS) as f32 * fraction.clamp(0.0, 1.0).powi(2);
+    let step = if raw < 120.0 {
+        10.0
+    } else if raw < 600.0 {
+        30.0
+    } else {
+        60.0
     };
-    next.clamp(MIN_SECS, MAX_SECS)
+    ((raw / step).round() * step) as u32
+}
+
+/// The inverse of [`secs_at`], for placing the thumb.
+fn fraction_of(secs: u32) -> f32 {
+    ((secs.clamp(MIN_SECS, MAX_SECS) - MIN_SECS) as f32 / (MAX_SECS - MIN_SECS) as f32).sqrt()
 }
 
 fn secs_label(secs: u32) -> String {
@@ -69,37 +96,161 @@ fn label(text: &'static str) -> gpui::Div {
     div().text_xs().text_color(rgb(MUTED)).child(text)
 }
 
-fn stepper(
+/// Buffer lengths offered by the dropdown, in seconds.
+const PRESETS: [u32; 7] = [30, 60, 120, 300, 600, 900, 1_800];
+
+/// What the open dropdown needs from the view.
+struct MenuArgs {
+    open: bool,
+    custom: String,
+    custom_focus: FocusHandle,
+    custom_focused: bool,
+}
+
+/// A draggable slider for the buffer length, and beside it the value as a dropdown button:
+/// presets, or a custom number of minutes.
+fn duration_control(
     i: usize,
     secs: u32,
+    state: &SliderState,
+    menu: MenuArgs,
     cx: &mut Context<ProfilesView>,
-    set: fn(&mut ZeroClipApp, usize, u32),
 ) -> impl IntoElement {
-    let step = |name: &'static str, glyph: &'static str, up: bool, cx: &mut Context<_>| {
-        button((name, i), glyph).w(px(28.0)).flex().justify_center().on_click(cx.listener(
-            move |this: &mut ProfilesView, _, _, cx| {
-                this.edit(cx, |app| set(app, i, step_secs(current(app, i), up)));
-            },
-        ))
-    };
+    let view = cx.entity().downgrade();
+    let value = div()
+        .id(("duration-value", i))
+        .w(px(84.0))
+        .px_2()
+        .py_1()
+        .flex()
+        .flex_row()
+        .justify_between()
+        .rounded(px(theme::RADIUS_MD))
+        .bg(rgb(FIELD))
+        .border_1()
+        .border_color(rgb(theme::INPUT))
+        .cursor_pointer()
+        .hover(|h| h.bg(rgb(theme::ACCENT)))
+        .child(secs_label(secs))
+        .child(div().text_color(rgb(MUTED)).child("\u{25be}"))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.menu = if this.menu == Some(i) { None } else { Some(i) };
+            this.custom.clear();
+            cx.notify();
+        }));
+
+    let list = menu.open.then(|| {
+        let item = |id: (&'static str, usize)| {
+            div()
+                .id(id)
+                .px_2()
+                .py_1()
+                .rounded(px(theme::RADIUS_SM))
+                .cursor_pointer()
+                .hover(|h| h.bg(rgb(theme::ACCENT)))
+        };
+        let presets = PRESETS.into_iter().enumerate().map(|(k, preset)| {
+            item(("preset", i * 16 + k)).child(secs_label(preset)).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.menu = None;
+                    this.edit(cx, |app| set_secs(app, i, preset));
+                },
+            ))
+        });
+        let custom_field = div()
+            .id(("custom", i))
+            .track_focus(&menu.custom_focus)
+            .w(px(44.0))
+            .px_1()
+            .rounded(px(theme::RADIUS_SM))
+            .bg(rgb(FIELD))
+            .border_1()
+            .border_color(rgb(if menu.custom_focused { theme::RING } else { theme::INPUT }))
+            .cursor_text()
+            .child(if menu.custom_focused {
+                format!("{}|", menu.custom)
+            } else {
+                menu.custom.clone()
+            })
+            .on_click({
+                let handle = menu.custom_focus.clone();
+                move |_, window, cx| window.focus(&handle, cx)
+            })
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
+                match ev.keystroke.key.as_str() {
+                    "escape" => {
+                        this.menu = None;
+                        window.blur(cx);
+                        cx.notify();
+                    }
+                    "enter" => {
+                        if let Ok(minutes) = this.custom.parse::<u32>() {
+                            let secs = (minutes * 60).clamp(MIN_SECS, MAX_SECS);
+                            this.menu = None;
+                            window.blur(cx);
+                            this.edit(cx, |app| set_secs(app, i, secs));
+                        }
+                    }
+                    "backspace" => {
+                        this.custom.pop();
+                        cx.notify();
+                    }
+                    _ => {
+                        if let Some(c) = ev.keystroke.key_char.as_deref()
+                            && c.chars().all(|ch| ch.is_ascii_digit())
+                            && this.custom.len() < 3
+                        {
+                            this.custom.push_str(c);
+                            cx.notify();
+                        }
+                    }
+                }
+            }));
+        deferred(
+            div()
+                .absolute()
+                .top(px(32.0))
+                .left_0()
+                .w(px(150.0))
+                .p_1()
+                .flex()
+                .flex_col()
+                .rounded(px(theme::RADIUS_MD))
+                .bg(rgb(SURFACE))
+                .border_1()
+                .border_color(rgb(theme::INPUT))
+                .occlude()
+                .children(presets)
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .child(div().text_color(rgb(MUTED)).child("Custom"))
+                        .child(custom_field)
+                        .child(div().text_color(rgb(MUTED)).child("min")),
+                ),
+        )
+        .with_priority(1)
+    });
+
     div()
         .flex()
         .flex_row()
         .items_center()
-        .gap_1()
-        .child(step("dec", "-", false, cx))
-        .child(div().w(px(76.0)).flex().justify_center().child(secs_label(secs)))
-        .child(step("inc", "+", true, cx))
+        .gap_3()
+        .child(slider(format!("duration-{i}"), fraction_of(secs), state, move |f, _, cx| {
+            view.update(cx, |this, cx| this.edit(cx, |app| set_secs(app, i, secs_at(f)))).ok();
+        }))
+        .child(div().relative().child(value).children(list))
 }
 
 /// Row 0 is the default profile; rows 1.. are `games[i - 1]`.
 fn profile_mut(profiles: &mut ProfileSet, i: usize) -> &mut GameProfile {
     if i == 0 { &mut profiles.default } else { &mut profiles.games[i - 1] }
-}
-
-fn current(app: &ZeroClipApp, i: usize) -> u32 {
-    let p = &app.draft.settings.profiles;
-    if i == 0 { p.default.buffer_secs } else { p.games[i - 1].buffer_secs }
 }
 
 fn set_secs(app: &mut ZeroClipApp, i: usize, secs: u32) {
@@ -122,7 +273,7 @@ impl Render for ProfilesView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(app_entity) = self.app.upgrade() else { return div().into_any_element() };
         // Copy what the screen needs, so the app isn't borrowed while the listeners are built.
-        let (profiles, tracks, max_kbps, ceiling_mb, dirty, problems) = {
+        let (profiles, tracks, max_kbps, ceiling_mb, dirty, problems, icons_dir) = {
             let app = app_entity.read(cx);
             let d = &app.draft;
             (
@@ -133,13 +284,31 @@ impl Render for ProfilesView {
                     / 1_000_000,
                 d.is_dirty(&app.settings),
                 d.problems.clone(),
+                app.paths.icons_dir.clone(),
             )
         };
         self.fields.resize_with(profiles.games.len(), || cx.focus_handle());
+        self.sliders.resize_with(profiles.games.len() + 1, SliderState::default);
 
         let mut rows: Vec<AnyElement> = Vec::new();
         for i in 0..=profiles.games.len() {
             let profile = if i == 0 { &profiles.default } else { &profiles.games[i - 1] };
+            let icon = (i > 0)
+                .then(|| exe_icon::cached(&icons_dir, &profile.exe))
+                .flatten()
+                .filter(|file| {
+                    // ponytail: looks again every few seconds while the row shows, not on game
+                    // start. Add that when the app watches for games.
+                    let due = self
+                        .icon_tried
+                        .get(&profile.exe)
+                        .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(3));
+                    if !file.is_file() && due {
+                        self.icon_tried.insert(profile.exe.clone(), std::time::Instant::now());
+                        exe_icon::capture(&icons_dir, &profile.exe);
+                    }
+                    file.is_file()
+                });
             let name: AnyElement = if i == 0 {
                 div().w(px(190.0)).child("Any other game").into_any_element()
             } else {
@@ -209,8 +378,26 @@ impl Render for ProfilesView {
                     .border_1()
                     .border_color(rgb(theme::BORDER))
                     .bg(rgb(SURFACE))
+                    .child(
+                        div()
+                            .w(px(24.0))
+                            .h(px(24.0))
+                            .flex_none()
+                            .children(icon.map(exe_icon::view)),
+                    )
                     .child(name)
-                    .child(stepper(i, profile.buffer_secs, cx, set_secs))
+                    .child(duration_control(
+                        i,
+                        profile.buffer_secs,
+                        &self.sliders[i],
+                        MenuArgs {
+                            open: self.menu == Some(i),
+                            custom: self.custom.clone(),
+                            custom_focus: self.custom_focus.clone(),
+                            custom_focused: self.custom_focus.is_focused(window),
+                        },
+                        cx,
+                    ))
                     .child(div().w(px(60.0)).child(toggle(("session", i), session, true).on_click(
                         cx.listener(move |this, _, _, cx| {
                             this.edit(cx, |app| {
@@ -247,8 +434,9 @@ impl Render for ProfilesView {
             .flex_row()
             .gap_4()
             .px_3()
+            .child(div().w(px(24.0)).flex_none())
             .child(div().w(px(190.0)).child(label("Executable")))
-            .child(div().w(px(140.0)).child(label("DVR buffer")))
+            .child(div().w(px(280.0)).child(label("DVR buffer")))
             .child(div().w(px(60.0)).child(label("Whole session")))
             .child(div().flex_1().child(label("Memory at max bitrate")));
 
@@ -473,12 +661,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stepping_pivots_at_a_minute_and_stays_in_range() {
-        assert_eq!(step_secs(50, true), 60);
-        assert_eq!(step_secs(60, true), 90);
-        assert_eq!(step_secs(90, false), 60);
-        assert_eq!(step_secs(60, false), 50);
-        assert_eq!(step_secs(10, false), MIN_SECS);
-        assert_eq!(step_secs(1_800, true), MAX_SECS);
+    fn slider_maps_to_snapped_seconds_and_back() {
+        assert_eq!(secs_at(0.0), MIN_SECS);
+        assert_eq!(secs_at(1.0), MAX_SECS);
+        assert_eq!(secs_at(fraction_of(60)), 60);
+        assert_eq!(secs_at(fraction_of(600)), 600);
+        assert_eq!(secs_at(fraction_of(300)), 300);
+        // Every snapped value survives a round trip, so the thumb never jumps after a drag.
+        for f in 0..=1000 {
+            let secs = secs_at(f as f32 / 1000.0);
+            assert_eq!(secs_at(fraction_of(secs)), secs);
+        }
     }
 }
