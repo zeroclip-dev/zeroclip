@@ -151,7 +151,7 @@ pub fn show(cx: &mut App, kind: ToastKind) -> Option<WindowHandle<ToastView>> {
             return None;
         }
     };
-    if let Err(error) = zc_win::overlay::prepare_toast(&title) {
+    if let Err(error) = zc_win::overlay::prepare_toast(&title, x, y, CARD_W, CARD_H) {
         tracing::warn!(%error, "toast not shown: it can't be excluded from capture");
         let _ = handle.update(cx, |_, window, _| window.remove_window());
         return None;

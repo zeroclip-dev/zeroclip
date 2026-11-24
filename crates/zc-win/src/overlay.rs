@@ -24,9 +24,10 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DwmSetWindowAttribute,
 };
+use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW, SPI_GETCLIENTAREAANIMATION,
-    SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos,
     ShowWindow, SystemParametersInfoW, WDA_EXCLUDEFROMCAPTURE, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
     WS_POPUP,
@@ -36,10 +37,13 @@ use windows::core::{BOOL, HSTRING, PCWSTR};
 /// Applies the toast styles to the window titled `title`, then shows it without activating it.
 ///
 /// The title must be unique among top-level windows: the caller builds it from a counter.
+/// `x`, `y`, `w`, `h` are the card's rectangle in logical pixels on the primary display (whose
+/// origin is 0, 0). GPUI only applies a window's bounds when it shows the window itself, and
+/// this function shows it with `ShowWindow` instead, so the position is set here.
 ///
 /// # Errors
 /// No window has that title, or the affinity call failed. Nothing is shown in that case.
-pub fn prepare_toast(title: &str) -> windows::core::Result<()> {
+pub fn prepare_toast(title: &str, x: f32, y: f32, w: f32, h: f32) -> windows::core::Result<()> {
     let title = HSTRING::from(title);
     // SAFETY: `title` is a valid NUL-terminated wide string that lives across the call. A null
     // class name matches any class.
@@ -61,17 +65,19 @@ pub fn prepare_toast(title: &str) -> windows::core::Result<()> {
     // a frame. Make it a plain `WS_POPUP`, like OpenCrosshair's overlay, so nothing is drawn
     // outside the client area, then tell Windows the frame changed.
     // SAFETY: `hwnd` is still live. Replacing the style only drops the frame bits; SetWindowPos
-    // with these flags moves, resizes and activates nothing.
+    // with these flags moves and resizes the window but never activates it.
     unsafe {
         SetWindowLongPtrW(hwnd, GWL_STYLE, WS_POPUP.0 as isize);
+        // The primary display's DPI, as a multiple of the 96 DPI that logical pixels assume.
+        let scale = GetDpiForSystem() as f32 / 96.0;
         SetWindowPos(
             hwnd,
             None,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            (x * scale).round() as i32,
+            (y * scale).round() as i32,
+            (w * scale).round() as i32,
+            (h * scale).round() as i32,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         )?;
     }
 
