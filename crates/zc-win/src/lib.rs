@@ -22,6 +22,7 @@ pub mod clock;
 pub mod com;
 pub mod drive;
 pub mod error;
+pub mod icon;
 pub mod main_window;
 pub mod memory;
 pub mod message_thread;

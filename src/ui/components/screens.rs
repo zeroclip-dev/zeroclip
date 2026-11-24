@@ -24,7 +24,7 @@ impl Screens {
         Self {
             home: cx.new(|_| HomeView::new(app.clone())),
             clips: cx.new(|_| ClipsView::new(app.clone())),
-            profiles: cx.new(|_| ProfilesView::new(app.clone())),
+            profiles: cx.new(|cx| ProfilesView::new(app.clone(), cx)),
             editor: cx.new(|_| EditorView::new(app.clone())),
             settings: cx.new(|_| SettingsView::new(app)),
         }

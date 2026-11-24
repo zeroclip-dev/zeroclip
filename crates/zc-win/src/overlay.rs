@@ -26,11 +26,11 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW, SPI_GETCLIENTAREAANIMATION,
-    SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, SystemParametersInfoW, WDA_EXCLUDEFROMCAPTURE, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
-    WS_POPUP,
+    FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW, HWND_TOPMOST,
+    SPI_GETCLIENTAREAANIMATION, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowDisplayAffinity, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, SystemParametersInfoW, WDA_EXCLUDEFROMCAPTURE, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{BOOL, HSTRING, PCWSTR};
 
@@ -52,9 +52,12 @@ pub fn prepare_toast(title: &str, x: f32, y: f32, w: f32, h: f32) -> windows::co
     // SAFETY: `hwnd` is a live window of this process, found just now. Reading its extended
     // style has no side effects.
     let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
-    let added = (WS_EX_TRANSPARENT.0 | WS_EX_NOACTIVATE.0) as isize;
+    // WS_EX_TOPMOST is set here too: GPUI's pop-up is not reliably top-most, and the card must sit
+    // over a borderless game without the player having to Alt+Tab.
+    let added =
+        (WS_EX_TRANSPARENT.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0) as isize;
     // SAFETY: `hwnd` is still the same live window. We only add bits to its extended style, so
-    // its other flags (tool window, top-most) stay as GPUI set them.
+    // its other flags stay as GPUI set them.
     unsafe { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style | added) };
 
     // SAFETY: `hwnd` is still live. The affinity is set before the window is ever shown, so the
@@ -73,12 +76,12 @@ pub fn prepare_toast(title: &str, x: f32, y: f32, w: f32, h: f32) -> windows::co
         // Best effort: a card in the wrong place is better than none.
         let _ = SetWindowPos(
             hwnd,
-            None,
+            Some(HWND_TOPMOST),
             (x * scale).round() as i32,
             (y * scale).round() as i32,
             (w * scale).round() as i32,
             (h * scale).round() as i32,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
     }
 
@@ -108,6 +111,11 @@ pub fn prepare_toast(title: &str, x: f32, y: f32, w: f32, h: f32) -> windows::co
     // SAFETY: `hwnd` is still live. SW_SHOWNOACTIVATE shows the window without giving it focus.
     // The return value only says whether it was visible before, so it is not needed.
     let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+    // Showing a window can drop it below other top-most ones (a borderless game); put it back on top.
+    // SAFETY: `hwnd` is still live; no move, resize or activation, only the z-order changes.
+    let _ = unsafe {
+        SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+    };
     Ok(())
 }
 

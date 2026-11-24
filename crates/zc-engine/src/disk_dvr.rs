@@ -3,7 +3,7 @@
 //! In disk mode the recorder's [`DvrBuffer`](zc_core::dvr::DvrBuffer) is only a small staging
 //! area (about [`STAGING_BYTES`]): the hot path pushes into it exactly as in RAM mode and never
 //! touches the disk (CONTRIBUTING.md rule 2). A [`Persister`] thread tails it. Once a GOP is
-//! finished, and the audio that goes with it has had [`PERSIST_LAG`] to arrive, the thread copies
+//! finished, and the audio that goes with it has had `PERSIST_LAG` to arrive, the thread copies
 //! it out in short lock holds (D29) and writes it to the [`DiskRing`] as one record. Staging keeps
 //! its copy until it evicts it as it would in RAM mode, so a snapshot never sees a hole between
 //! "written" and "still staged".
@@ -39,7 +39,7 @@
 //!
 //! # Saving without the RAM
 //!
-//! A [`DiskClip`] never holds the ring part of a clip. It copies the staged part first (at most
+//! A `DiskClip` never holds the ring part of a clip. It copies the staged part first (at most
 //! the staging area, so a slow disk can't make staging evict it), then reads the ring records one
 //! at a time into one reused buffer and hands their packets to the file writer, then the staged
 //! packets. Peak RAM is about the staging area, one record and the writer's chunk, whatever the
@@ -47,7 +47,7 @@
 //! each track stays in order without sorting.
 //!
 //! If a record is overwritten after packets were written, the clip has a hole: the writer reports
-//! [`Lapped`] and the caller starts over from a fresh plan.
+//! `Lapped` and the caller starts over from a fresh plan.
 // TODO(P4.11): teach crash rescue to read the ring file after a crash. The records are
 // self-describing, but nothing reads them yet. `DiskRing::create` truncates an old ring, so
 // rescue-after-restart has to read the file before the engine creates the ring.

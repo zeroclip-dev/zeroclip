@@ -45,6 +45,7 @@ fn main() -> anyhow::Result<()> {
     let start_hidden = std::env::args().any(|arg| arg == "--tray");
 
     gpui_platform::application().with_assets(ui::icons::Icons).run(move |cx| {
+        cx.bind_keys([gpui::KeyBinding::new("f11", ui::ToggleFullscreen, None)]);
         let bounds = Bounds::centered(None, size(px(980.0), px(660.0)), cx);
         let opened = cx.open_window(
             WindowOptions {
