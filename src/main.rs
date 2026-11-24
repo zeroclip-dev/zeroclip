@@ -44,7 +44,7 @@ fn main() -> anyhow::Result<()> {
     // Windows starts ZeroClip with `--tray` at sign-in (P4.16): the window stays hidden.
     let start_hidden = std::env::args().any(|arg| arg == "--tray");
 
-    gpui_platform::application().run(move |cx| {
+    gpui_platform::application().with_assets(ui::icons::Icons).run(move |cx| {
         let bounds = Bounds::centered(None, size(px(980.0), px(660.0)), cx);
         let opened = cx.open_window(
             WindowOptions {
@@ -52,6 +52,8 @@ fn main() -> anyhow::Result<()> {
                 window_min_size: Some(size(px(760.0), px(500.0))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("ZeroClip".into()),
+                    // No Windows title bar: the top bar draws its own (ui::top_bar).
+                    appears_transparent: true,
                     ..Default::default()
                 }),
                 show: !start_hidden,

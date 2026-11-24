@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyElement, Bounds, Context, FocusHandle, FontWeight, InteractiveElement as _, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Render, SharedString,
-    StatefulInteractiveElement as _, Styled, WeakEntity, Window, canvas, div, img, px, rgb,
+    StatefulInteractiveElement as _, Styled, StyledImage as _, WeakEntity, Window, canvas, div,
+    img, px, rgb,
 };
 use zc_core::Hns;
 use zc_editor::ffmpeg::{Ffmpeg, FfmpegError, ProbeInfo};
