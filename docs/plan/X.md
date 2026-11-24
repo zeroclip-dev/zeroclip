@@ -46,3 +46,30 @@ Owner publishes the repo (needs owner/repo names). Under the README title add `[
 **Verify**
 
 The badge renders on GitHub and links to the workflow.
+
+---
+
+### X.4 · Single-instance guard
+
+Size **S** · no hardware needed to build · depends on nothing
+
+Two running copies would both open the disk-ring DVR file, and one would truncate the other's buffer (data loss).
+
+**Files:**
+- `crates/zc-win/src/single_instance.rs` (new, the only `unsafe`), `crates/zc-win/src/lib.rs`
+- `src/main.rs`
+- `docs/ROADMAP.md`
+
+**Reuse:** `zc_win::error::WinResultExt` for the error type; the existing `windows` features (no `Cargo.toml` change).
+
+**Steps**
+
+1. `zc_win::single_instance::acquire(name)`: `CreateMutexW` on a `Local\` name (per session, so fast user switching doesn't block). `ERROR_ALREADY_EXISTS` means another copy runs: close our handle, return `Ok(None)`. Else return the `InstanceGuard`, whose `Drop` closes the handle.
+2. `main`: acquire right after logging starts. `None`: log a warning, say so on stderr, exit with status 0. An error from `acquire` is logged and startup continues. Hold the guard for the whole of `main`.
+3. Unit test: a uniquely named mutex is refused the second time and free again after the first guard drops.
+
+**Verify**
+
+Unit test passes. Owner check: start two copies, the second exits at once; kill the first, a new copy starts.
+
+(A visible message box for the refused copy needs a small `MessageBoxW` helper in `zc-win` (the feature is already enabled) and a decision; the release build has no console, so today the user sees only the log line.)

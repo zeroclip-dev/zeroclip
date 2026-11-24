@@ -133,3 +133,4 @@ and P5.14.
 - [ ] Publish the repo; add the CI badge to the README
 - [x] GitHub Sponsors (`.github/FUNDING.yml`) — ten minutes, no downside
 - [ ] Screenshots / a short GIF of saving a clip
+- [x] Single-instance guard: named mutex, second copy exits (X.4) (awaiting HW check)
