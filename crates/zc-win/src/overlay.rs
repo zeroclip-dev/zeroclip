@@ -25,9 +25,11 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DwmSetWindowAttribute,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GWL_EXSTYLE, GetWindowLongPtrW, SPI_GETCLIENTAREAANIMATION, SW_SHOWNOACTIVATE,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowDisplayAffinity, SetWindowLongPtrW, ShowWindow,
-    SystemParametersInfoW, WDA_EXCLUDEFROMCAPTURE, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
+    FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW, SPI_GETCLIENTAREAANIMATION,
+    SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, SystemParametersInfoW, WDA_EXCLUDEFROMCAPTURE, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
+    WS_POPUP,
 };
 use windows::core::{BOOL, HSTRING, PCWSTR};
 
@@ -54,6 +56,24 @@ pub fn prepare_toast(title: &str) -> windows::core::Result<()> {
     // SAFETY: `hwnd` is still live. The affinity is set before the window is ever shown, so the
     // card is never visible to a capture. Errors are returned, not ignored: no affinity, no card.
     unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) }?;
+
+    // GPUI makes a `PopUp` window with style 0 (`WS_OVERLAPPED`), which still has a title bar and
+    // a frame. Make it a plain `WS_POPUP`, like OpenCrosshair's overlay, so nothing is drawn
+    // outside the client area, then tell Windows the frame changed.
+    // SAFETY: `hwnd` is still live. Replacing the style only drops the frame bits; SetWindowPos
+    // with these flags moves, resizes and activates nothing.
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, WS_POPUP.0 as isize);
+        SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        )?;
+    }
 
     // Windows 11 draws a thin border (and rounds the corners) around top-level windows, even a
     // borderless one, so the toast would not look transparent. Turn both off.
