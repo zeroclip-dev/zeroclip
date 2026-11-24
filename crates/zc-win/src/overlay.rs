@@ -70,7 +70,8 @@ pub fn prepare_toast(title: &str, x: f32, y: f32, w: f32, h: f32) -> windows::co
         SetWindowLongPtrW(hwnd, GWL_STYLE, WS_POPUP.0 as isize);
         // The primary display's DPI, as a multiple of the 96 DPI that logical pixels assume.
         let scale = GetDpiForSystem() as f32 / 96.0;
-        SetWindowPos(
+        // Best effort: a card in the wrong place is better than none.
+        let _ = SetWindowPos(
             hwnd,
             None,
             (x * scale).round() as i32,
@@ -78,7 +79,7 @@ pub fn prepare_toast(title: &str, x: f32, y: f32, w: f32, h: f32) -> windows::co
             (w * scale).round() as i32,
             (h * scale).round() as i32,
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        )?;
+        );
     }
 
     // Windows 11 draws a thin border (and rounds the corners) around top-level windows, even a
