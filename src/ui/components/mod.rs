@@ -4,6 +4,7 @@
 pub mod banner;
 pub mod button;
 pub mod card;
+pub mod field_row;
 pub mod labeled_toggle;
 pub mod mic_indicator;
 pub mod number_stepper;

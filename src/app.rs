@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
 use gpui::{Context, IntoElement, Render, Window};
 use zc_core::control::{Command, EngineEvent, EngineStatus, FocusChoice};
@@ -22,17 +22,19 @@ pub enum Tab {
     Home,
     Clips,
     Profiles,
+    Editor,
     Settings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Home, Tab::Clips, Tab::Profiles, Tab::Settings];
+    pub const ALL: [Tab; 5] = [Tab::Home, Tab::Clips, Tab::Profiles, Tab::Editor, Tab::Settings];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::Home => "Home",
             Tab::Clips => "Clips",
             Tab::Profiles => "Profiles",
+            Tab::Editor => "Editor",
             Tab::Settings => "Settings",
         }
     }
@@ -70,6 +72,8 @@ pub struct ZeroClipApp {
     /// Newest first.
     pub notices: VecDeque<Notice>,
     pub clips: ui::clips::ClipList,
+    /// The metadata database (waveform cache). `None` when it couldn't be opened.
+    pub store: Option<Arc<Mutex<zc_store::Store>>>,
     #[allow(dead_code)] // used by the Profiles screen
     pub open_apps: ui::components::open_apps::OpenAppsList,
     /// The focus prompt on screen, if a second game asked to take over (D35).
@@ -165,6 +169,17 @@ impl ZeroClipApp {
         })
         .detach();
 
+        let store = match open_store(&paths.db_file) {
+            Ok(store) => Some(Arc::new(Mutex::new(store))),
+            Err(error) => {
+                notices.push_front(Notice {
+                    level: NoticeLevel::Error,
+                    text: format!("Clip metadata unavailable: {error:#}"),
+                });
+                None
+            }
+        };
+
         Ok(Self {
             screens: Screens::new(cx.weak_entity(), cx),
             engine,
@@ -178,6 +193,7 @@ impl ZeroClipApp {
             quitting: false,
             tray_hint_shown: false,
             clips: ui::clips::ClipList::default(),
+            store,
             open_apps: Default::default(),
             focus_prompt: None,
             rescues: Vec::new(),
@@ -185,6 +201,18 @@ impl ZeroClipApp {
             repairs,
             toast: None,
         })
+    }
+
+    /// Opens `path` in the Editor tab (the Clips tab's Edit button).
+    pub fn open_in_editor(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let ffmpeg = self.settings.editor.ffmpeg_path.clone();
+        let store = self.store.clone();
+        let bitrate_bps = self.settings.audio.bitrate_kbps * 1_000;
+        self.screens
+            .editor()
+            .update(cx, |editor, cx| editor.open(path, ffmpeg, store, bitrate_bps, cx));
+        self.tab = Tab::Editor;
+        cx.notify();
     }
 
     /// Where recordings are written right now.
@@ -528,6 +556,14 @@ fn repair_notice(partial: &Path) -> Notice {
             text: format!("Couldn't repair {}: {error}", partial.display()),
         },
     }
+}
+
+/// Opens the metadata database, creating its folder first.
+fn open_store(path: &Path) -> anyhow::Result<zc_store::Store> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(zc_store::Store::open(path)?)
 }
 
 #[cfg(test)]

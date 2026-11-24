@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use zc_core::Hns;
 use zc_core::media::Codec;
 
@@ -114,6 +114,40 @@ impl Store {
     pub fn schema_version(&self) -> Result<u32, StoreError> {
         Ok(self.conn.pragma_query_value(None, "user_version", |r| r.get(0))?)
     }
+
+    /// The cached waveform peaks for the file keyed `key` (`zc_editor::waveform::file_key`),
+    /// if they were stored with exactly `buckets` buckets.
+    ///
+    /// # Errors
+    /// SQLite errors.
+    pub fn waveform(&self, key: &str, buckets: usize) -> Result<Option<Vec<f32>>, StoreError> {
+        let buckets = i64::try_from(buckets).unwrap_or(i64::MAX);
+        let blob: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT peaks FROM waveform_cache WHERE file_hash = ?1 AND buckets = ?2",
+                (key, buckets),
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(blob.map(|b| {
+            b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        }))
+    }
+
+    /// Stores (or replaces) the waveform peaks of the file keyed `key`.
+    ///
+    /// # Errors
+    /// SQLite errors.
+    pub fn put_waveform(&self, key: &str, peaks: &[f32]) -> Result<(), StoreError> {
+        let blob: Vec<u8> = peaks.iter().flat_map(|p| p.to_le_bytes()).collect();
+        let buckets = i64::try_from(peaks.len()).unwrap_or(i64::MAX);
+        self.conn.execute(
+            "INSERT OR REPLACE INTO waveform_cache (file_hash, buckets, peaks) VALUES (?1, ?2, ?3)",
+            (key, buckets, blob),
+        )?;
+        Ok(())
+    }
 }
 
 /// Applies every migration past the file's `user_version`, one transaction per migration.
@@ -194,5 +228,20 @@ mod tests {
         let store = Store::open(&path).unwrap();
         let on: i64 = store.conn.pragma_query_value(None, "foreign_keys", |r| r.get(0)).unwrap();
         assert_eq!(on, 1);
+    }
+
+    #[test]
+    fn waveform_round_trips_and_misses_cleanly() {
+        let store = Store::open(&scratch_db("waveform")).unwrap();
+        assert_eq!(store.waveform("k", 3).unwrap(), None);
+        store.put_waveform("k", &[0.0, 0.5, 1.0]).unwrap();
+        assert_eq!(store.waveform("k", 3).unwrap(), Some(vec![0.0, 0.5, 1.0]));
+        // A different bucket count is a different waveform.
+        assert_eq!(store.waveform("k", 4).unwrap(), None);
+        assert_eq!(store.waveform("other", 3).unwrap(), None);
+        // Replacing keeps one row per file.
+        store.put_waveform("k", &[0.25; 4]).unwrap();
+        assert_eq!(store.waveform("k", 4).unwrap(), Some(vec![0.25; 4]));
+        assert_eq!(store.waveform("k", 3).unwrap(), None);
     }
 }
