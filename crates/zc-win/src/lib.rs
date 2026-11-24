@@ -31,3 +31,4 @@ pub mod mf;
 pub mod overlay;
 pub mod process;
 pub mod single_instance;
+pub mod toast;
