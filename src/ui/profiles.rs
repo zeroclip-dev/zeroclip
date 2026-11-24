@@ -9,20 +9,20 @@ use zc_core::Hns;
 use zc_core::profile::{GameProfile, ProfileSet, exe_name};
 use zc_core::settings::MAX_APP_TRACKS;
 
-use super::components::button::button;
+use super::components::button::{button, button_primary};
 use super::components::open_apps::{
     has_live_track, same_exe, set_audio_track, set_game_profile, track_slot_free,
 };
 use super::components::toggle::toggle;
 use super::settings::Draft;
+use super::theme;
 use super::{dvr_megabytes, effective_ceiling, human_duration};
 use crate::app::ZeroClipApp;
 
-const SURFACE: u32 = 0x25252b;
-const FIELD: u32 = 0x1b1b1f;
-const MUTED: u32 = 0x909090;
-const WARN: u32 = 0xe6be5a;
-const ACCENT: u32 = 0x4f8cff;
+const SURFACE: u32 = theme::CARD;
+const FIELD: u32 = theme::BG;
+const MUTED: u32 = theme::MUTED_FG;
+const WARN: u32 = theme::WARN;
 const MIN_SECS: u32 = 10;
 const MAX_SECS: u32 = 1_800;
 
@@ -153,10 +153,10 @@ impl Render for ProfilesView {
                     .w(px(190.0))
                     .px_2()
                     .py_1()
-                    .rounded_md()
+                    .rounded(px(theme::RADIUS_MD))
                     .bg(rgb(FIELD))
                     .border_1()
-                    .border_color(rgb(if focused { ACCENT } else { FIELD }))
+                    .border_color(rgb(if focused { theme::RING } else { theme::INPUT }))
                     .cursor_text()
                     .truncate()
                     .on_click({
@@ -205,7 +205,9 @@ impl Render for ProfilesView {
                     .gap_4()
                     .px_3()
                     .py_2()
-                    .rounded_lg()
+                    .rounded(px(theme::RADIUS))
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
                     .bg(rgb(SURFACE))
                     .child(name)
                     .child(stepper(i, profile.buffer_secs, cx, set_secs))
@@ -435,10 +437,10 @@ fn save_bar(
     problems: Vec<String>,
     cx: &mut Context<ProfilesView>,
 ) -> impl IntoElement {
-    let mut save = button("save", "Save");
+    let mut save = button_primary("save", "Save");
     let mut revert = button("revert", "Revert");
     if dirty {
-        save = save.bg(rgb(ACCENT)).on_click(cx.listener(|this, _, _, cx| {
+        save = save.on_click(cx.listener(|this, _, _, cx| {
             this.edit(cx, ZeroClipApp::save_settings);
         }));
         revert = revert.on_click(cx.listener(|this, _, _, cx| {
@@ -455,8 +457,12 @@ fn save_bar(
         .gap_1()
         .px_4()
         .py_2()
-        .bg(rgb(SURFACE))
-        .children(problems.into_iter().map(|p| div().text_sm().text_color(rgb(0xf08080)).child(p)))
+        .bg(rgb(theme::BG))
+        .border_t_1()
+        .border_color(rgb(theme::BORDER))
+        .children(
+            problems.into_iter().map(|p| div().text_sm().text_color(rgb(theme::DANGER)).child(p)),
+        )
         .child(div().flex().flex_row().items_center().gap_2().child(save).child(revert).children(
             dirty.then(|| div().text_sm().text_color(rgb(MUTED)).child("Unsaved changes")),
         ))
