@@ -41,6 +41,8 @@ pub struct ClipFile {
     pub path: PathBuf,
     pub size_bytes: u64,
     pub modified: Option<SystemTime>,
+    /// The game it was recorded from; `None` for clips from before games were tracked.
+    pub game: Option<String>,
 }
 
 impl ClipList {
@@ -90,11 +92,13 @@ impl ClipList {
                 .is_some_and(|e| EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)));
             let Ok(meta) = entry.metadata() else { continue };
             if wanted && meta.is_file() {
+                let game = zc_core::game_tag::load(&path);
                 self.files.push(ClipFile {
                     name: entry.file_name().to_string_lossy().into_owned(),
                     path,
                     size_bytes: meta.len(),
                     modified: meta.modified().ok(),
+                    game,
                 });
             }
         }
@@ -134,13 +138,25 @@ impl Kind {
     }
 }
 
+/// The game filter's name for clips with no tag.
+const OTHER: &str = "Other";
+
 /// The files of `kind` whose name contains `query` (case-insensitive, surrounding spaces
 /// ignored), in the original order.
-fn filter_files<'a>(files: &'a [ClipFile], kind: Kind, query: &str) -> Vec<&'a ClipFile> {
+fn filter_files<'a>(
+    files: &'a [ClipFile],
+    kind: Kind,
+    query: &str,
+    game: Option<&str>,
+) -> Vec<&'a ClipFile> {
     let query = query.trim().to_lowercase();
     files
         .iter()
-        .filter(|f| kind.accepts(&f.name) && f.name.to_lowercase().contains(&query))
+        .filter(|f| {
+            kind.accepts(&f.name)
+                && f.name.to_lowercase().contains(&query)
+                && game.is_none_or(|g| f.game.as_deref().unwrap_or(OTHER) == g)
+        })
         .collect()
 }
 
@@ -156,6 +172,8 @@ pub struct ClipsView {
     app: WeakEntity<ZeroClipApp>,
     query: String,
     kind: Kind,
+    /// Only clips of this game (`OTHER` for untagged ones); `None` shows all.
+    game: Option<String>,
     /// Search box focus, made on the first render.
     focus: Option<FocusHandle>,
     /// Rename box focus, made on the first render.
@@ -238,6 +256,7 @@ impl ClipsView {
             app,
             query: String::new(),
             kind: Kind::All,
+            game: None,
             focus: None,
             rename_focus: None,
             renaming: None,
@@ -258,6 +277,7 @@ impl ClipsView {
         match outcome {
             Ok(to) => {
                 zc_core::bookmarks::rename(&rename.path, &to);
+                zc_core::game_tag::rename(&rename.path, &to);
                 self.renaming = None;
                 let name =
                     to.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
@@ -427,7 +447,11 @@ impl Render for ClipsView {
         }
 
         let clips = &entity.read(cx).clips;
-        let shown = filter_files(&clips.files, self.kind, &self.query);
+        let mut games: Vec<&str> =
+            clips.files.iter().map(|f| f.game.as_deref().unwrap_or(OTHER)).collect();
+        games.sort_unstable_by_key(|g| (*g == OTHER, g.to_lowercase()));
+        games.dedup();
+        let shown = filter_files(&clips.files, self.kind, &self.query, self.game.as_deref());
 
         let header = div()
             .flex()
@@ -484,6 +508,27 @@ impl Render for ClipsView {
                     cx.notify();
                 }),
             ))
+            .children((games.len() > 1).then(|| {
+                let names: Vec<SharedString> = std::iter::once("All games")
+                    .chain(games.iter().copied())
+                    .map(SharedString::from)
+                    .collect();
+                let current = self
+                    .game
+                    .as_deref()
+                    .map_or(Some(0), |g| games.iter().position(|x| *x == g).map(|i| i + 1));
+                let games: Vec<String> = games.iter().map(|g| (*g).to_owned()).collect();
+                segmented(
+                    "clips-game",
+                    names,
+                    current,
+                    true,
+                    cx.listener(move |this, i: &usize, _, cx| {
+                        this.game = i.checked_sub(1).and_then(|i| games.get(i).cloned());
+                        cx.notify();
+                    }),
+                )
+            }))
             .child(segmented(
                 "clips-layout",
                 vec![SharedString::from("List"), SharedString::from("Grid")],
@@ -785,7 +830,13 @@ mod tests {
     use super::*;
 
     fn file(name: &str) -> ClipFile {
-        ClipFile { name: name.to_owned(), path: PathBuf::from(name), size_bytes: 1, modified: None }
+        ClipFile {
+            name: name.to_owned(),
+            path: PathBuf::from(name),
+            size_bytes: 1,
+            modified: None,
+            game: None,
+        }
     }
 
     fn names(files: &[&ClipFile]) -> Vec<String> {
@@ -816,17 +867,17 @@ mod tests {
     #[test]
     fn filters_by_kind_and_case_insensitive_name() {
         let files = [file("Clutch.MP4"), file("ace.mkv"), file("shot-clutch.png"), file("a.jpg")];
-        assert_eq!(filter_files(&files, Kind::All, "").len(), 4);
-        assert_eq!(names(&filter_files(&files, Kind::Videos, "")), ["Clutch.MP4", "ace.mkv"]);
+        assert_eq!(filter_files(&files, Kind::All, "", None).len(), 4);
+        assert_eq!(names(&filter_files(&files, Kind::Videos, "", None)), ["Clutch.MP4", "ace.mkv"]);
         assert_eq!(
-            names(&filter_files(&files, Kind::Screenshots, "")),
+            names(&filter_files(&files, Kind::Screenshots, "", None)),
             ["shot-clutch.png", "a.jpg"]
         );
         assert_eq!(
-            names(&filter_files(&files, Kind::All, " CLUTCH ")),
+            names(&filter_files(&files, Kind::All, " CLUTCH ", None)),
             ["Clutch.MP4", "shot-clutch.png"]
         );
-        assert_eq!(names(&filter_files(&files, Kind::Videos, "clutch")), ["Clutch.MP4"]);
-        assert!(filter_files(&files, Kind::Screenshots, "ace").is_empty());
+        assert_eq!(names(&filter_files(&files, Kind::Videos, "clutch", None)), ["Clutch.MP4"]);
+        assert!(filter_files(&files, Kind::Screenshots, "ace", None).is_empty());
     }
 }
