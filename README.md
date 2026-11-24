@@ -1,6 +1,7 @@
 # ZeroClip
 
-**A zero-impact game clipper for Windows, written in Rust.** ZeroClip keeps the last
+**A game clipper for Windows, written in Rust, that aims for minimal performance impact
+(not yet measured).** ZeroClip keeps the last
 few minutes of gameplay in memory and saves them with one hotkey — without touching
 the game, without copying frames off the GPU, and without losing the clip when the
 game crashes.
@@ -14,6 +15,11 @@ game crashes.
 > - record a live master mix track next to the game and microphone tracks
 > - keep the mic always on, or use push-to-talk
 > - encode with HEVC or H.264 on the GPU
+> - offer to rescue the last footage after a game crash, and swap profiles when the game changes
+>   (implemented; the rescue prompt is still awaiting a hardware check)
+>
+> **Planned, not built yet:** the clip editor (trim, stitch), one-drop sharing to Discord and
+> YouTube, and the system tray.
 >
 > See the [roadmap](docs/ROADMAP.md) for what comes next, and
 > [How ZeroClip works](docs/HOW_IT_WORKS.md) for the design in one read. Want to help? See
@@ -28,6 +34,8 @@ game crashes.
 - No MKV output. Recordings and clips are MP4 (fMP4).
 - Game audio follows the focused window only.
 - No tray yet.
+- No editor and no sharing yet. Both are planned (Phases 5 and 6 in the roadmap).
+- Performance impact on games has not been measured. Minimal impact is the goal, not a result.
 
 ## What makes it different
 
@@ -44,9 +52,9 @@ systems work properly:
   the game — or ZeroClip — dies mid-write.
 - **A watchdog that is a state machine,** not a retry loop: drain → flush → re-init →
   resume, stepping down the codec ladder (AV1 → HEVC → H.264) when a GPU can't cope.
-- **Instant editing (planned).** Trim and stitch by stream copy, with no re-encode; keyframe snap
+- **Instant editing (planned, not built).** Trim and stitch by stream copy, with no re-encode; keyframe snap
   points are shown on the timeline.
-- **One-drop sharing (planned).** Drag a clip onto Discord or YouTube and the link lands in your
+- **One-drop sharing (planned, not built).** Drag a clip onto Discord or YouTube and the link lands in your
   clipboard.
 
 The full design and the reasoning behind each choice: [docs/DESIGN.md](docs/DESIGN.md).
@@ -81,19 +89,19 @@ flowchart TD
 
 The engine and everything beneath it is platform-independent and tested with
 synthetic streams. The Windows crates are adapters that implement the engine's
-ports; the app plugs them in. Later phases add `zc-store` (SQLite metadata),
-`zc-editor` (stream-copy trim/stitch via the ffmpeg CLI) and `zc-destinations`
-(Discord, YouTube). Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+ports; the app plugs them in. `zc-store` (SQLite metadata) is built. `zc-editor` (stream-copy trim/stitch via the ffmpeg CLI)
+and `zc-destinations` (Discord, YouTube) are stubs for later phases. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Getting started
 
 You need:
 
 - Windows 10 1903 or later (Windows 11 for per-game audio capture).
-- A GPU with a hardware video encoder — any NVIDIA, AMD or Intel GPU from roughly the last eight years.
+- A GPU with a Media Foundation hardware H.264 encoder (HEVC is used where available). There is
+  no software encoder fallback. Tested on one GPU so far.
 - Rust 1.95 or newer, installed with [rustup](https://rustup.rs), plus the MSVC build tools: Visual
   Studio Build Tools with the **Desktop development with C++** workload (rustup offers to install them).
-- From Phase 5: `ffmpeg` on your `PATH`.
+- From Phase 5 (planned): `ffmpeg` on your `PATH`.
 
 ```powershell
 cargo run --release          # the app
