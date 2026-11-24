@@ -17,17 +17,17 @@ use zc_core::media::Codec;
 use crate::app::{Tab, ZeroClipApp};
 use components::{mic_indicator::mic_indicator, status_dot::status_dot, tab_button::tab_button};
 
-const RED: u32 = 0xf08080;
-const GREEN: u32 = 0x90ee90;
-const GRAY: u32 = 0x909090;
+const RED: u32 = theme::DANGER;
+const GREEN: u32 = theme::BRAND;
+const GRAY: u32 = theme::MUTED_FG;
 
 pub fn shell(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoElement {
     div()
         .size_full()
         .flex()
         .flex_col()
-        .bg(rgb(0x1b1b1f))
-        .text_color(rgb(0xe6e6e6))
+        .bg(rgb(theme::BG))
+        .text_color(rgb(theme::FG))
         .child(top_bar(app, cx))
         .children(focus_prompt::banner(app, cx))
         .children(rescue::banner(app, cx))
