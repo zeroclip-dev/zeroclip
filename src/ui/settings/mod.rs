@@ -1,5 +1,8 @@
 //! The Settings screen: a draft of the settings being edited, and the view that edits it. Save
-//! validates and applies the draft; Revert throws it away.
+//! validates and applies the draft; Revert throws it away. A Simple | Advanced switch at the top
+//! picks the view: Simple is the few settings most people change, Advanced is the full list.
+
+mod simple;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -12,7 +15,7 @@ use zc_audio::MicDevice;
 use zc_core::hotkey::Chord;
 use zc_core::media::{Codec, ContainerFormat};
 use zc_core::settings::{
-    AAC_BITRATES_KBPS, CaptureMode, DvrStorage, MIX_GAIN_DB, MicMode, Settings,
+    AAC_BITRATES_KBPS, CaptureMode, DvrStorage, MIX_GAIN_DB, MicMode, Settings, UiMode,
 };
 use zc_video::capture::MonitorInfo;
 
@@ -26,6 +29,10 @@ use super::components::{
 use super::theme;
 use super::{dvr_megabytes, dvr_ring_megabytes, effective_ceiling, human_duration};
 use crate::app::ZeroClipApp;
+use simple::{
+    MAX_MINUTES, MIN_MINUTES, buffer_bitrate_bps, free_space, minutes_from_buffer_secs,
+    storage_line,
+};
 
 const MIC_POLL: Duration = Duration::from_secs(2);
 const HINT: u32 = theme::MUTED_FG;
@@ -215,6 +222,107 @@ fn stepper(min: f64, max: f64, step: f64, suffix: &'static str, enabled: bool) -
     Stepper { min, max, step, suffix, enabled }
 }
 
+/// The page frame both views share: the Simple | Advanced switch, the sections, then the bar.
+fn page(switch: gpui::Div, sections: Vec<AnyElement>, bar: gpui::Div) -> gpui::Div {
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .child(div().px_4().pt_4().pb_3().child(switch))
+        .child(
+            div()
+                .id("settings-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .px_4()
+                .children(sections),
+        )
+        .child(bar)
+}
+
+/// The Simple | Advanced switch. Picking a view saves it like any other setting.
+fn view_switch(mode: UiMode, cx: &mut Context<SettingsView>) -> gpui::Div {
+    let selected = match mode {
+        UiMode::Simple => 0,
+        UiMode::Advanced => 1,
+    };
+    segmented(
+        "settings-view",
+        labels(["Simple", "Advanced"]),
+        Some(selected),
+        true,
+        cx.listener(|this: &mut SettingsView, ix: &usize, _, cx| {
+            let mode = if *ix == 0 { UiMode::Simple } else { UiMode::Advanced };
+            if let Some(app) = this.app.upgrade() {
+                app.update(cx, |app, cx| {
+                    app.set_ui_mode(mode);
+                    cx.notify();
+                });
+            }
+            cx.notify();
+        }),
+    )
+}
+
+/// Save and Revert, and every problem with the draft. Shared by both views.
+fn save_bar(d: &Draft, dirty: bool, cx: &mut Context<SettingsView>) -> gpui::Div {
+    let dim = if dirty { 1.0 } else { 0.4 };
+    let save = button_primary("save", "Save").opacity(dim);
+    let revert = button("revert", "Revert").opacity(dim);
+    let (save, revert) = if dirty {
+        (
+            save.on_click(cx.listener(|this, _, _, cx| {
+                if let Some(app) = this.app.upgrade() {
+                    app.update(cx, |app, cx| {
+                        app.save_settings();
+                        cx.notify();
+                    });
+                }
+                cx.notify();
+            })),
+            revert.on_click(cx.listener(|this, _, _, cx| {
+                if let Some(app) = this.app.upgrade() {
+                    app.update(cx, |app, cx| {
+                        app.draft = Draft::from_settings(&app.settings);
+                        cx.notify();
+                    });
+                }
+                cx.notify();
+            })),
+        )
+    } else {
+        (save, revert)
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .px_4()
+        .py_2()
+        .bg(rgb(theme::BG))
+        .border_t_1()
+        .border_color(rgb(theme::BORDER))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(save)
+                .child(revert)
+                .children(dirty.then(|| hint("Unsaved changes"))),
+        )
+        .children(
+            d.problems
+                .iter()
+                .map(|p| div().text_sm().text_color(rgb(theme::DANGER)).child(p.clone())),
+        )
+}
+
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(app) = self.app.upgrade() else { return div() };
@@ -287,6 +395,83 @@ impl Render for SettingsView {
             field(3, "f-shot", &d.screenshot, "none", 200., |d, v| d.screenshot = v.to_owned());
         let f_ptt =
             field(4, "f-ptt", &d.push_to_talk, "none", 200., |d, v| d.push_to_talk = v.to_owned());
+
+        if saved.ui_mode == UiMode::Simple {
+            let minutes = minutes_from_buffer_secs(d.settings.profiles.default.buffer_secs);
+            let bitrate = buffer_bitrate_bps(
+                d.settings.video.max_bitrate_kbps,
+                d.settings.audio.bitrate_kbps,
+            );
+            let line = storage_line(minutes, bitrate, free_space(&app.read(cx).output_dir()));
+            let line_color = if line.too_small { theme::DANGER } else { HINT };
+
+            // The number sits inside the sentence, so the heading reads "Clip the last 20 minutes".
+            let number = number_stepper(
+                "simple-minutes",
+                f64::from(minutes),
+                stepper(MIN_MINUTES, MAX_MINUTES, 1., "", true),
+                bind!(cx, |d, v: &f64| d.settings.profiles.default.buffer_secs = (*v as u32) * 60),
+            );
+            let intro = div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_3()
+                        .text_xl()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child("Clip the last")
+                        .child(number)
+                        .child("minutes"),
+                )
+                .child(div().text_sm().text_color(rgb(line_color)).child(line.text));
+
+            let recording = section("Recording").child(row("Output folder", f_out));
+            let hotkeys = section("Hotkeys")
+                .child(row("Save clip", f_save))
+                .child(row("Start/stop recording", f_rec))
+                .child(row("Screenshot", f_shot))
+                .child(hint(
+                    "Examples: Alt+F10, Ctrl+Shift+S, Mouse5. Hotkeys work while a game has focus.",
+                ));
+            let app_sec = section("App")
+                .child(labeled_toggle(
+                    "start-win",
+                    "Start with Windows",
+                    d.settings.app.start_with_windows,
+                    true,
+                    bind!(cx, |d, v: &bool| d.settings.app.start_with_windows = *v),
+                ))
+                .child(labeled_toggle(
+                    "close-tray",
+                    "Close to tray",
+                    d.settings.app.close_to_tray,
+                    true,
+                    bind!(cx, |d, v: &bool| d.settings.app.close_to_tray = *v),
+                ))
+                .child(labeled_toggle(
+                    "toasts",
+                    "Clip toasts",
+                    d.settings.overlay_toasts,
+                    true,
+                    bind!(cx, |d, v: &bool| d.settings.overlay_toasts = *v),
+                ));
+
+            let sections: Vec<AnyElement> = vec![
+                intro.into_any_element(),
+                recording.into_any_element(),
+                hotkeys.into_any_element(),
+                app_sec.into_any_element(),
+                div().h(px(8.)).into_any_element(),
+            ];
+            let bar = save_bar(&d, dirty, cx);
+            return page(view_switch(saved.ui_mode, cx), sections, bar);
+        }
 
         let recording = section("Recording").child(row("Output folder", f_out)).child(row(
             "Container",
@@ -659,58 +844,6 @@ impl Render for SettingsView {
                 "Off by default. Platforms re-encode uploads, can block them after the fact, and change visibility rules; the local file is your master copy.",
             ));
 
-        let dim = if dirty { 1.0 } else { 0.4 };
-        let save = button_primary("save", "Save").opacity(dim);
-        let revert = button("revert", "Revert").opacity(dim);
-        let (save, revert) = if dirty {
-            (
-                save.on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(app) = this.app.upgrade() {
-                        app.update(cx, |app, cx| {
-                            app.save_settings();
-                            cx.notify();
-                        });
-                    }
-                    cx.notify();
-                })),
-                revert.on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(app) = this.app.upgrade() {
-                        app.update(cx, |app, cx| {
-                            app.draft = Draft::from_settings(&app.settings);
-                            cx.notify();
-                        });
-                    }
-                    cx.notify();
-                })),
-            )
-        } else {
-            (save, revert)
-        };
-        let bar = div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .px_4()
-            .py_2()
-            .bg(rgb(theme::BG))
-            .border_t_1()
-            .border_color(rgb(theme::BORDER))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(save)
-                    .child(revert)
-                    .children(dirty.then(|| hint("Unsaved changes"))),
-            )
-            .children(
-                d.problems
-                    .iter()
-                    .map(|p| div().text_sm().text_color(rgb(theme::DANGER)).child(p.clone())),
-            );
-
         // Tray and startup (P4.15, P4.16)
         let app_sec = section("App")
             .child(labeled_toggle(
@@ -729,7 +862,7 @@ impl Render for SettingsView {
             ))
             .child(hint("Quit from the tray menu to close ZeroClip while it runs in the tray."));
 
-        let sections: [AnyElement; 9] = [
+        let sections: Vec<AnyElement> = vec![
             recording.into_any_element(),
             video_sec.into_any_element(),
             dvr_sec.into_any_element(),
@@ -740,23 +873,8 @@ impl Render for SettingsView {
             app_sec.into_any_element(),
             div().h(px(8.)).into_any_element(),
         ];
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .id("settings-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .px_4()
-                    .children(sections),
-            )
-            .child(bar)
+        let bar = save_bar(&d, dirty, cx);
+        page(view_switch(saved.ui_mode, cx), sections, bar)
     }
 }
 
