@@ -127,6 +127,8 @@ pub struct EditorView {
     /// Every audio track is shown and editable; otherwise only Master.
     tracks_open: bool,
     focus: Option<FocusHandle>,
+    /// Whether the timeline and editing tools show. Off, the clip plays like in a normal player.
+    editing: bool,
     /// The picture is showing over the whole window, with a bar to seek by.
     fullscreen: bool,
     full_bar: Rc<Cell<Bounds<Pixels>>>,
@@ -191,6 +193,7 @@ impl EditorView {
             listen: 0,
             tracks_open: false,
             focus: None,
+            editing: true,
             fullscreen: false,
             full_bar: Rc::new(Cell::new(Bounds::default())),
         }
@@ -209,6 +212,7 @@ impl EditorView {
     pub fn open(
         &mut self,
         path: PathBuf,
+        watch: bool,
         ffmpeg_path: Option<PathBuf>,
         store: Option<Arc<Mutex<Store>>>,
         bitrate_bps: u32,
@@ -218,6 +222,7 @@ impl EditorView {
         self.store = store;
         self.bitrate_bps = bitrate_bps;
         self.reset();
+        self.editing = !watch;
         if let Some(app) = self.app.upgrade() {
             let editor = &app.read(cx).settings.editor;
             (self.finish, self.listen) = (editor.finish, usize::from(editor.listen_track));
@@ -967,6 +972,8 @@ impl EditorView {
             "f" if plain => self.set_fullscreen(!self.fullscreen, window, cx),
             "escape" if self.fullscreen => self.set_fullscreen(false, window, cx),
             "space" if plain => self.toggle_play(cx),
+            // Watching is only watching: the editing keys wait for the Edit button.
+            _ if !self.editing => {}
             "s" if plain => self.split(cx),
             "delete" | "backspace" if plain && self.range.is_some() => self.silence_range(cx),
             "delete" | "backspace" if plain => self.delete_selected(cx),
@@ -1090,7 +1097,8 @@ impl Render for EditorView {
             window.focus(&focus, cx);
         }
         let viewport = window.viewport_size();
-        let video_height = (f32::from(viewport.height) * VIDEO_SHARE).clamp(VIDEO_MIN, VIDEO_MAX);
+        let share = if self.editing { VIDEO_SHARE } else { 0.7 };
+        let video_height = (f32::from(viewport.height) * share).clamp(VIDEO_MIN, VIDEO_MAX * 1.5);
         let wide = f32::from(viewport.width) >= WIDE;
 
         let mut page = div()
@@ -1136,7 +1144,10 @@ impl Render for EditorView {
         if self.confirm_close {
             page = page.child(self.close_prompt(cx));
         }
-        if !self.timeline.pieces.is_empty() {
+        if !self.timeline.pieces.is_empty() && !self.editing {
+            page = page.child(self.player_view(video_height, cx));
+        }
+        if !self.timeline.pieces.is_empty() && self.editing {
             // Wide windows put the editing panel beside the picture; narrow ones stack it below.
             let side = div()
                 .flex()
@@ -1305,7 +1316,7 @@ impl EditorView {
                                         )
                                     })
                                     .unwrap_or((None, None, this.bitrate_bps));
-                                this.open(path, ffmpeg, store, bitrate, cx);
+                                this.open(path, false, ffmpeg, store, bitrate, cx);
                             } else {
                                 this.add_clip(path, cx);
                             }
@@ -1373,19 +1384,32 @@ impl EditorView {
                 .child(button_ghost("editor-fullscreen", "Fullscreen (F)").on_click(
                     cx.listener(|this, _, window, cx| this.set_fullscreen(true, window, cx)),
                 ))
-                .child(
+                .children(self.editing.then(|| {
                     button("editor-split", "Split")
                         .child(icon("scissors", theme::FG))
-                        .on_click(cx.listener(|this, _, _, cx| this.split(cx))),
-                )
-                .child(
+                        .on_click(cx.listener(|this, _, _, cx| this.split(cx)))
+                }))
+                .children(self.editing.then(|| {
                     button_ghost("editor-delete", "Delete piece")
                         .child(icon("trash-2", theme::MUTED_FG))
-                        .on_click(cx.listener(|this, _, _, cx| this.delete_selected(cx))),
-                );
-        div().flex().flex_col().gap_2().child(video).child(controls).child(muted(
-            "Space plays, S splits, J joins, Delete removes, Ctrl+Z undoes. On a lane, drag to pick a stretch and press Delete to silence it; click the line to add a volume point.",
-        ))
+                        .on_click(cx.listener(|this, _, _, cx| this.delete_selected(cx)))
+                }))
+                .children((!self.editing).then(|| {
+                    button_primary("editor-edit", "Edit")
+                        .on_click(cx.listener(|this, _, _, cx| this.start_editing(cx)))
+                }));
+        let help = if self.editing {
+            "Space plays, S splits, J joins, Delete removes, Ctrl+Z undoes. On a lane, drag to pick a stretch and press Delete to silence it; click the line to add a volume point."
+        } else {
+            "Space plays, F is fullscreen. Press Edit to cut, trim and change the sound."
+        };
+        div().flex().flex_col().gap_2().child(video).child(controls).child(muted(help))
+    }
+
+    /// Leaves the plain player for the full editor, on the same clip and place.
+    fn start_editing(&mut self, cx: &mut Context<Self>) {
+        self.editing = true;
+        cx.notify();
     }
 
     /// The picture over the whole editor: play, the time, and a bar of the pieces to seek by, so

@@ -485,13 +485,19 @@ impl Render for ClipsView {
             let rows = shown.iter().enumerate().map(|(i, file)| {
                 let is_video = Kind::Videos.accepts(&file.name);
                 let edit = is_video.then(|| {
-                    let path = file.path.clone();
-                    button_ghost(("clip-edit", i), "Edit").on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            let path = path.clone();
-                            let _ = this.app.update(cx, |app, cx| app.open_in_editor(path, cx));
+                    [("clip-watch", "Watch", true), ("clip-edit", "Edit", false)].map(
+                        |(id, label, watch)| {
+                            let path = file.path.clone();
+                            button_ghost((id, i), label).on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    let path = path.clone();
+                                    let _ = this
+                                        .app
+                                        .update(cx, |app, cx| app.open_in_editor(path, watch, cx));
+                                },
+                            ))
                         },
-                    ))
+                    )
                 });
                 let rename = {
                     let path = file.path.clone();
@@ -518,7 +524,12 @@ impl Render for ClipsView {
                 } else {
                     Some(file.path.clone())
                 };
-                let actions = div().flex().flex_row().gap_1().children(edit).child(rename);
+                let actions = div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .children(edit.into_iter().flatten())
+                    .child(rename);
                 if self.grid {
                     return self
                         .drag_source(div(), &file.path, cx)

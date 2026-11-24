@@ -211,14 +211,15 @@ impl ZeroClipApp {
         })
     }
 
-    /// Opens `path` in the Editor tab (the Clips tab's Edit button).
-    pub fn open_in_editor(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    /// Opens `path` in the Editor tab: as a plain player when `watch`, else ready to edit (the Clips
+    /// tab's Watch and Edit buttons).
+    pub fn open_in_editor(&mut self, path: PathBuf, watch: bool, cx: &mut Context<Self>) {
         let ffmpeg = self.settings.editor.ffmpeg_path.clone();
         let store = self.store.clone();
         let bitrate_bps = self.settings.audio.bitrate_kbps * 1_000;
         self.screens
             .editor()
-            .update(cx, |editor, cx| editor.open(path, ffmpeg, store, bitrate_bps, cx));
+            .update(cx, |editor, cx| editor.open(path, watch, ffmpeg, store, bitrate_bps, cx));
         self.tab = Tab::Editor;
         cx.notify();
     }
