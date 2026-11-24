@@ -92,7 +92,7 @@ Measured 2026-10-05 with `spike-phase2`: every track within ±11 ms of its minut
 - [x] `zc-store` (rusqlite, bundled) and the migrations (built, not wired in yet)
 - [x] Profile engine on foreground change, with safe buffer resizing
 - [x] Watchdog wiring and the `synthetic_harness` recovery spec (P4.9)
-- [ ] Crash rescue (`recovery.tmp` + prompt) (P4.11, P4.12)
+- [x] Crash rescue (`recovery.tmp` + prompt) (P4.11, P4.12) (awaiting HW check on the prompt)
 - [ ] Flight recorder: in-memory ring of recent events, dumped with crash rescue
 - [ ] System tray; close-to-tray; start with Windows
 

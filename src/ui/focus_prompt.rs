@@ -3,16 +3,13 @@
 
 use gpui::{
     Context, FontWeight, IntoElement, ParentElement, StatefulInteractiveElement as _, Styled, div,
-    rgb,
 };
 use zc_core::control::FocusChoice;
 use zc_core::focus_prompt::is_shell;
 
+use super::components::banner::banner as strip;
 use super::components::button::button;
 use crate::app::ZeroClipApp;
-
-const BANNER_BG: u32 = 0x3a3320;
-const BANNER_EDGE: u32 = 0x5c4f20;
 
 /// A focus prompt on screen: the game being clipped, and the app that has focus (file names).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,17 +41,7 @@ fn has_left(game: Option<&str>, prompt: Option<&FocusPrompt>) -> bool {
 pub fn banner(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> Option<impl IntoElement> {
     let prompt = app.focus_prompt.as_ref()?;
     Some(
-        div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_center()
-            .gap_3()
-            .px_3()
-            .py_2()
-            .bg(rgb(BANNER_BG))
-            .border_b_1()
-            .border_color(rgb(BANNER_EDGE))
+        strip()
             .child(
                 div().font_weight(FontWeight::SEMIBOLD).child(format!(
                     "Clipping {}. {} is in focus.",
