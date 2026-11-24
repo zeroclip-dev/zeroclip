@@ -346,7 +346,7 @@ fn parse_keyframes(text: &str, start: Hns) -> Vec<Hns> {
 
 /// Converts little-endian f32 PCM bytes to samples. A trailing partial sample is dropped.
 fn f32_samples(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+    bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
 }
 
 /// Flags every job starts with: quiet, never read stdin, and never overwrite. Exports are

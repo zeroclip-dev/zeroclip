@@ -595,7 +595,7 @@ mod tests {
                 // The tfra's body is after its 8-byte header: a version, flags, track ID, the
                 // length word, the entry count, then 19-byte entries.
                 let tfra = &body[start as usize + 8..end as usize];
-                for entry in tfra[16..].chunks_exact(19) {
+                for entry in tfra[16..].as_chunks::<19>().0.iter() {
                     let moof = u64_at(entry, 8) as usize;
                     assert_eq!(&file[moof + 4..moof + 8], b"moof", "an entry points at a moof");
                 }

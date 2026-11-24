@@ -1090,7 +1090,9 @@ mod tests {
     /// version and flags, the sample count and the data offset.
     fn trun_samples(trun: &[u8]) -> Vec<(u32, u32, u32)> {
         trun[12..]
-            .chunks_exact(12)
+            .as_chunks::<12>()
+            .0
+            .iter()
             .map(|entry| (u32_at(entry, 0), u32_at(entry, 4), u32_at(entry, 8)))
             .collect()
     }
@@ -1355,7 +1357,7 @@ mod tests {
         for (_, tfra) in boxes(body).into_iter().filter(|(kind, _)| kind == b"tfra") {
             let track_id = u32_at(tfra, 4);
             assert_eq!(u32_at(tfra, 12), 3, "one entry per fragment");
-            for entry in tfra[16..].chunks_exact(19) {
+            for entry in tfra[16..].as_chunks::<19>().0.iter() {
                 let offset = u64_at(entry, 8) as usize;
                 assert_eq!(&file[offset + 4..offset + 8], b"moof", "the entry points at a moof");
                 let moof = &file[offset + 8..offset + u32_at(&file, offset) as usize];
