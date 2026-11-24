@@ -21,6 +21,9 @@
 use std::ffi::c_void;
 
 use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DwmSetWindowAttribute,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GWL_EXSTYLE, GetWindowLongPtrW, SPI_GETCLIENTAREAANIMATION, SW_SHOWNOACTIVATE,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowDisplayAffinity, SetWindowLongPtrW, ShowWindow,
@@ -51,6 +54,29 @@ pub fn prepare_toast(title: &str) -> windows::core::Result<()> {
     // SAFETY: `hwnd` is still live. The affinity is set before the window is ever shown, so the
     // card is never visible to a capture. Errors are returned, not ignored: no affinity, no card.
     unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) }?;
+
+    // Windows 11 draws a thin border (and rounds the corners) around top-level windows, even a
+    // borderless one, so the toast would not look transparent. Turn both off.
+    // https://learn.microsoft.com/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+    // Best effort: older Windows 10 builds don't know these attributes and just ignore them.
+    let no_border: u32 = 0xFFFF_FFFE; // DWMWA_COLOR_NONE
+    let square: i32 = 1; // DWMWCP_DONOTROUND
+    // SAFETY: `hwnd` is still live. Each pointer is to a local that lives across its call, and the
+    // size passed is that local's size (4 bytes), as the attribute requires.
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            (&raw const no_border).cast::<c_void>(),
+            4,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&raw const square).cast::<c_void>(),
+            4,
+        );
+    }
 
     // SAFETY: `hwnd` is still live. SW_SHOWNOACTIVATE shows the window without giving it focus.
     // The return value only says whether it was visible before, so it is not needed.
