@@ -17,7 +17,7 @@ mod ui;
 mod wiring;
 
 use gpui::{
-    AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size,
+    AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -43,7 +43,7 @@ fn main() -> anyhow::Result<()> {
 
     let settings = settings_store::load(&paths.settings_file);
 
-    Application::new().run(move |cx| {
+    gpui_platform::application().run(move |cx| {
         let bounds = Bounds::centered(None, size(px(980.0), px(660.0)), cx);
         let opened = cx.open_window(
             WindowOptions {
@@ -70,7 +70,7 @@ fn main() -> anyhow::Result<()> {
             tracing::error!(%error, "couldn't open the window");
             cx.quit();
         }
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
             }

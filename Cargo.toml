@@ -36,7 +36,8 @@ zc-destinations = { path = "crates/zc-destinations" }
 anyhow = "1.0.104"
 async-channel = "2.5.0"
 directories = "6.0.0"
-gpui = "0.2.2"
+gpui = { git = "https://github.com/sonorahq/gpui", rev = "e5766e772ee939b741456eeec22dbe6764fafcdd" }
+gpui_platform = { git = "https://github.com/sonorahq/gpui", rev = "e5766e772ee939b741456eeec22dbe6764fafcdd" }
 # PNG screenshots.
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 # `bundled` compiles SQLite into the binary, so there is no sqlite3.dll to ship. It needs
@@ -100,6 +101,7 @@ zc-win.workspace = true
 anyhow.workspace = true
 directories.workspace = true
 gpui.workspace = true
+gpui_platform.workspace = true
 async-channel.workspace = true
 toml.workspace = true
 tracing.workspace = true
