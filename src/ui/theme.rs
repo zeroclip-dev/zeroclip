@@ -14,10 +14,13 @@ pub const PRIMARY: u32 = 0xfafafa;
 pub const PRIMARY_FG: u32 = 0x18181b;
 pub const ACCENT: u32 = 0x1f1f23;
 pub const BRAND: u32 = 0x2dd4bf;
+#[allow(dead_code)] // token mirrors the preview; banners and status pill use the soft fills
 pub const BRAND_SOFT: u32 = 0x0f2f2c;
 pub const WARN: u32 = 0xfbbf24;
+#[allow(dead_code)]
 pub const WARN_SOFT: u32 = 0x2a2108;
 pub const DANGER: u32 = 0xf87171;
+#[allow(dead_code)]
 pub const DANGER_SOFT: u32 = 0x301212;
 
 /// Corner radii in px: cards, controls, small chips (`--r`, `--r-md`, `--r-sm`).
