@@ -10,12 +10,21 @@ use windows::Graphics::Capture::{
 };
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
+use windows::Win32::Devices::Display::{
+    DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SDR_WHITE_LEVEL,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes,
+    QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+};
 use windows::Win32::Foundation::{E_ACCESSDENIED, HWND, LPARAM, POINT, RECT, TRUE};
 use windows::Win32::Graphics::Direct3D11::{D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11Texture2D};
-use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_ACCESS_DENIED, IDXGIDevice};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, DXGI_ERROR_ACCESS_DENIED, IDXGIDevice, IDXGIFactory1, IDXGIOutput6,
+};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
-    MonitorFromPoint,
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW, MonitorFromPoint, MonitorFromWindow,
 };
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
@@ -29,6 +38,10 @@ use zc_win::error::{WinResultExt, platform_error};
 /// WGC's BGRA format. The video processor converts it to NV12 (see [`crate::convert`]).
 const FORMAT: DirectXPixelFormat = DirectXPixelFormat::B8G8R8A8UIntNormalized;
 
+/// What WGC gives when Windows HDR is on and we ask for the real picture: 16-bit float scRGB,
+/// where 1.0 is 80 nits. [`crate::tonemap`] turns it into SDR.
+const FORMAT_HDR: DirectXPixelFormat = DirectXPixelFormat::R16G16B16A16Float;
+
 /// One captured frame, still in VRAM.
 #[derive(Debug)]
 pub struct CapturedFrame {
@@ -39,6 +52,9 @@ pub struct CapturedFrame {
     pub time: Hns,
     /// Content size in pixels; changes when the window or display mode does.
     pub size: (u32, u32),
+    /// `Some(nits)` when `texture` is float scRGB from an HDR display, with Windows' SDR white
+    /// level; `None` for an ordinary BGRA8 frame.
+    pub sdr_white: Option<f32>,
 }
 
 /// A display Windows reports, for the settings screen.
@@ -121,6 +137,96 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
             })
         })
         .collect()
+}
+
+/// The display `target` is on.
+fn target_monitor(target: CaptureTarget) -> HMONITOR {
+    match target {
+        CaptureTarget::PrimaryMonitor => primary_monitor(),
+        CaptureTarget::Monitor(index) => monitor_at(index).unwrap_or_else(primary_monitor),
+        // SAFETY: an invalid HWND makes the call return the nearest display; it can't cause UB.
+        CaptureTarget::Window(hwnd) => unsafe {
+            MonitorFromWindow(HWND(hwnd as *mut c_void), MONITOR_DEFAULTTONEAREST)
+        },
+    }
+}
+
+/// Whether Windows HDR is switched on for `monitor` (its DXGI output is in HDR10 mode).
+fn is_hdr(monitor: HMONITOR) -> bool {
+    // SAFETY: plain DXGI enumeration; every interface is released when it drops.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else { return false };
+        for adapter in (0..).map_while(|i| factory.EnumAdapters1(i).ok()) {
+            for output in (0..).map_while(|i| adapter.EnumOutputs(i).ok()) {
+                if output.GetDesc().is_ok_and(|d| d.Monitor == monitor)
+                    && let Ok(output) = output.cast::<IDXGIOutput6>()
+                    && let Ok(desc) = output.GetDesc1()
+                {
+                    return desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The "SDR content brightness" Windows applies to `monitor`, in nits.
+/// [DISPLAYCONFIG_SDR_WHITE_LEVEL](https://learn.microsoft.com/windows/win32/api/wingdi/ns-wingdi-displayconfig_sdr_white_level)
+/// counts in 1/1000ths of 80 nits.
+fn sdr_white_nits(monitor: HMONITOR) -> Option<f32> {
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = u32::try_from(std::mem::size_of::<MONITORINFOEXW>()).ok()?;
+    // SAFETY: MONITORINFOEXW starts with a MONITORINFO and its cbSize says which one it is.
+    if !unsafe { GetMonitorInfoW(monitor, std::ptr::from_mut(&mut info).cast()) }.as_bool() {
+        return None;
+    }
+    let (mut paths, mut modes) = (0_u32, 0_u32);
+    // SAFETY: valid out-parameters; the vectors are sized by the call before they are filled.
+    unsafe {
+        GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths, &mut modes).ok().ok()?;
+        let mut path_buf = vec![DISPLAYCONFIG_PATH_INFO::default(); paths as usize];
+        let mut mode_buf = vec![DISPLAYCONFIG_MODE_INFO::default(); modes as usize];
+        QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut paths,
+            path_buf.as_mut_ptr(),
+            &mut modes,
+            mode_buf.as_mut_ptr(),
+            None,
+        )
+        .ok()
+        .ok()?;
+        for path in path_buf.iter().take(paths as usize) {
+            let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+            source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            source.header.size = u32::try_from(std::mem::size_of_val(&source)).ok()?;
+            source.header.adapterId = path.sourceInfo.adapterId;
+            source.header.id = path.sourceInfo.id;
+            if DisplayConfigGetDeviceInfo(&mut source.header) != 0
+                || source.viewGdiDeviceName != info.szDevice
+            {
+                continue;
+            }
+            let mut white = DISPLAYCONFIG_SDR_WHITE_LEVEL::default();
+            white.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+            white.header.size = u32::try_from(std::mem::size_of_val(&white)).ok()?;
+            white.header.adapterId = path.targetInfo.adapterId;
+            white.header.id = path.targetInfo.id;
+            if DisplayConfigGetDeviceInfo(&mut white.header) == 0 {
+                return Some(white.SDRWhiteLevel as f32 * 80.0 / 1000.0);
+            }
+        }
+    }
+    None
+}
+
+/// `Some(SDR white in nits)` when Windows HDR is on for the display `target` is on, so capture
+/// should take the float scRGB frame and tone-map it; `None` for an ordinary SDR display.
+#[must_use]
+pub fn hdr_sdr_white(target: CaptureTarget) -> Option<f32> {
+    let monitor = target_monitor(target);
+    // 200 nits is Windows' usual default if the level can't be read.
+    is_hdr(monitor).then(|| sdr_white_nits(monitor).unwrap_or(200.0))
 }
 
 /// Resolves a [`CaptureTarget`] into a WGC capture item
@@ -210,12 +316,14 @@ impl WgcCapture {
         device: &ID3D11Device,
         item: &GraphicsCaptureItem,
         capture_cursor: bool,
+        hdr_white: Option<f32>,
         on_frame: impl FnMut(CapturedFrame) + Send + 'static,
     ) -> Result<Self, SourceError> {
         let err = |context: &'static str| move |e| capture_error(context, &e);
         let d3d = winrt_device(device).map_err(err("CreateDirect3D11DeviceFromDXGIDevice"))?;
         let size = item.Size().map_err(err("GraphicsCaptureItem::Size"))?;
-        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&d3d, FORMAT, 2, size)
+        let format = if hdr_white.is_some() { FORMAT_HDR } else { FORMAT };
+        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&d3d, format, 2, size)
             .map_err(err("Direct3D11CaptureFramePool::CreateFreeThreaded"))?;
 
         // `TypedEventHandler` takes `Fn`, so the mutable state lives in a mutex. A
@@ -233,7 +341,7 @@ impl WgcCapture {
                 let frame = pool.TryGetNextFrame()?;
                 let content = frame.ContentSize()?;
                 if content != *last_size {
-                    pool.Recreate(&winrt_device(device)?, FORMAT, 2, content)?;
+                    pool.Recreate(&winrt_device(device)?, format, 2, content)?;
                     *last_size = content;
                 }
                 let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
@@ -246,7 +354,12 @@ impl WgcCapture {
                 let width = u32::try_from(content.Width).unwrap_or(0).min(desc.Width);
                 let height = u32::try_from(content.Height).unwrap_or(0).min(desc.Height);
                 let time = Hns(frame.SystemRelativeTime()?.Duration);
-                on_frame(CapturedFrame { texture, time, size: (width, height) });
+                on_frame(CapturedFrame {
+                    texture,
+                    time,
+                    size: (width, height),
+                    sdr_white: hdr_white,
+                });
                 frame.Close()
             });
         let token = pool.FrameArrived(&handler).map_err(err("FrameArrived"))?;
