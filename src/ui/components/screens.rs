@@ -7,7 +7,7 @@ use gpui::{AnyView, App, AppContext, Entity, WeakEntity};
 use crate::app::{Tab, ZeroClipApp};
 use crate::ui::{
     clips::ClipsView, editor::EditorView, home::HomeView, profiles::ProfilesView,
-    settings::SettingsView,
+    settings::SettingsView, video_player::VideoPlayerView,
 };
 
 /// One live view per tab.
@@ -17,6 +17,7 @@ pub struct Screens {
     profiles: Entity<ProfilesView>,
     editor: Entity<EditorView>,
     settings: Entity<SettingsView>,
+    player: Entity<VideoPlayerView>,
 }
 
 impl Screens {
@@ -26,13 +27,19 @@ impl Screens {
             clips: cx.new(|_| ClipsView::new(app.clone())),
             profiles: cx.new(|cx| ProfilesView::new(app.clone(), cx)),
             editor: cx.new(|_| EditorView::new(app.clone())),
-            settings: cx.new(|_| SettingsView::new(app)),
+            settings: cx.new(|_| SettingsView::new(app.clone())),
+            player: cx.new(|_| VideoPlayerView::new(app)),
         }
     }
 
     /// The Editor view, so other screens can open a clip in it.
     pub fn editor(&self) -> &Entity<EditorView> {
         &self.editor
+    }
+
+    /// The video player, so other screens can play a clip in it.
+    pub fn player(&self) -> &Entity<VideoPlayerView> {
+        &self.player
     }
 
     /// The view shown for `tab`.
@@ -43,6 +50,7 @@ impl Screens {
             Tab::Profiles => self.profiles.clone().into(),
             Tab::Editor => self.editor.clone().into(),
             Tab::Settings => self.settings.clone().into(),
+            Tab::Player => self.player.clone().into(),
         }
     }
 }

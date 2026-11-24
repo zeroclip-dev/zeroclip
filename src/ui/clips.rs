@@ -513,9 +513,13 @@ impl Render for ClipsView {
                             button_ghost((id, i), label).on_click(cx.listener(
                                 move |this, _, _, cx| {
                                     let path = path.clone();
-                                    let _ = this
-                                        .app
-                                        .update(cx, |app, cx| app.open_in_editor(path, watch, cx));
+                                    let _ = this.app.update(cx, |app, cx| {
+                                        if watch {
+                                            app.play_clip(path, cx);
+                                        } else {
+                                            app.open_in_editor(path, false, cx);
+                                        }
+                                    });
                                 },
                             ))
                         },
@@ -587,7 +591,7 @@ impl Render for ClipsView {
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             let path = path.clone();
                                             let _ = this.app.update(cx, |app, cx| {
-                                                app.open_in_editor(path, true, cx)
+                                                app.play_clip(path, cx)
                                             });
                                         }))
                                 })

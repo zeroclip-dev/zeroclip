@@ -227,7 +227,7 @@ impl Render for HomeView {
                     ))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let path = path.clone();
-                        let _ = this.app.update(cx, |app, cx| app.open_in_editor(path, true, cx));
+                        let _ = this.app.update(cx, |app, cx| app.play_clip(path, cx));
                     }))
             })
             .collect();
