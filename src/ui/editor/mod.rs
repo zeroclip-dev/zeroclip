@@ -110,6 +110,8 @@ pub struct EditorView {
     export: Export,
     /// The "what now?" choice is showing.
     finishing: bool,
+    /// "Close the editor?" is showing.
+    confirm_close: bool,
     /// Whether the choice is kept for next time.
     remember: bool,
     /// The remembered choice for Done, and the audio track the preview plays.
@@ -159,6 +161,7 @@ impl EditorView {
             picking: false,
             export: Export::Idle,
             finishing: false,
+            confirm_close: false,
             remember: false,
             finish: FinishChoice::Ask,
             listen: 0,
@@ -176,10 +179,21 @@ impl EditorView {
         bitrate_bps: u32,
         cx: &mut Context<Self>,
     ) {
-        self.generation += 1;
         self.ffmpeg_path = ffmpeg_path;
         self.store = store;
         self.bitrate_bps = bitrate_bps;
+        self.reset();
+        if let Some(app) = self.app.upgrade() {
+            let editor = &app.read(cx).settings.editor;
+            (self.finish, self.listen) = (editor.finish, usize::from(editor.listen_track));
+        }
+        self.add_clip(path, cx);
+    }
+
+    /// Empties the project: no clips, no history, no picture.
+    fn reset(&mut self) {
+        self.generation += 1;
+        self.player.pause();
         self.sources.clear();
         self.timeline = Timeline::default();
         self.undo.clear();
@@ -192,12 +206,9 @@ impl EditorView {
         self.player.reset();
         self.picking = false;
         self.finishing = false;
+        self.confirm_close = false;
+        self.range = None;
         self.export = Export::Idle;
-        if let Some(app) = self.app.upgrade() {
-            let editor = &app.read(cx).settings.editor;
-            (self.finish, self.listen) = (editor.finish, usize::from(editor.listen_track));
-        }
-        self.add_clip(path, cx);
     }
 
     /// Reads `path` in the background, then puts it at the end of the timeline.
@@ -243,9 +254,14 @@ impl EditorView {
         self.loading.pop();
         match result {
             Ok((ffmpeg, info)) => {
+                // Clips differ in how many audio tracks they have (an app that was closed has no
+                // track), so those are not compared; every piece keeps the tracks all share.
+                let same_audio = |s: StreamInfo| StreamInfo { audio_tracks: 0, ..s };
                 if let Some(first) = self.sources.first()
-                    && let Err(error) =
-                        zc_editor::concat::check_compatible(&[first.info.stream, info.stream])
+                    && let Err(error) = zc_editor::concat::check_compatible(&[
+                        same_audio(first.info.stream),
+                        same_audio(info.stream),
+                    ])
                 {
                     self.problem = Some(format!(
                         "This clip can't join the others without re-encoding: {error}."
@@ -253,19 +269,28 @@ impl EditorView {
                     cx.notify();
                     return;
                 }
-                let tracks = usize::from(info.stream.audio_tracks);
+                let own = usize::from(info.stream.audio_tracks);
+                let tracks = self.timeline.pieces.first().map_or(own, |p| p.tracks.len().min(own));
+                if tracks < own || self.timeline.pieces.first().is_some_and(|p| p.tracks.len() > tracks) {
+                    self.problem = Some(format!(
+                        "The clips have different numbers of audio tracks, so the joined video keeps                          the first {tracks} of each."
+                    ));
+                }
                 let index = self.sources.len();
                 let name =
                     path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
                 self.checkpoint();
+                for piece in &mut self.timeline.pieces {
+                    piece.tracks.truncate(tracks);
+                }
                 self.timeline.pieces.push(Piece {
                     source: index,
                     a: Hns::ZERO,
                     b: info.duration,
                     tracks: vec![TrackEdit::default(); tracks],
                 });
-                self.sources.push(Source { path, name, info, waves: vec![None; tracks] });
-                for track in 0..tracks {
+                self.sources.push(Source { path, name, info, waves: vec![None; own] });
+                for track in 0..own {
                     self.spawn_waveform(generation, &ffmpeg, index, track, cx);
                 }
                 let first = self.ffmpeg.is_none();
@@ -976,8 +1001,14 @@ impl Render for EditorView {
         if !self.loading.is_empty() {
             page = page.child(muted(format!("Reading {}.", self.loading.join(", "))));
         }
-        if self.picking || (self.timeline.pieces.is_empty() && self.loading.is_empty()) {
+        if self.timeline.pieces.is_empty() && self.loading.is_empty() {
+            page = page.child(self.drop_zone(cx));
+        }
+        if self.picking {
             page = page.child(self.picker(cx));
+        }
+        if self.confirm_close {
+            page = page.child(self.close_prompt(cx));
         }
         if !self.timeline.pieces.is_empty() {
             // Wide windows put the editing panel beside the picture; narrow ones stack it below.
@@ -1026,6 +1057,80 @@ impl EditorView {
                         cx.notify();
                     }))
                     .child(icon("plus", theme::FG)),
+            )
+            .children((!self.timeline.pieces.is_empty()).then(|| {
+                button_ghost("editor-close", "Close").child(icon("x", theme::FG)).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.confirm_close = true;
+                        cx.notify();
+                    }),
+                )
+            }))
+    }
+
+    /// The empty editor: a big target for dropping a video, and a + that opens the clip list.
+    fn drop_zone(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("editor-drop")
+            .w_full()
+            .h(px(260.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .rounded(px(theme::RADIUS))
+            .border_2()
+            .border_color(rgb(theme::BORDER))
+            .bg(rgb(theme::CARD))
+            .cursor_pointer()
+            .hover(|s| s.border_color(rgb(theme::BRAND)))
+            .drag_over::<ExternalPaths>(|s, _, _, _| s.border_color(rgb(theme::BRAND)))
+            .child(
+                div()
+                    .size(px(56.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(rgb(theme::BG))
+                    .child(icon("plus", theme::BRAND).size(px(28.))),
+            )
+            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Drop a video here"))
+            .child(muted(if self.picking {
+                "or pick one of your clips below"
+            } else {
+                "or click to open one of your clips"
+            }))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.picking = !this.picking;
+                cx.notify();
+            }))
+    }
+
+    /// Asks before closing the project, since closing drops every edit.
+    fn close_prompt(&self, cx: &mut Context<Self>) -> gpui::Div {
+        card("Close the editor?")
+            .child(muted(
+                "Are you sure you want to continue? The pieces and every edit you made are dropped. Clips on disk are not touched.",
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(button_primary("close-yes", "Yes, close it").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.reset();
+                            cx.notify();
+                        },
+                    )))
+                    .child(button("close-no", "Keep editing").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.confirm_close = false;
+                            cx.notify();
+                        },
+                    ))),
             )
     }
 
@@ -1080,8 +1185,8 @@ impl EditorView {
                 }))
                 .into_any_element()
         };
-        card("Add a clip")
-            .child(muted("Pick one below, drop video files anywhere on this page, or paste a file or its path with Ctrl+V."))
+        card("Your clips")
+            .child(muted("Pick one, drop video files anywhere on this page, or paste a file or its path with Ctrl+V."))
             .child(body)
     }
 

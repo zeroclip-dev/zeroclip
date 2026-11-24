@@ -68,7 +68,11 @@ pub fn run(
             [only] if only.scratch => std::fs::rename(&only.path, output)?,
             [only] => ffmpeg.remux_for_export(&only.path, output)?,
             many => {
-                let used: Vec<StreamInfo> = plans.iter().map(|p| infos[p.source]).collect();
+                // Each piece carries only the audio tracks its plan lists, so those are the ones compared.
+                let used: Vec<StreamInfo> = plans
+                    .iter()
+                    .map(|p| StreamInfo { audio_tracks: p.tracks.len() as u8, ..infos[p.source] })
+                    .collect();
                 check_compatible(&used)?;
                 let paths: Vec<PathBuf> = many.iter().map(|m| m.path.clone()).collect();
                 ffmpeg.concat(&paths, output)?;
