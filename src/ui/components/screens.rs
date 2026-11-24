@@ -5,13 +5,17 @@
 use gpui::{AnyView, App, AppContext, Entity, WeakEntity};
 
 use crate::app::{Tab, ZeroClipApp};
-use crate::ui::{clips::ClipsView, home::HomeView, profiles::ProfilesView, settings::SettingsView};
+use crate::ui::{
+    clips::ClipsView, editor::EditorView, home::HomeView, profiles::ProfilesView,
+    settings::SettingsView,
+};
 
 /// One live view per tab.
 pub struct Screens {
     home: Entity<HomeView>,
     clips: Entity<ClipsView>,
     profiles: Entity<ProfilesView>,
+    editor: Entity<EditorView>,
     settings: Entity<SettingsView>,
 }
 
@@ -21,8 +25,14 @@ impl Screens {
             home: cx.new(|_| HomeView::new(app.clone())),
             clips: cx.new(|_| ClipsView::new(app.clone())),
             profiles: cx.new(|_| ProfilesView::new(app.clone())),
+            editor: cx.new(|_| EditorView::new(app.clone())),
             settings: cx.new(|_| SettingsView::new(app)),
         }
+    }
+
+    /// The Editor view, so other screens can open a clip in it.
+    pub fn editor(&self) -> &Entity<EditorView> {
+        &self.editor
     }
 
     /// The view shown for `tab`.
@@ -31,6 +41,7 @@ impl Screens {
             Tab::Home => self.home.clone().into(),
             Tab::Clips => self.clips.clone().into(),
             Tab::Profiles => self.profiles.clone().into(),
+            Tab::Editor => self.editor.clone().into(),
             Tab::Settings => self.settings.clone().into(),
         }
     }

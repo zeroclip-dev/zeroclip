@@ -5968,9 +5968,11 @@ dependencies = [
  "tray-icon",
  "zc-audio",
  "zc-core",
+ "zc-editor",
  "zc-engine",
  "zc-input",
  "zc-mux",
+ "zc-store",
  "zc-video",
  "zc-win",
 ]

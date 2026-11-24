@@ -21,6 +21,7 @@ use zc_video::capture::MonitorInfo;
 
 use super::components::{
     button::{button, button_primary},
+    field_row::field_row as row,
     labeled_toggle::labeled_toggle,
     number_stepper::{Stepper, number_stepper},
     segmented::segmented,
@@ -46,6 +47,8 @@ pub struct Draft {
     toggle_recording: String,
     screenshot: String,
     push_to_talk: String,
+    /// Path to `ffmpeg.exe` for the Editor; empty looks next to ZeroClip, then on `PATH`.
+    ffmpeg_path: String,
     /// Microphones Windows reports, re-listed every `MIC_POLL` while the screen is open.
     mics: Vec<MicDevice>,
     mics_listed: Instant,
@@ -75,6 +78,12 @@ impl Draft {
             toggle_recording: hotkeys.toggle_recording.to_string(),
             screenshot: hotkeys.screenshot.to_string(),
             push_to_talk: hotkeys.push_to_talk.as_ref().map(Chord::to_string).unwrap_or_default(),
+            ffmpeg_path: settings
+                .editor
+                .ffmpeg_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
             mics: zc_audio::list_microphones(),
             mics_listed: Instant::now(),
             monitors: zc_video::capture::list_monitors(),
@@ -91,6 +100,9 @@ impl Draft {
 
         let dir = self.output_dir.trim();
         settings.recording.output_dir = (!dir.is_empty()).then(|| PathBuf::from(dir));
+
+        let ffmpeg = self.ffmpeg_path.trim();
+        settings.editor.ffmpeg_path = (!ffmpeg.is_empty()).then(|| PathBuf::from(ffmpeg));
 
         let mut chord = |label: &str, text: &str| match text.parse::<Chord>() {
             Ok(chord) => Some(chord),
@@ -137,7 +149,7 @@ macro_rules! bind {
 
 pub struct SettingsView {
     app: WeakEntity<ZeroClipApp>,
-    /// Text-field focus: output folder, then the four hotkeys. Made on the first render.
+    /// Text-field focus: output folder, the four hotkeys, then the ffmpeg path. Made on the first render.
     focus: Vec<FocusHandle>,
     /// A repaint is already scheduled for the microphone re-list.
     polling: bool,
@@ -182,20 +194,6 @@ fn section(title: &'static str) -> gpui::Div {
         .border_1()
         .border_color(rgb(theme::BORDER))
         .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(title))
-}
-
-fn row(label: &'static str, control: impl IntoElement) -> gpui::Div {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_4()
-        .min_h(px(30.))
-        .pb_2()
-        .border_b_1()
-        .border_color(rgb(theme::BORDER))
-        .child(div().w(px(190.)).flex_shrink_0().text_color(rgb(theme::FG)).child(label))
-        .child(control)
 }
 
 fn hint(text: impl Into<SharedString>) -> gpui::Div {
@@ -327,7 +325,7 @@ impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(app) = self.app.upgrade() else { return div() };
         if self.focus.is_empty() {
-            self.focus = (0..5).map(|_| cx.focus_handle()).collect();
+            self.focus = (0..6).map(|_| cx.focus_handle()).collect();
         }
         // Hot-plug: re-list microphones while this screen is open, so a new one appears by itself.
         if !self.polling {
@@ -395,6 +393,15 @@ impl Render for SettingsView {
             field(3, "f-shot", &d.screenshot, "none", 200., |d, v| d.screenshot = v.to_owned());
         let f_ptt =
             field(4, "f-ptt", &d.push_to_talk, "none", 200., |d, v| d.push_to_talk = v.to_owned());
+
+        let f_ffmpeg = field(
+            5,
+            "f-ffmpeg",
+            &d.ffmpeg_path,
+            "Looks next to ZeroClip, then on PATH",
+            380.,
+            |d, v| d.ffmpeg_path = v.to_owned(),
+        );
 
         if saved.ui_mode == UiMode::Simple {
             let minutes = minutes_from_buffer_secs(d.settings.profiles.default.buffer_secs);
@@ -862,6 +869,12 @@ impl Render for SettingsView {
             ))
             .child(hint("Quit from the tray menu to close ZeroClip while it runs in the tray."));
 
+        let editor_sec = section("Editor")
+            .child(row("ffmpeg location", f_ffmpeg))
+            .child(hint(
+                "Full path to ffmpeg.exe. ffprobe.exe is expected in the same folder. Leave empty to search next to ZeroClip, then PATH.",
+            ));
+
         let sections: Vec<AnyElement> = vec![
             recording.into_any_element(),
             video_sec.into_any_element(),
@@ -870,6 +883,7 @@ impl Render for SettingsView {
             hotkeys.into_any_element(),
             storage.into_any_element(),
             uploads.into_any_element(),
+            editor_sec.into_any_element(),
             app_sec.into_any_element(),
             div().h(px(8.)).into_any_element(),
         ];

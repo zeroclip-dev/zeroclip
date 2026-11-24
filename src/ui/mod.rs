@@ -3,6 +3,7 @@
 
 pub mod clips;
 pub mod components;
+pub mod editor;
 pub mod focus_prompt;
 pub mod home;
 pub mod overlay;
