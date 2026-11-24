@@ -116,6 +116,15 @@ impl Ffmpeg {
         Ok(ProbeInfo { stream, duration, keyframes })
     }
 
+    /// Writes the frame of `input` at `at` to `output` as a small JPEG, for the clip list.
+    ///
+    /// # Errors
+    /// See [`FfmpegError`]. A time past the end of the clip writes nothing and is not an error,
+    /// so callers check that `output` exists.
+    pub fn thumbnail(&self, input: &Path, at: Hns, output: &Path) -> Result<(), FfmpegError> {
+        run(&self.exe, &thumbnail_args(input, at, output)).map(drop)
+    }
+
     /// Edits audio tracks and stream-copies the video (D38); see [`audio_edit_args`].
     ///
     /// # Errors
@@ -237,11 +246,15 @@ fn keyframe_args(path: &Path) -> Vec<OsString> {
 }
 
 /// Parses `default=noprint_wrappers=1` output for [`STREAM_ENTRIES`]. Returns the stream info,
-/// the container duration and its start time. `codec_type` comes first in each stream block.
+/// the container duration and its start time. Each stream block starts with `codec_name`, then
+/// `codec_type` (ffprobe's order, checked against real ffprobe 8 output).
 fn parse_streams(text: &str) -> Result<(StreamInfo, Hns, Hns), String> {
     let mut video_seen = false;
     let mut in_first_video = false;
     let mut codec_name = None;
+    // The codec of the stream block being read. ffprobe prints `codec_name` before
+    // `codec_type`, so it is held here until the type says whether it is the first video.
+    let mut block_codec = None;
     let mut width = None;
     let mut height = None;
     let mut fps_rate = None;
@@ -251,14 +264,21 @@ fn parse_streams(text: &str) -> Result<(StreamInfo, Hns, Hns), String> {
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else { continue };
         match key {
+            // Each stream block starts with `codec_name`.
+            "codec_name" => {
+                block_codec = Some(value);
+                in_first_video = false;
+            }
             "codec_type" => {
                 in_first_video = value == "video" && !video_seen;
+                if in_first_video {
+                    codec_name = block_codec;
+                }
                 video_seen |= value == "video";
                 if value == "audio" {
                     audio += 1;
                 }
             }
-            "codec_name" if in_first_video => codec_name = Some(value),
             "width" if in_first_video => width = Some(value),
             "height" if in_first_video => height = Some(value),
             "avg_frame_rate" if in_first_video => fps_rate = Some(value),
@@ -405,6 +425,22 @@ pub fn remux_args(input: &Path, output: &Path) -> Vec<OsString> {
     args
 }
 
+/// Arguments that decode the first video frame at `at` and write it to `output` (a `.jpg`),
+/// scaled to 192 px wide. Seeking before `-i` is fast and lands on the nearest earlier keyframe.
+#[must_use]
+pub fn thumbnail_args(input: &Path, at: Hns, output: &Path) -> Vec<OsString> {
+    let mut args = common_args();
+    args.push("-ss".into());
+    args.push(ffmpeg_time(at).into());
+    args.push("-i".into());
+    args.push(os(input));
+    args.extend(
+        ["-map", "0:v:0", "-frames:v", "1", "-vf", "scale=192:-2", "-q:v", "5"].map(OsString::from),
+    );
+    args.push(os(output));
+    args
+}
+
 /// What the editor does to one audio track (D38). Anything but `Keep` re-encodes that track to
 /// AAC; video is never re-encoded.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -545,6 +581,19 @@ mod tests {
 
     fn strs(args: &[OsString]) -> Vec<String> {
         args.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn thumbnail_takes_one_scaled_frame_and_ends_with_the_output() {
+        let args = strs(&thumbnail_args(
+            Path::new("in.mp4"),
+            Hns::from_millis(500),
+            Path::new("out.jpg"),
+        ));
+        let at = args.iter().position(|a| a == "-ss").unwrap();
+        assert_eq!(args[at + 1], "0.5000000");
+        assert!(args.windows(2).any(|w| w == ["-frames:v", "1"]));
+        assert_eq!(args.last().map(String::as_str), Some("out.jpg"));
     }
 
     #[test]
@@ -760,15 +809,20 @@ mod tests {
         assert_eq!(concat_line(Path::new("it's.mp4")), r"file 'it'\''s.mp4'");
     }
 
-    /// Canned `stream_args` output: an audio track first, then video, then the format.
+    /// Canned `stream_args` output in ffprobe's real order (`codec_name` first in each block):
+    /// an audio track first, then video, then another audio track, then the format.
     const STREAMS: &str = "\
+codec_name=aac
 codec_type=audio
-codec_type=video
+avg_frame_rate=0/0
 codec_name=h264
+codec_type=video
 width=1920
 height=1080
 avg_frame_rate=60/1
+codec_name=aac
 codec_type=audio
+avg_frame_rate=0/0
 duration=12.500000
 start_time=0.250000
 ";
@@ -788,7 +842,7 @@ start_time=0.250000
     fn parse_streams_rejects_unsupported_codecs_and_missing_video() {
         let vp9 = STREAMS.replace("h264", "vp9");
         assert_eq!(parse_streams(&vp9).unwrap_err(), "unsupported video codec vp9");
-        let audio_only = "codec_type=audio\nduration=1.0\nstart_time=0.0\n";
+        let audio_only = "codec_name=aac\ncodec_type=audio\nduration=1.0\nstart_time=0.0\n";
         assert_eq!(parse_streams(audio_only).unwrap_err(), "no video stream");
     }
 
