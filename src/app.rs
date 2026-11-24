@@ -29,6 +29,17 @@ pub enum Tab {
 impl Tab {
     pub const ALL: [Tab; 5] = [Tab::Home, Tab::Clips, Tab::Profiles, Tab::Editor, Tab::Settings];
 
+    /// The Lucide icon for this tab's top-bar button.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Tab::Home => "house",
+            Tab::Clips => "film",
+            Tab::Profiles => "sliders-horizontal",
+            Tab::Editor => "scissors",
+            Tab::Settings => "settings",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Tab::Home => "Home",

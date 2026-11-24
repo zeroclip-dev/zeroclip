@@ -6,18 +6,23 @@ pub mod components;
 pub mod editor;
 pub mod focus_prompt;
 pub mod home;
+pub mod icons;
 pub mod overlay;
 pub mod profiles;
 pub mod rescue;
 pub mod settings;
 pub mod theme;
 
-use gpui::{Context, IntoElement, ParentElement, StatefulInteractiveElement, Styled, div, rgb};
+use gpui::{
+    Context, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled,
+    WindowControlArea, div, px, rgb,
+};
 use zc_core::Hns;
 use zc_core::media::Codec;
 
 use crate::app::{Tab, ZeroClipApp};
 use components::{mic_indicator::mic_indicator, status_dot::status_dot, tab_button::tab_button};
+use icons::icon;
 
 const RED: u32 = theme::DANGER;
 const GREEN: u32 = theme::BRAND;
@@ -54,26 +59,58 @@ fn top_bar(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoElement
         .flex_row()
         .items_center()
         .gap_2()
-        .px_3()
-        .py_2()
+        .pl_3()
+        .h(px(48.))
         .child(div().text_xl().font_weight(gpui::FontWeight::BOLD).mr_4().child("ZeroClip"))
         .children(Tab::ALL.into_iter().map(|tab| {
-            tab_button(tab.label(), app.tab == tab).on_click(cx.listener(move |app, _, _, cx| {
+            tab_button(tab.icon(), tab.label(), app.tab == tab).on_click(cx.listener(move |app, _, _, cx| {
                 app.tab = tab;
                 cx.notify();
             }))
         }))
+        // The empty stretch is what you grab to move the window.
+        .child(div().flex_1().h_full().window_control_area(WindowControlArea::Drag))
         .child(
             div()
-                .ml_auto()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap_2()
+                .mr_2()
                 .text_color(rgb(color))
                 .child(status_dot(rgb(color)))
                 .child(text),
         )
+        .child(window_button("win-min", "minus", WindowControlArea::Min, false))
+        .child(window_button("win-max", "square", WindowControlArea::Max, false))
+        .child(window_button("win-close", "x", WindowControlArea::Close, true))
+}
+
+/// A minimise, maximise or close button. Windows acts on the control area itself, so there is
+/// no click handler.
+fn window_button(
+    id: &'static str,
+    name: &str,
+    area: WindowControlArea,
+    close: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .w(px(46.))
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(rgb(theme::MUTED_FG))
+        .hover(move |s| {
+            if close {
+                s.bg(rgb(theme::DANGER)).text_color(rgb(theme::BG))
+            } else {
+                s.bg(rgb(theme::ACCENT)).text_color(rgb(theme::FG))
+            }
+        })
+        .window_control_area(area)
+        .child(icon(name))
 }
 
 fn status_bar(app: &ZeroClipApp) -> impl IntoElement {
