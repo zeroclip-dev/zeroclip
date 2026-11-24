@@ -17,6 +17,8 @@ pub enum Command {
     SaveClip,
     /// Start or stop a manual recording.
     ToggleRecording,
+    /// Mark this moment of the running recording.
+    Bookmark,
     /// Save a PNG of the current frame.
     Screenshot,
     /// The push-to-talk key went down (`true`) or up (`false`).
@@ -53,6 +55,11 @@ pub enum EngineEvent {
         path: PathBuf,
         /// How long.
         duration: Hns,
+    },
+    /// A bookmark was added to the running recording, `at` into it.
+    BookmarkAdded {
+        /// How far into the recording.
+        at: Hns,
     },
     /// A screenshot was written.
     ScreenshotSaved {

@@ -46,6 +46,7 @@ pub struct Draft {
     save_clip: String,
     toggle_recording: String,
     screenshot: String,
+    bookmark: String,
     push_to_talk: String,
     /// Path to `ffmpeg.exe` for the Editor; empty looks next to ZeroClip, then on `PATH`.
     ffmpeg_path: String,
@@ -77,6 +78,7 @@ impl Draft {
             save_clip: hotkeys.save_clip.to_string(),
             toggle_recording: hotkeys.toggle_recording.to_string(),
             screenshot: hotkeys.screenshot.to_string(),
+            bookmark: hotkeys.bookmark.to_string(),
             push_to_talk: hotkeys.push_to_talk.as_ref().map(Chord::to_string).unwrap_or_default(),
             ffmpeg_path: settings
                 .editor
@@ -119,6 +121,9 @@ impl Draft {
         }
         if let Some(c) = chord("Screenshot", &self.screenshot) {
             settings.hotkeys.screenshot = c;
+        }
+        if let Some(c) = chord("Bookmark", &self.bookmark) {
+            settings.hotkeys.bookmark = c;
         }
         settings.hotkeys.push_to_talk = if self.push_to_talk.trim().is_empty() {
             None
@@ -325,7 +330,7 @@ impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(app) = self.app.upgrade() else { return div() };
         if self.focus.is_empty() {
-            self.focus = (0..6).map(|_| cx.focus_handle()).collect();
+            self.focus = (0..7).map(|_| cx.focus_handle()).collect();
         }
         // Hot-plug: re-list microphones while this screen is open, so a new one appears by itself.
         if !self.polling {
@@ -391,6 +396,9 @@ impl Render for SettingsView {
         });
         let f_shot =
             field(3, "f-shot", &d.screenshot, "none", 200., |d, v| d.screenshot = v.to_owned());
+        let f_mark = field(6, "f-mark", &d.bookmark, "none", 200., |d, v| {
+            d.bookmark = v.to_owned();
+        });
         let f_ptt =
             field(4, "f-ptt", &d.push_to_talk, "none", 200., |d, v| d.push_to_talk = v.to_owned());
 
@@ -470,6 +478,7 @@ impl Render for SettingsView {
                 .child(row("Save clip", f_save))
                 .child(row("Start/stop recording", f_rec))
                 .child(row("Screenshot", f_shot))
+                .child(row("Bookmark", f_mark))
                 .child(hint(
                     "Examples: Alt+F10, Ctrl+Shift+S, Mouse5. Hotkeys work while a game has focus.",
                 ));
@@ -826,6 +835,7 @@ impl Render for SettingsView {
             .child(row("Save clip", f_save))
             .child(row("Start/stop recording", f_rec))
             .child(row("Screenshot", f_shot))
+            .child(row("Bookmark", f_mark))
             .child(row("Push-to-talk", f_ptt))
             .child(labeled_toggle(
                 "toasts",

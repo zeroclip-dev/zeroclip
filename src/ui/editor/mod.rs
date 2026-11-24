@@ -78,6 +78,8 @@ struct Source {
     waves: Vec<Option<Vec<f32>>>,
     /// Small pictures along the clip (source time, picture), in time order, for the video lane.
     thumbs: Vec<(Hns, Arc<RenderImage>)>,
+    /// Moments marked while the clip was recorded.
+    bookmarks: Vec<Hns>,
 }
 
 enum Export {
@@ -335,6 +337,7 @@ impl EditorView {
                     tracks: vec![TrackEdit::default(); tracks],
                 });
                 self.sources.push(Source {
+                    bookmarks: zc_core::bookmarks::load(&path),
                     path,
                     name,
                     info,
@@ -1731,6 +1734,27 @@ impl EditorView {
                     .child(model::piece_label(i))
                     .children(handles),
             );
+        }
+
+        // Bookmarks: a small amber tick on the video lane wherever a kept piece holds one.
+        for (i, piece) in self.timeline.pieces.iter().enumerate() {
+            let (x0, x1) = place(i);
+            let span = piece.span().as_secs_f64().max(0.001);
+            for mark in &self.sources[piece.source].bookmarks {
+                if *mark < piece.a || *mark > piece.b {
+                    continue;
+                }
+                let x = x0 + ((*mark - piece.a).as_secs_f64() / span) as f32 * (x1 - x0);
+                video_lane = video_lane.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left(px(x - 1.5))
+                        .w(px(3.))
+                        .h_full()
+                        .bg(rgb(theme::WARN)),
+                );
+            }
         }
 
         let mut lanes = Vec::new();

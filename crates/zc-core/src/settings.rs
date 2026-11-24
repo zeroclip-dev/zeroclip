@@ -135,6 +135,7 @@ impl Settings {
             ("Save clip", Some(&hotkeys.save_clip)),
             ("Start/stop recording", Some(&hotkeys.toggle_recording)),
             ("Screenshot", Some(&hotkeys.screenshot)),
+            ("Bookmark", Some(&hotkeys.bookmark)),
             ("Push-to-talk", hotkeys.push_to_talk.as_ref()),
         ];
         for (i, (name_a, chord_a)) in bound.iter().enumerate() {
@@ -432,6 +433,8 @@ pub struct HotkeySettings {
     pub toggle_recording: Chord,
     /// Screenshot.
     pub screenshot: Chord,
+    /// Mark a moment of the running recording.
+    pub bookmark: Chord,
     /// Push-to-talk (only used when the mic is in push-to-talk mode).
     pub push_to_talk: Option<Chord>,
 }
@@ -444,6 +447,7 @@ impl Default for HotkeySettings {
             save_clip: chord(Key::f(10)),
             toggle_recording: chord(Key::f(9)),
             screenshot: chord(Key::f(1)),
+            bookmark: chord(Key::f(8)),
             push_to_talk: None,
         }
     }

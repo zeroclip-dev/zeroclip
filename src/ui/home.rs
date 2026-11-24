@@ -12,10 +12,10 @@ use zc_core::control::Command;
 use zc_core::hotkey::Chord;
 use zc_core::settings::MicMode;
 
+use super::clips::{Thumbs, age, thumb_box};
 use super::components::button::{button, button_ghost, button_primary};
 use super::components::card::{card, kbd};
 use super::components::status_dot::status_dot;
-use super::clips::{Thumbs, age, thumb_box};
 use super::{human_duration, theme};
 use crate::app::{NoticeLevel, Tab, ZeroClipApp};
 
@@ -81,31 +81,35 @@ impl Render for HomeView {
             hotkey_row(&hotkeys.save_clip, "Save the buffer as a clip"),
             hotkey_row(&hotkeys.toggle_recording, "Start or stop recording"),
             hotkey_row(&hotkeys.screenshot, "Screenshot"),
+            hotkey_row(&hotkeys.bookmark, "Bookmark this moment (while recording)"),
         ];
         rows.extend(push_to_talk.map(|ptt| hotkey_row(ptt, "Push-to-talk (hold)")));
 
         let record_label = if app.status.recording { "Stop recording" } else { "Start recording" };
         let fill =
             fill_ratio(app.status.buffered.as_millis(), app.status.buffer_window.as_millis());
-        let feed: Vec<gpui::Div> = if app.notices.is_empty() {
-            vec![div().text_color(rgb(theme::MUTED_FG)).child("Nothing yet. Saved clips, screenshots and problems will be listed here.")]
-        } else {
-            app.notices
-                .iter()
-                .map(|notice| {
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .py_1()
-                        .border_t_1()
-                        .border_color(rgb(theme::BORDER))
-                        .child(status_dot(rgb(notice_color(notice.level))))
-                        .child(div().flex_1().child(notice.text.clone()))
-                })
-                .collect()
-        };
+        let feed: Vec<gpui::Div> =
+            if app.notices.is_empty() {
+                vec![div().text_color(rgb(theme::MUTED_FG)).child(
+                    "Nothing yet. Saved clips, screenshots and problems will be listed here.",
+                )]
+            } else {
+                app.notices
+                    .iter()
+                    .map(|notice| {
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .py_1()
+                            .border_t_1()
+                            .border_color(rgb(theme::BORDER))
+                            .child(status_dot(rgb(notice_color(notice.level))))
+                            .child(div().flex_1().child(notice.text.clone()))
+                    })
+                    .collect()
+            };
 
         let buffer_card =
             card("Replay buffer")
@@ -171,10 +175,11 @@ impl Render for HomeView {
                         .flex_1()
                         .flex()
                         .flex_col()
-                        .child(div().font_weight(FontWeight::SEMIBOLD).child(format!(
-                            "Clipping {}",
-                            name.trim_end_matches(".exe")
-                        )))
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(format!("Clipping {}", name.trim_end_matches(".exe"))),
+                        )
                         .child(div().text_sm().text_color(rgb(theme::MUTED_FG)).child(format!(
                             "In game for {} \u{b7} {} saved this session",
                             human_duration(Hns::from_secs(since.elapsed().as_secs() as i64)),
@@ -222,9 +227,12 @@ impl Render for HomeView {
                         ),
                     )
                     .child(div().text_sm().truncate().child(file.name.clone()))
-                    .child(div().text_xs().text_color(rgb(theme::MUTED_FG)).child(
-                        file.modified.map_or_else(|| "\u{2014}".to_owned(), age),
-                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::MUTED_FG))
+                            .child(file.modified.map_or_else(|| "\u{2014}".to_owned(), age)),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let path = path.clone();
                         let _ = this.app.update(cx, |app, cx| app.play_clip(path, cx));

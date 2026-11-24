@@ -257,6 +257,7 @@ impl ClipsView {
         });
         match outcome {
             Ok(to) => {
+                zc_core::bookmarks::rename(&rename.path, &to);
                 self.renaming = None;
                 let name =
                     to.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
@@ -568,14 +569,11 @@ impl Render for ClipsView {
                         .hover(|s| s.bg(rgb(theme::ACCENT)))
                         .child({
                             let path = file.path.clone();
-                            let picture =
-                                thumb_box(thumb, CARD_W - 18., (CARD_W - 18.) * 9. / 16.);
+                            let picture = thumb_box(thumb, CARD_W - 18., (CARD_W - 18.) * 9. / 16.);
                             // A video's picture is a play button: click to watch it.
-                            div()
-                                .id(("clip-play", i))
-                                .relative()
-                                .child(picture)
-                                .when(is_video, |d| {
+                            div().id(("clip-play", i)).relative().child(picture).when(
+                                is_video,
+                                |d| {
                                     d.cursor_pointer()
                                         .child(
                                             div()
@@ -590,11 +588,12 @@ impl Render for ClipsView {
                                         )
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             let path = path.clone();
-                                            let _ = this.app.update(cx, |app, cx| {
-                                                app.play_clip(path, cx)
-                                            });
+                                            let _ = this
+                                                .app
+                                                .update(cx, |app, cx| app.play_clip(path, cx));
                                         }))
-                                })
+                                },
+                            )
                         })
                         .child(div().text_sm().truncate().child(file.name.clone()))
                         .child(div().text_xs().text_color(rgb(theme::MUTED_FG)).child(format!(
