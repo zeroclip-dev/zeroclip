@@ -21,6 +21,38 @@ fn gigabytes(bytes: u64) -> String {
     format!("{}.{} GB", tenths / 10, tenths % 10)
 }
 
+/// One quality choice on the Simple view: the frame rate and bitrate range it sets. The numbers
+/// are the Advanced ones, so picking a preset and then opening Advanced shows the same values.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Quality {
+    pub label: &'static str,
+    pub fps: u32,
+    pub min_kbps: u32,
+    pub max_kbps: u32,
+}
+
+/// Low to Ultra. High is what a fresh install uses.
+pub const QUALITIES: [Quality; 4] = [
+    Quality { label: "Low", fps: 30, min_kbps: 2_500, max_kbps: 8_000 },
+    Quality { label: "Medium", fps: 60, min_kbps: 3_500, max_kbps: 12_000 },
+    Quality { label: "High", fps: 60, min_kbps: 5_000, max_kbps: 20_000 },
+    Quality { label: "Ultra", fps: 60, min_kbps: 8_000, max_kbps: 35_000 },
+];
+
+/// The preset the current settings match exactly, or `None` for custom values from Advanced.
+pub fn current_quality(fps: u32, min_kbps: u32, max_kbps: u32) -> Option<usize> {
+    QUALITIES.iter().position(|q| (q.fps, q.min_kbps, q.max_kbps) == (fps, min_kbps, max_kbps))
+}
+
+/// "60 fps, up to 20 Mbps", the line under the choice.
+pub fn quality_line(q: &Quality) -> String {
+    format!(
+        "{} fps, up to {} Mbps. Higher quality uses more space and memory.",
+        q.fps,
+        q.max_kbps / 1_000
+    )
+}
+
 /// The video and audio bitrates added together, in bits per second. Settings hold kbit/s.
 pub fn buffer_bitrate_bps(video_kbps: u32, audio_kbps: u32) -> u64 {
     (u64::from(video_kbps) + u64::from(audio_kbps)) * 1_000
@@ -70,6 +102,23 @@ pub fn free_space(dir: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fresh_install_is_high_quality() {
+        let v = zc_core::settings::VideoSettings::default();
+        assert_eq!(current_quality(v.fps, v.min_bitrate_kbps, v.max_bitrate_kbps), Some(2));
+    }
+
+    #[test]
+    fn custom_values_match_no_preset() {
+        assert_eq!(current_quality(144, 5_000, 20_000), None);
+        assert_eq!(current_quality(60, 5_000, 20_001), None);
+    }
+
+    #[test]
+    fn presets_get_bigger_each_step() {
+        assert!(QUALITIES.windows(2).all(|w| w[0].max_kbps < w[1].max_kbps));
+    }
 
     #[test]
     fn buffer_seconds_become_whole_minutes() {

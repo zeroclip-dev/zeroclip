@@ -1,16 +1,17 @@
-//! The editor's player: decodes the clip with ffmpeg into raw frames and shows them in step with
-//! a clock. Sound comes from `ffplay` when it sits beside ffmpeg.
+//! The editor's player: decodes the timeline's pieces with ffmpeg into raw frames and shows them
+//! in step with a clock. Sound comes from `ffplay` when it sits beside ffmpeg.
 //!
-//! One ffmpeg process decodes at a time. Seeking or pausing kills it, so there is never a pile
-//! of jobs. A reader thread turns each raw BGRA frame into a GPUI image and hands it over
-//! through a small bounded channel, which also stops ffmpeg from racing ahead of the clock.
+//! One ffmpeg process decodes at a time. Seeking, pausing or moving on to the next piece kills
+//! it, so there is never a pile of jobs. A reader thread turns each raw BGRA frame into a GPUI
+//! image and hands it over through a small bounded channel, which also stops ffmpeg from racing
+//! ahead of the clock.
 //!
 //! ponytail: picture and sound start together but are not locked to one clock, so they can drift
 //! a little on a long play. Add a shared clock if that shows.
 
 use std::collections::VecDeque;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
@@ -28,12 +29,27 @@ const FPS: u32 = 24;
 /// Frames that may wait between the reader thread and the screen.
 const BACKLOG: usize = 6;
 
+/// What to hear while a piece plays.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sound {
+    /// Which audio track of the file (0 is Master).
+    pub track: usize,
+    pub gain_db: f64,
+}
+
+/// One piece to play: `[from, to)` of a file. `sound` is `None` for a muted piece.
+#[derive(Clone, Debug)]
+pub struct Item {
+    pub path: PathBuf,
+    pub from: Hns,
+    pub to: Hns,
+    pub sound: Option<Sound>,
+}
+
 /// A running ffmpeg decode, killed when dropped.
 struct Decoder {
     child: Child,
     frames: Receiver<Arc<RenderImage>>,
-    /// Clip time of the first frame, in seconds.
-    start: f64,
     /// Frames taken from `frames` so far.
     taken: u32,
 }
@@ -70,7 +86,7 @@ impl Decoder {
                 }
             }
         });
-        Ok(Self { child, frames, start: at.as_secs_f64(), taken: 0 })
+        Ok(Self { child, frames, taken: 0 })
     }
 }
 
@@ -93,10 +109,10 @@ fn no_window(cmd: &mut Command) {
     let _ = cmd;
 }
 
-/// What the player shows and where it is in the clip.
+/// What the player shows and where it is on the timeline.
 #[derive(Default)]
 pub struct Player {
-    /// The current position in the clip.
+    /// The current position on the timeline.
     pub playhead: Hns,
     /// Whether the clock is running.
     pub playing: bool,
@@ -104,14 +120,17 @@ pub struct Player {
     pub shown: Option<Arc<RenderImage>>,
     /// Frames that were on screen and can leave the GPU cache; the view drops them on render.
     pub spent: Vec<Arc<RenderImage>>,
+    ffmpeg: Option<Ffmpeg>,
     decoder: Option<Decoder>,
-    /// Decoded frames and their clip times, waiting for the clock.
+    /// Decoded frames and their time since the piece began, waiting for the clock.
     queue: VecDeque<(f64, Arc<RenderImage>)>,
     audio: Option<Child>,
-    /// When play began and the playhead then; the clock is the time since.
-    started: Option<(Instant, Hns)>,
-    /// Play stops when the playhead reaches this.
-    limit: Hns,
+    /// The pieces still to play, the one playing first.
+    items: VecDeque<Item>,
+    /// Timeline time at which the current piece began.
+    base: Hns,
+    /// When the current piece began.
+    started: Option<Instant>,
 }
 
 impl Player {
@@ -120,7 +139,7 @@ impl Player {
         self.playing || self.decoder.is_some()
     }
 
-    /// Forgets everything for a new clip.
+    /// Forgets everything for a new project.
     pub fn reset(&mut self) {
         self.halt();
         if let Some(old) = self.shown.take() {
@@ -133,6 +152,7 @@ impl Player {
     fn halt(&mut self) {
         self.decoder = None;
         self.queue.clear();
+        self.items.clear();
         if let Some(mut audio) = self.audio.take() {
             let _ = audio.kill();
             let _ = audio.wait();
@@ -146,25 +166,41 @@ impl Player {
         self.halt();
     }
 
-    /// Moves to `at` and shows the frame there.
-    pub fn show_at(&mut self, ffmpeg: &Ffmpeg, path: &Path, at: Hns) {
+    /// Moves to timeline time `at` and shows the frame of `path` at source time `src`.
+    pub fn show_at(&mut self, ffmpeg: &Ffmpeg, path: &Path, src: Hns, at: Hns) {
         self.halt();
         self.playhead = at;
-        self.decoder = Decoder::start(ffmpeg, path, at, Some(1)).ok();
+        self.decoder = Decoder::start(ffmpeg, path, src, Some(1)).ok();
     }
 
-    /// Plays from `from` until `limit`.
-    pub fn play(&mut self, ffmpeg: &Ffmpeg, path: &Path, from: Hns, limit: Hns) {
+    /// Plays `items` in order, the first beginning at timeline time `at`.
+    pub fn play(&mut self, ffmpeg: &Ffmpeg, items: Vec<Item>, at: Hns) {
         self.halt();
-        self.playhead = from;
-        self.limit = limit;
-        self.decoder = Decoder::start(ffmpeg, path, from, None).ok();
-        if self.decoder.is_none() {
-            return;
+        self.ffmpeg = Some(ffmpeg.clone());
+        self.items = items.into();
+        self.playhead = at;
+        self.base = at;
+        self.playing = self.start_item();
+    }
+
+    /// Starts decoding and sound for the piece at the front. `false` when there is none.
+    fn start_item(&mut self) -> bool {
+        self.decoder = None;
+        self.queue.clear();
+        if let Some(mut audio) = self.audio.take() {
+            let _ = audio.kill();
+            let _ = audio.wait();
         }
-        self.playing = true;
-        self.started = Some((Instant::now(), from));
-        self.audio = spawn_audio(ffmpeg, path, from, limit);
+        let (Some(item), Some(ffmpeg)) = (self.items.front(), self.ffmpeg.as_ref()) else {
+            return false;
+        };
+        self.decoder = Decoder::start(ffmpeg, &item.path, item.from, None).ok();
+        if self.decoder.is_none() {
+            return false;
+        }
+        self.audio = item.sound.and_then(|s| spawn_audio(ffmpeg, item, s));
+        self.started = Some(Instant::now());
+        true
     }
 
     /// Advances the clock and picks the frame to show. Returns whether it is still busy.
@@ -174,7 +210,7 @@ impl Player {
             loop {
                 match decoder.frames.try_recv() {
                     Ok(image) => {
-                        let time = decoder.start + f64::from(decoder.taken) / f64::from(FPS);
+                        let time = f64::from(decoder.taken) / f64::from(FPS);
                         decoder.taken += 1;
                         self.queue.push_back((time, image));
                     }
@@ -187,26 +223,34 @@ impl Player {
                 }
             }
         }
-        if let (true, Some((began, from))) = (self.playing, self.started) {
-            self.playhead = from + Hns::from_secs_f64(began.elapsed().as_secs_f64());
-            if self.playhead >= self.limit {
-                self.playhead = self.limit;
-                self.halt();
-                return false;
+        if self.playing {
+            let Some(began) = self.started else { return self.busy() };
+            let mut elapsed = began.elapsed().as_secs_f64();
+            while let Some(item) = self.items.front() {
+                let len = (item.to - item.from).as_secs_f64();
+                if elapsed < len {
+                    break;
+                }
+                // This piece is done: on to the next one, or stop at the end.
+                self.base += item.to - item.from;
+                self.items.pop_front();
+                if self.items.is_empty() || !self.start_item() {
+                    self.playhead = self.base;
+                    self.halt();
+                    return false;
+                }
+                ended = false;
+                elapsed = 0.0;
             }
-            let now = self.playhead.as_secs_f64();
-            while self.queue.len() >= 2 && self.queue[1].0 <= now {
+            self.playhead = self.base + Hns::from_secs_f64(elapsed);
+            while self.queue.len() >= 2 && self.queue[1].0 <= elapsed {
                 self.queue.pop_front();
             }
             // Only a frame whose time has come goes on screen.
-            if self.queue.front().is_some_and(|(time, _)| *time <= now)
+            if self.queue.front().is_some_and(|(time, _)| *time <= elapsed)
                 && let Some((_, image)) = self.queue.pop_front()
             {
                 self.set_shown(image);
-            }
-            if ended && self.queue.is_empty() {
-                self.halt();
-                return false;
             }
         } else if let Some((_, image)) = self.queue.pop_back() {
             // Paused on a still: the one frame, whenever it arrives.
@@ -232,22 +276,24 @@ impl Drop for Player {
     }
 }
 
-/// Starts `ffplay` with no window, for the sound of `from` to `limit`. `None` when ffplay isn't
-/// beside ffmpeg: the picture then plays without sound.
-fn spawn_audio(ffmpeg: &Ffmpeg, path: &Path, from: Hns, limit: Hns) -> Option<Child> {
+/// Starts `ffplay` with no window, for the sound of `item`'s track `sound.track`. `None` when
+/// ffplay isn't beside ffmpeg: the picture then plays without sound.
+fn spawn_audio(ffmpeg: &Ffmpeg, item: &Item, sound: Sound) -> Option<Child> {
     let ffplay = ffmpeg.exe.with_file_name(if cfg!(windows) { "ffplay.exe" } else { "ffplay" });
     if !ffplay.is_file() {
         return None;
     }
     let mut cmd = Command::new(ffplay);
-    cmd.args(["-nodisp", "-vn", "-autoexit", "-loglevel", "quiet", "-ss"])
-        .arg(format!("{:.3}", from.as_secs_f64()))
+    cmd.args(["-nodisp", "-vn", "-autoexit", "-loglevel", "quiet", "-ast"])
+        .arg(format!("a:{}", sound.track))
+        .arg("-ss")
+        .arg(format!("{:.3}", item.from.as_secs_f64()))
         .arg("-t")
-        .arg(format!("{:.3}", (limit - from).as_secs_f64()))
-        .arg(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .arg(format!("{:.3}", (item.to - item.from).as_secs_f64()));
+    if sound.gain_db != 0.0 {
+        cmd.arg("-af").arg(format!("volume={}dB", sound.gain_db));
+    }
+    cmd.arg(&item.path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     no_window(&mut cmd);
     cmd.spawn().ok()
 }

@@ -31,8 +31,8 @@ use super::theme;
 use super::{dvr_megabytes, dvr_ring_megabytes, effective_ceiling, human_duration};
 use crate::app::ZeroClipApp;
 use simple::{
-    MAX_MINUTES, MIN_MINUTES, buffer_bitrate_bps, free_space, minutes_from_buffer_secs,
-    storage_line,
+    MAX_MINUTES, MIN_MINUTES, QUALITIES, buffer_bitrate_bps, current_quality, free_space,
+    minutes_from_buffer_secs, quality_line, storage_line,
 };
 
 const MIC_POLL: Duration = Duration::from_secs(2);
@@ -438,6 +438,33 @@ impl Render for SettingsView {
                 )
                 .child(div().text_sm().text_color(rgb(line_color)).child(line.text));
 
+            let v = &d.settings.video;
+            let quality_ix = current_quality(v.fps, v.min_bitrate_kbps, v.max_bitrate_kbps);
+            let quality_hint = quality_ix.map_or_else(
+                || {
+                    format!(
+                        "Custom: {} fps, up to {} Mbps. Pick one to replace it, or edit it in Advanced.",
+                        v.fps,
+                        v.max_bitrate_kbps / 1_000
+                    )
+                },
+                |i| quality_line(&QUALITIES[i]),
+            );
+            let quality = section("Quality")
+                .child(segmented(
+                    "simple-quality",
+                    QUALITIES.iter().map(|q| q.label.into()).collect(),
+                    quality_ix,
+                    true,
+                    bind!(cx, |d, i: &usize| {
+                        let q = &QUALITIES[*i];
+                        d.settings.video.fps = q.fps;
+                        d.settings.video.min_bitrate_kbps = q.min_kbps;
+                        d.settings.video.max_bitrate_kbps = q.max_kbps;
+                    }),
+                ))
+                .child(hint(quality_hint));
+
             let recording = section("Recording").child(row("Output folder", f_out));
             let hotkeys = section("Hotkeys")
                 .child(row("Save clip", f_save))
@@ -471,6 +498,7 @@ impl Render for SettingsView {
 
             let sections: Vec<AnyElement> = vec![
                 intro.into_any_element(),
+                quality.into_any_element(),
                 recording.into_any_element(),
                 hotkeys.into_any_element(),
                 app_sec.into_any_element(),
