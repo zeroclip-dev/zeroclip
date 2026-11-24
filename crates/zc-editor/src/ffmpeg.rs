@@ -7,8 +7,18 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use zc_core::Hns;
+use zc_core::media::Codec;
+
+use crate::concat::StreamInfo;
+
+/// The ffmpeg executable name on this platform.
+const EXE: &str = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+/// The ffprobe executable name on this platform. It sits beside ffmpeg.
+const PROBE_EXE: &str = if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" };
 
 /// A located `ffmpeg.exe`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,8 +50,15 @@ impl Ffmpeg {
     /// # Errors
     /// [`FfmpegError::NotFound`].
     pub fn locate(configured: Option<&Path>) -> Result<Self, FfmpegError> {
-        let _ = configured;
-        todo!("Phase 5: check `configured`, then search PATH for ffmpeg.exe")
+        let exe = match configured {
+            // A configured path that's missing is an error, not a silent fallback.
+            Some(path) if path.is_file() => path.to_path_buf(),
+            Some(_) => return Err(FfmpegError::NotFound),
+            None => {
+                beside_current_exe(EXE).or_else(|| search_path(EXE)).ok_or(FfmpegError::NotFound)?
+            }
+        };
+        Ok(Self { exe })
     }
 
     /// Stream-copies `[start, end)` of `input` into `output`. `start` must already be
@@ -56,11 +73,7 @@ impl Ffmpeg {
         end: Hns,
         output: &Path,
     ) -> Result<(), FfmpegError> {
-        let _ = (input, start, end, output);
-        todo!(
-            "Phase 5: ffmpeg -hide_banner -ss <start> -to <end> -i <input> -map 0 -c copy \
-             -avoid_negative_ts make_zero <output>"
-        )
+        run(&self.exe, &trim_args(input, start, end, output)?).map(drop)
     }
 
     /// Joins clips with the concat demuxer (check `crate::concat::check_compatible` first).
@@ -68,10 +81,16 @@ impl Ffmpeg {
     /// # Errors
     /// See [`FfmpegError`].
     pub fn concat(&self, inputs: &[PathBuf], output: &Path) -> Result<(), FfmpegError> {
-        let _ = (inputs, output);
-        todo!(
-            "Phase 5: write a concat list file, ffmpeg -f concat -safe 0 -i list.txt -map 0 -c copy <output>"
-        )
+        // The list lives in the temp dir under a pid+time name, so runs never collide.
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let list = std::env::temp_dir()
+            .join(format!("zeroclip-concat-{}-{nanos}.txt", std::process::id()));
+        let body: String = inputs.iter().map(|p| concat_line(p) + "\n").collect();
+        std::fs::write(&list, body)?;
+        let result = run(&self.exe, &concat_args(&list, output)).map(drop);
+        // The list is scratch; failing to delete it must not fail the export.
+        let _ = std::fs::remove_file(&list);
+        result
     }
 
     /// Remuxes a fragmented recording into a plain MP4 with the index up front, for sharing.
@@ -79,9 +98,207 @@ impl Ffmpeg {
     /// # Errors
     /// See [`FfmpegError`].
     pub fn remux_for_export(&self, input: &Path, output: &Path) -> Result<(), FfmpegError> {
-        let _ = (input, output);
-        todo!("Phase 5: ffmpeg -i <input> -map 0 -c copy -movflags +faststart <output>")
+        run(&self.exe, &remux_args(input, output)).map(drop)
     }
+
+    /// Reads the first video stream, the audio track count, the duration and the keyframe
+    /// times of `path` (ffprobe, demux only).
+    ///
+    /// # Errors
+    /// See [`FfmpegError`]. A video codec other than H.264, HEVC or AV1 is `Failed`.
+    pub fn probe(&self, path: &Path) -> Result<ProbeInfo, FfmpegError> {
+        let ffprobe = self.exe.with_file_name(PROBE_EXE);
+        let streams = run(&ffprobe, &stream_args(path))?;
+        let (stream, duration, start) = parse_streams(&String::from_utf8_lossy(&streams))
+            .map_err(|stderr| FfmpegError::Failed { stderr })?;
+        let packets = run(&ffprobe, &keyframe_args(path))?;
+        let keyframes = parse_keyframes(&String::from_utf8_lossy(&packets), start);
+        Ok(ProbeInfo { stream, duration, keyframes })
+    }
+
+    /// Decodes the first audio track to mono f32 samples at `sample_rate`, for the waveform.
+    /// A clip without audio is an `Err`; callers treat that as "no waveform".
+    ///
+    /// # Errors
+    /// See [`FfmpegError`].
+    pub fn audio_samples(&self, path: &Path, sample_rate: u32) -> Result<Vec<f32>, FfmpegError> {
+        let mut args = common_args();
+        args.push("-i".into());
+        args.push(os(path));
+        args.extend(["-map", "0:a:0", "-ac", "1", "-ar"].map(OsString::from));
+        args.push(sample_rate.to_string().into());
+        args.extend(["-f", "f32le", "-"].map(OsString::from));
+        let bytes = run(&self.exe, &args)?;
+        Ok(f32_samples(&bytes))
+    }
+}
+
+/// What [`Ffmpeg::probe`] learned about a clip.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProbeInfo {
+    /// The first video stream, plus the audio track count.
+    pub stream: StreamInfo,
+    /// Container duration.
+    pub duration: Hns,
+    /// Keyframe times, relative to the first frame (sorted).
+    pub keyframes: Vec<Hns>,
+}
+
+/// The first existing `name` beside the running executable (a bundled ffmpeg).
+fn beside_current_exe(name: &str) -> Option<PathBuf> {
+    let candidate = std::env::current_exe().ok()?.parent()?.join(name);
+    candidate.is_file().then_some(candidate)
+}
+
+/// The first existing `name` on `PATH`.
+fn search_path(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths).map(|dir| dir.join(name)).find(|p| p.is_file())
+}
+
+/// Runs `exe` with `args` and returns its stdout. Non-zero exit is `Failed` with the last
+/// lines of stderr.
+fn run(exe: &Path, args: &[OsString]) -> Result<Vec<u8>, FfmpegError> {
+    let mut cmd = Command::new(exe);
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW (winbase.h): release builds are GUI-subsystem, so without this every
+        // job would flash a console window.
+        // https://learn.microsoft.com/windows/win32/procthread/process-creation-flags
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd.output()?;
+    if out.status.success() {
+        Ok(out.stdout)
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        Err(FfmpegError::Failed { stderr: last_lines(&stderr, 20) })
+    }
+}
+
+/// The last `n` lines of `text`.
+fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// ffprobe arguments listing every stream's type and the first video stream's shape, plus the
+/// container duration and start time. Parsed by [`parse_streams`].
+fn stream_args(path: &Path) -> Vec<OsString> {
+    let mut args: Vec<OsString> = ["-v", "error", "-show_entries"].map(OsString::from).to_vec();
+    args.push(
+        "stream=codec_type,codec_name,width,height,avg_frame_rate:format=duration,start_time"
+            .into(),
+    );
+    args.extend(["-of", "default=noprint_wrappers=1"].map(OsString::from));
+    args.push(os(path));
+    args
+}
+
+/// ffprobe arguments listing the first video stream's packet times and flags. Packet level only,
+/// so it demuxes without decoding and is fast even for long clips. Parsed by [`parse_keyframes`].
+fn keyframe_args(path: &Path) -> Vec<OsString> {
+    let mut args: Vec<OsString> =
+        ["-v", "error", "-select_streams", "v:0", "-show_entries"].map(OsString::from).to_vec();
+    args.push("packet=pts_time,flags".into());
+    args.extend(["-of", "csv=print_section=0"].map(OsString::from));
+    args.push(os(path));
+    args
+}
+
+/// Parses `default=noprint_wrappers=1` output for [`STREAM_ENTRIES`]. Returns the stream info,
+/// the container duration and its start time. `codec_type` comes first in each stream block.
+fn parse_streams(text: &str) -> Result<(StreamInfo, Hns, Hns), String> {
+    let mut video_seen = false;
+    let mut in_first_video = false;
+    let mut codec_name = None;
+    let mut width = None;
+    let mut height = None;
+    let mut fps_rate = None;
+    let mut audio = 0usize;
+    let mut duration = None;
+    let mut start = None;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        match key {
+            "codec_type" => {
+                in_first_video = value == "video" && !video_seen;
+                video_seen |= value == "video";
+                if value == "audio" {
+                    audio += 1;
+                }
+            }
+            "codec_name" if in_first_video => codec_name = Some(value),
+            "width" if in_first_video => width = Some(value),
+            "height" if in_first_video => height = Some(value),
+            "avg_frame_rate" if in_first_video => fps_rate = Some(value),
+            // Only the format section asks for these, and it comes after every stream block.
+            "duration" => duration = value.parse::<f64>().ok(),
+            "start_time" => start = value.parse::<f64>().ok(),
+            _ => {}
+        }
+    }
+    let codec = match codec_name.ok_or("no video stream")? {
+        "h264" => Codec::H264,
+        "hevc" => Codec::Hevc,
+        "av1" => Codec::Av1,
+        other => return Err(format!("unsupported video codec {other}")),
+    };
+    let size = (parse_dim(width)?, parse_dim(height)?);
+    let fps = fps_rate.and_then(parse_rate).unwrap_or(0);
+    let duration = Hns::from_secs_f64(duration.ok_or("no duration")?);
+    // A missing start time (N/A) means the file starts at zero.
+    let start = Hns::from_secs_f64(start.unwrap_or(0.0));
+    let stream =
+        StreamInfo { codec, size, fps, audio_tracks: u8::try_from(audio).unwrap_or(u8::MAX) };
+    Ok((stream, duration, start))
+}
+
+fn parse_dim(value: Option<&str>) -> Result<u32, String> {
+    value.and_then(|v| v.parse().ok()).ok_or_else(|| "missing video size".into())
+}
+
+/// Parses an ffprobe rate such as `60/1` or `30000/1001`, rounded to whole frames per second.
+/// `0/0` (unknown) gives `None`.
+fn parse_rate(rate: &str) -> Option<u32> {
+    let (num, den) = rate.split_once('/')?;
+    let (num, den): (f64, f64) = (num.parse().ok()?, den.parse().ok()?);
+    if den == 0.0 {
+        return None;
+    }
+    let fps = (num / den).round();
+    // Frame rates are small positive numbers, so this conversion cannot lose anything real.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a frame rate is a small non-negative whole number"
+    )]
+    Some(fps as u32)
+}
+
+/// Parses `pts_time,flags` CSV lines from [`KEYFRAME_ENTRIES`]. Keeps keyframes (flags start with
+/// `K`), subtracts `start` (ffmpeg's `-ss` counts from the first frame), and sorts.
+fn parse_keyframes(text: &str, start: Hns) -> Vec<Hns> {
+    let mut keys: Vec<Hns> = text
+        .lines()
+        .filter_map(|line| {
+            let (pts, flags) = line.split_once(',')?;
+            if !flags.starts_with('K') {
+                return None;
+            }
+            let secs: f64 = pts.parse().ok()?;
+            Some(Hns::from_secs_f64(secs) - start)
+        })
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// Converts little-endian f32 PCM bytes to samples. A trailing partial sample is dropped.
+fn f32_samples(bytes: &[u8]) -> Vec<f32> {
+    bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
 }
 
 /// Flags every job starts with: quiet, never read stdin, and never overwrite. Exports are
@@ -513,5 +730,76 @@ mod tests {
     fn concat_line_escapes_single_quotes() {
         assert_eq!(concat_line(Path::new(r"C:\clips\a.mp4")), r"file 'C:\clips\a.mp4'");
         assert_eq!(concat_line(Path::new("it's.mp4")), r"file 'it'\''s.mp4'");
+    }
+
+    /// Canned `stream_args` output: an audio track first, then video, then the format.
+    const STREAMS: &str = "\
+codec_type=audio
+codec_type=video
+codec_name=h264
+width=1920
+height=1080
+avg_frame_rate=60/1
+codec_type=audio
+duration=12.500000
+start_time=0.250000
+";
+
+    #[test]
+    fn parse_streams_reads_the_first_video_and_the_container() {
+        let (stream, duration, start) = parse_streams(STREAMS).unwrap();
+        assert_eq!(stream.codec, Codec::H264);
+        assert_eq!(stream.size, (1920, 1080));
+        assert_eq!(stream.fps, 60);
+        assert_eq!(stream.audio_tracks, 2);
+        assert_eq!(duration, Hns::from_millis(12_500));
+        assert_eq!(start, Hns::from_millis(250));
+    }
+
+    #[test]
+    fn parse_streams_rejects_unsupported_codecs_and_missing_video() {
+        let vp9 = STREAMS.replace("h264", "vp9");
+        assert_eq!(parse_streams(&vp9).unwrap_err(), "unsupported video codec vp9");
+        let audio_only = "codec_type=audio\nduration=1.0\nstart_time=0.0\n";
+        assert_eq!(parse_streams(audio_only).unwrap_err(), "no video stream");
+    }
+
+    #[test]
+    fn parse_rate_rounds_ntsc_and_rejects_unknown() {
+        assert_eq!(parse_rate("60/1"), Some(60));
+        assert_eq!(parse_rate("30000/1001"), Some(30));
+        assert_eq!(parse_rate("0/0"), None);
+    }
+
+    #[test]
+    fn keyframes_are_relative_to_the_start_time_and_sorted() {
+        // Packets arrive in decode order; only the `K` ones count, and the 0.25 s start is removed.
+        let packets = "1.250000,K__\n1.500000,___\n0.250000,K_\n2.250000,K__\n";
+        let keys = parse_keyframes(packets, Hns::from_millis(250));
+        assert_eq!(keys, [Hns::ZERO, Hns::from_secs(1), Hns::from_secs(2)]);
+    }
+
+    #[test]
+    fn f32_samples_decodes_little_endian_and_drops_a_partial_tail() {
+        let mut bytes = Vec::new();
+        bytes.extend(0.5_f32.to_le_bytes());
+        bytes.extend((-0.25_f32).to_le_bytes());
+        bytes.push(0xff);
+        assert_eq!(f32_samples(&bytes), [0.5, -0.25]);
+    }
+
+    #[test]
+    fn locate_refuses_a_missing_configured_path() {
+        let missing = std::env::temp_dir().join("zc-no-such-ffmpeg-for-tests.exe");
+        assert!(matches!(Ffmpeg::locate(Some(&missing)), Err(FfmpegError::NotFound)));
+    }
+
+    #[test]
+    fn locate_accepts_a_configured_file() {
+        let path = std::env::temp_dir().join(format!("zc-fake-ffmpeg-{}.exe", std::process::id()));
+        std::fs::write(&path, b"").unwrap();
+        let found = Ffmpeg::locate(Some(&path));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(found.unwrap().exe, path);
     }
 }
