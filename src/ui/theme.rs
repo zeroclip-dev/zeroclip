@@ -17,7 +17,6 @@ pub const BRAND: u32 = 0x2dd4bf;
 #[allow(dead_code)] // token mirrors the preview; banners and status pill use the soft fills
 pub const BRAND_SOFT: u32 = 0x0f2f2c;
 pub const WARN: u32 = 0xfbbf24;
-#[allow(dead_code)]
 pub const WARN_SOFT: u32 = 0x2a2108;
 pub const DANGER: u32 = 0xf87171;
 #[allow(dead_code)]
