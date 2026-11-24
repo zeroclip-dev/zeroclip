@@ -32,8 +32,7 @@ fn main() -> anyhow::Result<()> {
         Ok(Some(guard)) => Some(guard),
         Ok(None) => {
             tracing::warn!("ZeroClip is already running; exiting this copy");
-            // ponytail: no message box (needs a new windows feature); stderr + log only.
-            eprintln!("ZeroClip is already running.");
+            zc_win::single_instance::show_already_running();
             return Ok(());
         }
         Err(error) => {
