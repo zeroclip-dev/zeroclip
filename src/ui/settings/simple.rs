@@ -1,25 +1,14 @@
-//! Simple mode: one screen, "Clip the last N minutes", shown in place of the tabs. The number
-//! edits the draft's default profile buffer; Save applies it the same way the Settings tab does.
-//! A live line under the number says what the buffer needs and whether the drive has room.
+//! Helpers for the Settings screen's Simple view: the "Clip the last N minutes" number and the
+//! live line under it that says what the buffer needs. Pure and tested here; the view itself is in
+//! `settings/mod.rs`.
 
 use std::path::Path;
 
-use gpui::{
-    Context, FontWeight, IntoElement, ParentElement, StatefulInteractiveElement, Styled, div, px,
-    rgb,
-};
 use zc_core::dvr::{SimpleCheck, simple_mode_check};
 
-use crate::app::ZeroClipApp;
-use crate::ui::components::{
-    button::button_primary,
-    number_stepper::{Stepper, number_stepper},
-};
-use crate::ui::theme;
-
 /// The stepper's limits, in minutes.
-const MIN_MINUTES: f64 = 1.0;
-const MAX_MINUTES: f64 = 240.0;
+pub const MIN_MINUTES: f64 = 1.0;
+pub const MAX_MINUTES: f64 = 240.0;
 
 /// The buffer length in whole minutes, as the number shows it. Never below one minute.
 pub fn minutes_from_buffer_secs(secs: u32) -> u32 {
@@ -27,7 +16,7 @@ pub fn minutes_from_buffer_secs(secs: u32) -> u32 {
 }
 
 /// Bytes as gigabytes with one decimal, e.g. "1.4 GB". Rounds half up, in integers.
-pub fn gigabytes(bytes: u64) -> String {
+fn gigabytes(bytes: u64) -> String {
     let tenths = bytes.saturating_add(50_000_000) / 100_000_000;
     format!("{}.{} GB", tenths / 10, tenths % 10)
 }
@@ -73,63 +62,9 @@ pub fn storage_line(minutes: u32, bitrate_bps: u64, free: Option<u64>) -> Storag
 
 /// Free bytes on the drive that will hold the clips. The output folder may not exist yet, so
 /// the nearest folder that does is asked instead.
-fn free_space(dir: &Path) -> Option<u64> {
+pub fn free_space(dir: &Path) -> Option<u64> {
     let existing = dir.ancestors().find(|p| p.exists())?;
     zc_win::drive::free_bytes(existing).ok()
-}
-
-pub fn screen(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoElement {
-    let draft = &app.draft.settings;
-    let minutes = minutes_from_buffer_secs(draft.profiles.default.buffer_secs);
-    let bitrate = buffer_bitrate_bps(draft.video.max_bitrate_kbps, draft.audio.bitrate_kbps);
-    let line = storage_line(minutes, bitrate, free_space(&app.output_dir()));
-    let dirty = app.draft.is_dirty(&app.settings);
-
-    let number = number_stepper(
-        "simple-minutes",
-        f64::from(minutes),
-        Stepper { min: MIN_MINUTES, max: MAX_MINUTES, step: 1.0, suffix: "", enabled: true },
-        cx.listener(|app, minutes: &f64, _, cx| {
-            app.draft.settings.profiles.default.buffer_secs = (*minutes as u32) * 60;
-            cx.notify();
-        }),
-    );
-
-    let save = button_primary("simple-save", "Save").opacity(if dirty { 1.0 } else { 0.4 });
-    let save = if dirty {
-        save.on_click(cx.listener(|app, _, _, cx| {
-            app.save_settings();
-            cx.notify();
-        }))
-    } else {
-        save
-    };
-
-    let line_color = if line.too_small { theme::DANGER } else { theme::MUTED_FG };
-
-    div()
-        .size_full()
-        .flex()
-        .flex_col()
-        .gap_4()
-        .p_6()
-        .max_w(px(560.))
-        .child(
-            // The number sits inside the sentence, so the heading reads "Clip the last 20 minutes".
-            div()
-                .flex()
-                .flex_row()
-                .flex_wrap()
-                .items_center()
-                .gap_3()
-                .text_xl()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child("Clip the last")
-                .child(number)
-                .child("minutes"),
-        )
-        .child(div().text_sm().text_color(rgb(line_color)).child(line.text))
-        .child(div().flex().flex_row().child(save))
 }
 
 #[cfg(test)]
