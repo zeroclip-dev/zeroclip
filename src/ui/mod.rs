@@ -1,6 +1,7 @@
 //! The UI shell: top bar, optional focus banner, the active screen, status bar. Screens are
 //! views registered in `components/screens.rs`; this file never needs to change for a new screen.
 
+pub mod clip_menu;
 pub mod clips;
 pub mod components;
 pub mod editor;
@@ -31,7 +32,11 @@ const GRAY: u32 = theme::MUTED_FG;
 
 gpui::actions!(zeroclip, [ToggleFullscreen]);
 
-pub fn shell(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoElement {
+pub fn shell(
+    app: &ZeroClipApp,
+    window: &gpui::Window,
+    cx: &mut Context<ZeroClipApp>,
+) -> impl IntoElement {
     div()
         .size_full()
         .flex()
@@ -45,6 +50,7 @@ pub fn shell(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoEleme
         .children(rescue::banner(app, cx))
         .child(div().flex_1().min_h_0().overflow_hidden().child(app.screens.view(app.tab)))
         .child(status_bar(app))
+        .children(clip_menu::layer(app, window, cx))
 }
 
 fn top_bar(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoElement {

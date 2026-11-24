@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 
-use gpui::{Context, IntoElement, Render, Window};
+use gpui::{Context, FocusHandle, IntoElement, Pixels, Point, Render, Window};
 use zc_core::control::{Command, EngineEvent, EngineStatus, FocusChoice};
 use zc_core::settings::{CaptureMode, Settings, UiMode};
 use zc_engine::{Engine, EngineConfig, EngineHandle};
@@ -87,6 +87,11 @@ pub struct ZeroClipApp {
     /// Newest first.
     pub notices: VecDeque<Notice>,
     pub clips: ui::clips::ClipList,
+    /// The clip the right-click menu is open for, and where it was opened. Any screen sets it
+    /// through [`Self::open_clip_menu`]; the shell draws it (`ui/clip_menu.rs`).
+    pub clip_menu: Option<(PathBuf, Point<Pixels>)>,
+    /// Focus for the open menu, so Esc reaches it.
+    pub menu_focus: FocusHandle,
     /// The metadata database (waveform cache). `None` when it couldn't be opened.
     pub store: Option<Arc<Mutex<zc_store::Store>>>,
     #[allow(dead_code)] // used by the Profiles screen
@@ -206,6 +211,8 @@ impl ZeroClipApp {
             quitting: false,
             tray_hint_shown: false,
             clips: ui::clips::ClipList::default(),
+            clip_menu: None,
+            menu_focus: cx.focus_handle(),
             store,
             open_apps: Default::default(),
             focus_prompt: None,
@@ -226,6 +233,19 @@ impl ZeroClipApp {
             editor.open(path, watch, Some(prefs), ffmpeg, store, bitrate_bps, cx)
         });
         self.tab = Tab::Editor;
+        cx.notify();
+    }
+
+    /// Opens the clip menu for `path` at `at` (window coordinates).
+    pub fn open_clip_menu(
+        &mut self,
+        path: PathBuf,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clip_menu = Some((path, at));
+        self.menu_focus.focus(window, cx);
         cx.notify();
     }
 
@@ -568,9 +588,9 @@ impl ZeroClipApp {
 }
 
 impl Render for ZeroClipApp {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         ui::focus_prompt::clear_if_left(self);
-        ui::shell(self, cx)
+        ui::shell(self, window, cx)
     }
 }
 
