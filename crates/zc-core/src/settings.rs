@@ -33,6 +33,9 @@ pub struct Settings {
     pub uploads: UploadSettings,
     /// Per-game profiles.
     pub profiles: ProfileSet,
+    /// The lightning editor's external tools (P5.5).
+    #[serde(default)]
+    pub editor: EditorSettings,
     /// Tray and startup behaviour (P4.15, P4.16).
     #[serde(default)]
     pub app: AppSettings,
@@ -61,6 +64,7 @@ impl Default for Settings {
             storage: StorageSettings::default(),
             uploads: UploadSettings::default(),
             profiles: ProfileSet::default(),
+            editor: EditorSettings::default(),
             app: AppSettings::default(),
             ui_mode: UiMode::default(),
             overlay_toasts: default_overlay_toasts(),
@@ -160,6 +164,15 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self { close_to_tray: true, start_with_windows: false }
     }
+}
+
+/// The editor's external tools (P5.5).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorSettings {
+    /// Full path to `ffmpeg.exe`. `None` looks next to ZeroClip, then on `PATH`. A path that
+    /// doesn't exist is an error, not a silent fallback. `ffprobe` is expected beside it.
+    pub ffmpeg_path: Option<PathBuf>,
 }
 
 /// Output location and container.
