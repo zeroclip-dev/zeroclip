@@ -1594,6 +1594,21 @@ impl EditorView {
             (xd(start), xd(start + span))
         };
         let tracks = self.timeline.pieces.first().map_or(0, |p| p.tracks.len());
+        // The trimmed-off parts of piece `i` (drawn at `x0..x1`) as gray room around it: x range
+        // and the source time range each one stands for, so the video and audio lanes can show
+        // what was cut. The left one runs `gl` back from the piece's start, the right `gr` on.
+        let ghosts = |i: usize, x0: f32, x1: f32| -> Vec<(f32, f32, Hns, Hns)> {
+            let piece = &self.timeline.pieces[i];
+            let room = xd(gl) - xd(Hns::ZERO);
+            let room_r = xd(gr) - xd(Hns::ZERO);
+            [
+                (x0 - room, x0, piece.a - gl, piece.a),
+                (x1, x1 + room_r, piece.b, piece.b + gr),
+            ]
+            .into_iter()
+            .filter(|(g0, g1, a, b)| g1 - g0 >= 2.0 && b > a)
+            .collect()
+        };
 
         // Above the ruler: each piece's letter, its length and the extract button.
         let mut head = div().relative().w_full().h(px(HEAD_HEIGHT));
@@ -1730,22 +1745,29 @@ impl EditorView {
             // What was trimmed off the selected piece stays in place, grayed out, so the scale
             // doesn't change; the handles above still trim it.
             if selected && self.trim.is_none() {
-                for (g0, g1) in
-                    [(x0 - (xd(gl) - xd(Hns::ZERO)), x0), (x1, x1 + (xd(gr) - xd(Hns::ZERO)))]
-                {
-                    if g1 - g0 < 2.0 {
-                        continue;
-                    }
+                for (g0, g1, a, b) in ghosts(i, x0, x1) {
+                    let tiles = thumb_tiles(&self.sources[piece.source].thumbs, a, b - a, g1 - g0);
                     video_lane = video_lane.child(
                         div()
                             .absolute()
                             .left(px(g0))
                             .w(px(g1 - g0))
                             .h_full()
+                            .overflow_hidden()
                             .bg(rgb(theme::MUTED))
-                            .opacity(0.55)
                             .border_1()
-                            .border_color(rgb(theme::MUTED_FG)),
+                            .border_color(rgb(theme::MUTED_FG))
+                            .children(tiles.into_iter().map(|(x, image)| {
+                                img(ImageSource::Render(image))
+                                    .absolute()
+                                    .left(px(x))
+                                    .top_0()
+                                    .w(px(THUMB_W))
+                                    .h_full()
+                                    .object_fit(ObjectFit::Cover)
+                                    // Dimmer than the kept part: this is what was cut off.
+                                    .opacity(0.3)
+                            })),
                     );
                 }
             }
@@ -1839,6 +1861,43 @@ impl EditorView {
                 let w = (x1 - x0 - 1.0).max(1.0);
                 let edit = &piece.tracks[t];
                 let source = &self.sources[piece.source];
+                if self.selected == Some(i) && self.trim.is_none() {
+                    for (g0, g1, a, b) in ghosts(i, x0, x1) {
+                        let gw = g1 - g0;
+                        let mut ghost = div()
+                            .absolute()
+                            .left(px(g0))
+                            .w(px(gw))
+                            .h_full()
+                            .overflow_hidden()
+                            .bg(rgb(theme::MUTED))
+                            .opacity(0.55);
+                        if let Some(Some(peaks)) = source.waves.get(t) {
+                            let span = source
+                                .info
+                                .audio_spans
+                                .get(t)
+                                .copied()
+                                .unwrap_or((Hns::ZERO, source.info.duration));
+                            let columns =
+                                model::column_peaks(peaks, span, a, b, (gw / BAR_STEP) as usize);
+                            let n = columns.len().max(1);
+                            ghost = ghost.children(columns.into_iter().enumerate().map(
+                                |(c, peak)| {
+                                    let h = (peak.min(1.0).sqrt() * LANE_HEIGHT).max(1.0);
+                                    div()
+                                        .absolute()
+                                        .left(px((c as f32 + 0.5) / n as f32 * gw))
+                                        .top(px((LANE_HEIGHT - h) / 2.0))
+                                        .w(px(2.))
+                                        .h(px(h))
+                                        .bg(rgb(theme::MUTED_FG))
+                                },
+                            ));
+                        }
+                        lane = lane.child(ghost);
+                    }
+                }
                 let mut block = div()
                     .absolute()
                     .left(px(x0))
