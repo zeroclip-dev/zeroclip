@@ -110,6 +110,8 @@ pub struct EditorView {
     export: Export,
     /// The "what now?" choice is showing.
     finishing: bool,
+    /// A piece edge being dragged.
+    trim: Option<TrimDrag>,
     /// "Close the editor?" is showing.
     confirm_close: bool,
     /// Whether the choice is kept for next time.
@@ -131,6 +133,16 @@ pub struct EditorView {
     /// Earlier and undone states of the pieces.
     undo: Vec<Vec<Piece>>,
     redo: Vec<Vec<Piece>>,
+}
+
+/// A piece edge being dragged: which piece and side, where the mouse went down, how much time a
+/// pixel is, and the piece as it was.
+struct TrimDrag {
+    index: usize,
+    left: bool,
+    x0: f32,
+    per_px: f64,
+    orig: Piece,
 }
 
 impl EditorView {
@@ -162,6 +174,7 @@ impl EditorView {
             export: Export::Idle,
             finishing: false,
             confirm_close: false,
+            trim: None,
             remember: false,
             finish: FinishChoice::Ask,
             listen: 0,
@@ -485,6 +498,7 @@ impl EditorView {
     }
 
     fn release(&mut self) {
+        self.trim = None;
         self.scrubbing = false;
         self.drag = None;
         self.ranging = false;
@@ -566,7 +580,19 @@ impl EditorView {
         }
     }
 
-    /// Moves the grabbed volume point to the mouse.
+    /// Drags the grabbed piece edge to the mouse, from the piece as it was when grabbed.
+    fn drag_edge(&mut self, ev: &MouseMoveEvent) {
+        let Some(t) = &self.trim else { return };
+        let Some(source) = self.sources.get(t.orig.source) else { return };
+        let by = Hns::from_ticks((f64::from(f32::from(ev.position.x) - t.x0) * t.per_px) as i64);
+        let (a, b) = if t.left { (t.orig.a + by, t.orig.b) } else { (t.orig.a, t.orig.b + by) };
+        let trimmed = t.orig.trimmed(a, b, source.info.duration);
+        if let Some(piece) = self.timeline.pieces.get_mut(t.index) {
+            *piece = trimmed;
+        }
+    }
+
+    /// Moves the grabbed
     fn drag_point(&mut self, ev: &MouseMoveEvent) {
         let Some((i, t, k)) = self.drag else { return };
         let Some(lane) = self.lanes.borrow().get(t).copied() else { return };
@@ -1326,6 +1352,43 @@ impl EditorView {
             let x0 = x_of(self.timeline.start_of(i));
             let x1 = x_of(self.timeline.start_of(i) + piece.span());
             let selected = self.selected == Some(i);
+            // Handles on the selected piece's two edges: drag to trim it.
+            let handles: Vec<gpui::Stateful<gpui::Div>> = if selected {
+                [true, false]
+                    .into_iter()
+                    .map(|left| {
+                        let piece = piece.clone();
+                        let per_px = f64::from(self.timeline.total().ticks() as f32)
+                            / f64::from(f32::from(self.strip.get().size.width).max(1.0));
+                        let side = div().id(("trim", i * 2 + usize::from(left))).absolute().top_0();
+                        let side = if left { side.left_0() } else { side.right_0() };
+                        side.w(px(10.))
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(rgb(theme::BRAND))
+                            .cursor_col_resize()
+                            .child(div().w(px(2.)).h(px(16.)).rounded_full().bg(rgb(theme::BG)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                    this.checkpoint();
+                                    this.trim = Some(TrimDrag {
+                                        index: i,
+                                        left,
+                                        x0: f32::from(ev.position.x),
+                                        per_px,
+                                        orig: piece.clone(),
+                                    });
+                                    cx.stop_propagation();
+                                }),
+                            )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             video_lane = video_lane.child(
                 div()
                     .absolute()
@@ -1340,7 +1403,8 @@ impl EditorView {
                     .items_center()
                     .text_sm()
                     .text_color(rgb(theme::FG))
-                    .child(model::piece_label(i)),
+                    .child(model::piece_label(i))
+                    .children(handles),
             );
         }
 
@@ -1548,6 +1612,9 @@ impl EditorView {
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
                 if this.drag.is_some() && ev.dragging() {
                     this.drag_point(ev);
+                    cx.notify();
+                } else if this.trim.is_some() && ev.dragging() {
+                    this.drag_edge(ev);
                     cx.notify();
                 } else if this.ranging && ev.dragging() {
                     if let Some(i) = this.range.map(|r| r.1) {

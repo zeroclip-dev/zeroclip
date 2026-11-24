@@ -209,6 +209,28 @@ impl TrackEdit {
         self.simplify();
     }
 
+    /// Re-cuts the piece this track belongs to. `shift` is how much earlier the piece now starts
+    /// to count from (positive when its start was trimmed, negative when it was pulled out) and
+    /// `new_span` its new length. The sound inside stays what it was; the line is cut or extended
+    /// flat at the new ends.
+    pub fn resized(&self, shift: Hns, new_span: Hns) -> Self {
+        if !self.has_line() {
+            return self.clone();
+        }
+        let mut out = self.clone();
+        let inside = self
+            .points
+            .iter()
+            .filter(|p| p.at > shift + MIN_GAP && p.at < shift + new_span - MIN_GAP)
+            .map(|p| EnvPoint { at: p.at - shift, db: p.db });
+        out.points = std::iter::once(EnvPoint { at: Hns::ZERO, db: self.db_at(shift) })
+            .chain(inside)
+            .chain(std::iter::once(EnvPoint { at: new_span, db: self.db_at(shift + new_span) }))
+            .collect();
+        out.simplify();
+        out
+    }
+
     /// Drops a line that does nothing: fewer than two points, or all at one level.
     pub fn simplify(&mut self) {
         let flat = match self.points.as_slice() {
@@ -331,6 +353,16 @@ pub struct Piece {
 impl Piece {
     pub fn span(&self) -> Hns {
         self.b - self.a
+    }
+
+    /// This piece with its range changed to `a..b` of a source `duration` long (kept inside it and
+    /// at least `MIN_PIECE` long). The audio edits keep their place in the sound.
+    pub fn trimmed(&self, a: Hns, b: Hns, duration: Hns) -> Self {
+        let a = a.clamp(Hns::ZERO, (b - MIN_PIECE).max(Hns::ZERO));
+        let b = b.clamp(a + MIN_PIECE, duration.max(a + MIN_PIECE));
+        let (shift, span) = (a - self.a, b - a);
+        let tracks = self.tracks.iter().map(|t| t.resized(shift, span)).collect();
+        Self { source: self.source, a, b, tracks }
     }
 }
 
@@ -708,6 +740,20 @@ mod tests {
         let mut all = TrackEdit::default();
         all.silence(Hns::ZERO, secs(10), secs(10));
         assert!(all.mute);
+    }
+
+    #[test]
+    fn trimming_keeps_the_sound_where_it_was() {
+        let mut e = TrackEdit::default();
+        e.silence(secs(4), secs(6), secs(10));
+        let piece = Piece { source: 0, a: secs(10), b: secs(20), tracks: vec![e] };
+        // Cut 3 s off the start: the silent stretch is now 1..3 s in.
+        let t = piece.trimmed(secs(13), secs(20), secs(60));
+        assert_eq!(t.span(), secs(7));
+        assert_eq!(t.tracks[0].db_at(secs(2)), MIN_DB);
+        assert_eq!(t.tracks[0].db_at(secs(5)), 0.0);
+        // Pulled back out, the piece can't start before the clip does.
+        assert_eq!(t.trimmed(secs(0), secs(20), secs(60)).a, secs(0));
     }
 
     #[test]
