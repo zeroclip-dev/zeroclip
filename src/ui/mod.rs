@@ -9,21 +9,14 @@ pub mod overlay;
 pub mod profiles;
 pub mod rescue;
 pub mod settings;
-pub mod simple;
 pub mod theme;
 
-use gpui::{
-    Context, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, rgb,
-};
+use gpui::{Context, IntoElement, ParentElement, StatefulInteractiveElement, Styled, div, rgb};
 use zc_core::Hns;
 use zc_core::media::Codec;
-use zc_core::settings::UiMode;
 
 use crate::app::{Tab, ZeroClipApp};
-use components::{
-    mic_indicator::mic_indicator, segmented::segmented, status_dot::status_dot,
-    tab_button::tab_button,
-};
+use components::{mic_indicator::mic_indicator, status_dot::status_dot, tab_button::tab_button};
 
 const RED: u32 = theme::DANGER;
 const GREEN: u32 = theme::BRAND;
@@ -39,10 +32,7 @@ pub fn shell(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoEleme
         .child(top_bar(app, cx))
         .children(focus_prompt::banner(app, cx))
         .children(rescue::banner(app, cx))
-        .child(div().flex_1().min_h_0().overflow_hidden().child(match app.settings.ui_mode {
-            UiMode::Simple => simple::screen(app, cx).into_any_element(),
-            UiMode::Advanced => app.screens.view(app.tab).into_any_element(),
-        }))
+        .child(div().flex_1().min_h_0().overflow_hidden().child(app.screens.view(app.tab)))
         .child(status_bar(app))
 }
 
@@ -66,17 +56,12 @@ fn top_bar(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoElement
         .px_3()
         .py_2()
         .child(div().text_xl().font_weight(gpui::FontWeight::BOLD).mr_4().child("ZeroClip"))
-        .children(Tab::ALL.into_iter().filter(|_| app.settings.ui_mode == UiMode::Advanced).map(
-            |tab| {
-                tab_button(tab.label(), app.tab == tab).on_click(cx.listener(
-                    move |app, _, _, cx| {
-                        app.tab = tab;
-                        cx.notify();
-                    },
-                ))
-            },
-        ))
-        .child(mode_switch(app, cx))
+        .children(Tab::ALL.into_iter().map(|tab| {
+            tab_button(tab.label(), app.tab == tab).on_click(cx.listener(move |app, _, _, cx| {
+                app.tab = tab;
+                cx.notify();
+            }))
+        }))
         .child(
             div()
                 .ml_auto()
@@ -113,26 +98,6 @@ fn status_bar(app: &ZeroClipApp) -> impl IntoElement {
         .child(div().ml_auto().child(concat!("v", env!("CARGO_PKG_VERSION"))))
 }
 
-/// The Simple | Advanced switch in the header.
-fn mode_switch(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoElement {
-    let options = vec![SharedString::from("Simple"), SharedString::from("Advanced")];
-    let selected = match app.settings.ui_mode {
-        UiMode::Simple => 0,
-        UiMode::Advanced => 1,
-    };
-    segmented(
-        "ui-mode",
-        options,
-        Some(selected),
-        true,
-        cx.listener(|app, ix: &usize, _, cx| {
-            let mode = if *ix == 0 { UiMode::Simple } else { UiMode::Advanced };
-            app.set_ui_mode(mode);
-            cx.notify();
-        }),
-    )
-}
-
 /// "45 s", "2 min", "1 min 30 s".
 pub fn human_duration(t: Hns) -> String {
     let secs = t.as_millis().max(0) / 1_000;
@@ -144,13 +109,11 @@ pub fn human_duration(t: Hns) -> String {
 }
 
 /// Approximate DVR memory for `secs` at `max_kbps`, in MB (DESIGN §4 table).
-#[allow(dead_code)] // used by the Settings and Profiles screens
 pub fn dvr_megabytes(secs: u32, max_kbps: u32) -> u64 {
     u64::from(max_kbps) * 1_000 / 8 * u64::from(secs) / 1_000_000
 }
 
 /// Size of the disk-mode ring file for `secs` (P4.21), in MB. The engine sizes it the same way.
-#[allow(dead_code)]
 pub fn dvr_ring_megabytes(secs: u32, max_kbps: u32, audio_kbps: u32) -> u64 {
     let window = zc_core::Hns::from_secs(i64::from(secs));
     let config = zc_core::dvr::DvrConfig::for_window(
@@ -164,7 +127,6 @@ pub fn dvr_ring_megabytes(secs: u32, max_kbps: u32, audio_kbps: u32) -> u64 {
 /// The DVR memory limit the engine really runs under: the setting, capped at a share of this
 /// machine's RAM (D32, P4.20). The engine and the UI must agree on it, or the Profiles tab shows
 /// windows the engine then cuts.
-#[allow(dead_code)]
 pub fn effective_ceiling(setting_mib: u32) -> zc_core::profile::RamCeiling {
     zc_core::profile::effective_ram_ceiling(setting_mib, zc_win::memory::total_physical_mib())
 }
