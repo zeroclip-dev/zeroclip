@@ -11,12 +11,13 @@ use gpui::{
 use crate::ui::theme;
 
 pub fn segmented(
-    id: &'static str,
+    id: impl Into<SharedString>,
     options: Vec<SharedString>,
     selected: Option<usize>,
     enabled: bool,
     on_select: impl Fn(&usize, &mut Window, &mut App) + 'static,
 ) -> gpui::Div {
+    let id: SharedString = id.into();
     let on_select = std::rc::Rc::new(on_select);
     let chips = options.into_iter().enumerate().map(|(i, label)| {
         let on_select = on_select.clone();

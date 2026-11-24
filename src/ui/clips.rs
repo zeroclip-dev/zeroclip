@@ -1,7 +1,7 @@
 //! The clip list. For now a plain folder listing; the library (thumbnails,
 //! metadata from zc-store), the editor and sharing arrive in Phases 4–6.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use gpui::{
@@ -29,6 +29,7 @@ pub struct ClipList {
 #[derive(Debug)]
 struct ClipFile {
     name: String,
+    path: PathBuf,
     size_bytes: u64,
     modified: Option<SystemTime>,
 }
@@ -37,6 +38,22 @@ impl ClipList {
     /// Marks the listing stale; it is re-read the next time the tab is shown.
     pub fn invalidate(&mut self) {
         self.scanned = false;
+    }
+
+    /// Re-reads `dir` if the listing is stale.
+    pub fn ensure_scanned(&mut self, dir: &Path) {
+        if !self.scanned {
+            self.rescan(dir);
+        }
+    }
+
+    /// Video files (mp4, mkv): name and path, newest first. For the Editor's picker.
+    pub fn videos(&self) -> Vec<(String, PathBuf)> {
+        self.files
+            .iter()
+            .filter(|f| Kind::Videos.accepts(&f.name))
+            .map(|f| (f.name.clone(), f.path.clone()))
+            .collect()
     }
 
     fn rescan(&mut self, dir: &Path) {
@@ -61,6 +78,7 @@ impl ClipList {
             if wanted && meta.is_file() {
                 self.files.push(ClipFile {
                     name: entry.file_name().to_string_lossy().into_owned(),
+                    path,
                     size_bytes: meta.len(),
                     modified: meta.modified().ok(),
                 });
@@ -210,11 +228,21 @@ impl Render for ClipsView {
         } else if shown.is_empty() {
             empty(format!("No clips match \u{201c}{}\u{201d}.", self.query.trim()))
         } else {
-            let rows = shown.iter().map(|file| {
+            let rows = shown.iter().enumerate().map(|(i, file)| {
+                let edit = Kind::Videos.accepts(&file.name).then(|| {
+                    let path = file.path.clone();
+                    button_ghost(("clip-edit", i), "Edit").on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            let path = path.clone();
+                            let _ = this.app.update(cx, |app, cx| app.open_in_editor(path, cx));
+                        },
+                    ))
+                });
                 table_row(
                     file.name.clone(),
                     format!("{:.1} MB", file.size_bytes as f64 / 1_000_000.0),
                     file.modified.map_or_else(|| "\u{2014}".to_owned(), age),
+                    edit,
                 )
                 .border_t_1()
                 .border_color(rgb(theme::BORDER))
@@ -230,7 +258,9 @@ impl Render for ClipsView {
                 .border_1()
                 .border_color(rgb(theme::BORDER))
                 .child(
-                    table_row("File", "Size", "Saved").text_sm().text_color(rgb(theme::MUTED_FG)),
+                    table_row("File", "Size", "Saved", None::<gpui::Div>)
+                        .text_sm()
+                        .text_color(rgb(theme::MUTED_FG)),
                 )
                 .child(
                     div()
@@ -278,7 +308,12 @@ fn empty(text: impl Into<SharedString>) -> gpui::AnyElement {
 }
 
 /// One row of the table: the name takes the spare width, size and age keep fixed widths.
-fn table_row(name: impl IntoElement, size: impl IntoElement, saved: impl IntoElement) -> gpui::Div {
+fn table_row(
+    name: impl IntoElement,
+    size: impl IntoElement,
+    saved: impl IntoElement,
+    action: Option<impl IntoElement>,
+) -> gpui::Div {
     div()
         .flex()
         .flex_row()
@@ -288,6 +323,7 @@ fn table_row(name: impl IntoElement, size: impl IntoElement, saved: impl IntoEle
         .child(div().flex_1().min_w_0().child(name))
         .child(div().w(px(90.)).child(size))
         .child(div().w(px(120.)).child(saved))
+        .child(div().w(px(56.)).flex().justify_end().children(action))
 }
 
 fn age(when: SystemTime) -> String {
@@ -312,7 +348,7 @@ mod tests {
     use super::*;
 
     fn file(name: &str) -> ClipFile {
-        ClipFile { name: name.to_owned(), size_bytes: 1, modified: None }
+        ClipFile { name: name.to_owned(), path: PathBuf::from(name), size_bytes: 1, modified: None }
     }
 
     fn names(files: &[&ClipFile]) -> Vec<String> {
