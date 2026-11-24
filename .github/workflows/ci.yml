@@ -27,3 +27,24 @@ jobs:
       - run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # A release build to download and try by hand. It does not wait for `check`, so a formatting
+  # complaint doesn't stop you getting the exe. Kept for a week.
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Put fxc.exe on PATH (GPUI's shader build needs it)
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter fxc.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -like '*\x64\*' } | Sort-Object FullName | Select-Object -Last 1
+          if ($fxc) { Add-Content $env:GITHUB_PATH $fxc.DirectoryName }
+      - run: cargo build --release --locked -p zeroclip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zeroclip-windows
+          path: target/release/zeroclip.exe
+          retention-days: 7
