@@ -39,11 +39,12 @@ use zc_win::clock;
 use zc_win::com::Apartment;
 use zc_win::mf::MediaFoundation;
 
-use crate::capture::{CapturedFrame, WgcCapture, capture_item};
+use crate::capture::{CapturedFrame, WgcCapture, capture_item, hdr_sdr_white};
 use crate::convert::NvConverter;
 use crate::device::create_device;
 use crate::encoder::{EncoderEvent, HwEncoder, probe};
 use crate::screenshot::{save_png, staging_copy};
+use crate::tonemap::ToneMapper;
 
 /// A staging copy of one frame, and its size.
 type Shot = Result<(ID3D11Texture2D, (u32, u32)), SourceError>;
@@ -198,6 +199,8 @@ struct FrameHandler {
     /// Kept so a screenshot never waits for the screen to change (WGC sends nothing
     /// while it's still).
     latest: Option<Latest>,
+    /// Made on the first HDR frame; turns float scRGB into the BGRA8 the rest expects.
+    tonemap: Option<ToneMapper>,
 }
 
 impl FrameHandler {
@@ -207,36 +210,51 @@ impl FrameHandler {
         if !self.pacer.accept(frame.time) {
             return;
         }
-        self.keep_latest(frame);
-        let slot = self.converter.convert(&frame.texture, frame.size);
+        let slot = match self.sdr_frame(frame) {
+            Ok(texture) => {
+                self.keep_latest(&texture, frame.size);
+                self.converter.convert(&texture, frame.size)
+            }
+            Err(e) => Err(e),
+        };
         self.hand_off(slot, frame.time);
+    }
+
+    /// The frame as BGRA8: itself, or tone-mapped when it came from an HDR display.
+    fn sdr_frame(&mut self, frame: &CapturedFrame) -> Result<ID3D11Texture2D, SourceError> {
+        let Some(white) = frame.sdr_white else { return Ok(frame.texture.clone()) };
+        if self.tonemap.is_none() {
+            self.tonemap = Some(ToneMapper::new(&self.device, &self.context)?);
+        }
+        let mapper =
+            self.tonemap.as_mut().ok_or_else(|| SourceError::Other("no tone mapper".into()))?;
+        mapper.map(&frame.texture, white).cloned()
     }
 
     /// One GPU copy per encoded frame into a reused texture (~8 MB of VRAM at 1080p).
     /// Failures only cost screenshots, so they're logged and skipped.
-    fn keep_latest(&mut self, frame: &CapturedFrame) {
+    fn keep_latest(&mut self, texture: &ID3D11Texture2D, content: (u32, u32)) {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: `desc` is a valid out-parameter.
-        unsafe { frame.texture.GetDesc(&mut desc) };
+        unsafe { texture.GetDesc(&mut desc) };
         let dims = (desc.Width, desc.Height);
         if self.latest.as_ref().is_none_or(|(_, d, _)| *d != dims) {
             desc.Usage = D3D11_USAGE_DEFAULT;
             desc.BindFlags = 0;
             desc.CPUAccessFlags = 0;
             desc.MiscFlags = 0;
-            let mut texture = None;
+            let mut kept = None;
             // SAFETY: a valid descriptor and out-parameter.
-            if let Err(e) = unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut texture)) }
-            {
+            if let Err(e) = unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut kept)) } {
                 tracing::debug!(%e, "can't keep a frame for screenshots");
                 return;
             }
-            self.latest = texture.map(|t| (t, dims, frame.size));
+            self.latest = kept.map(|t| (t, dims, content));
         }
-        if let Some((texture, _, size)) = &mut self.latest {
+        if let Some((kept, _, size)) = &mut self.latest {
             // SAFETY: same size and format; a GPU copy on a multithread-protected device.
-            unsafe { self.context.CopyResource(&*texture, &frame.texture) };
-            *size = frame.size;
+            unsafe { self.context.CopyResource(&*kept, texture) };
+            *size = content;
         }
     }
 
@@ -319,7 +337,12 @@ fn run(
     let mut backoff = Backoff::hdcp();
     let try_capture = |item: &GraphicsCaptureItem| {
         let handler = Arc::clone(&handler);
-        WgcCapture::start(&device, item, config.capture_cursor, move |frame| {
+        // Asked afresh on every (re)start, so switching Windows HDR on or off mid-session works.
+        let hdr = hdr_sdr_white(config.target);
+        if let Some(white) = hdr {
+            tracing::info!(white, "HDR display: capturing scRGB and tone-mapping to SDR");
+        }
+        WgcCapture::start(&device, item, config.capture_cursor, hdr, move |frame| {
             if let Ok(mut handler) = handler.lock() {
                 handler.on_frame(&frame);
             }
@@ -512,6 +535,7 @@ impl Pipeline {
             last: None,
             dropping: false,
             latest: None,
+            tonemap: None,
         }));
         Ok(Self { device, context, codec, size: size_out, encoder, handler, frames, item })
     }
