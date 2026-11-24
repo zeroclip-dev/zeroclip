@@ -6,6 +6,8 @@ use gpui::{
     div, px, rgb,
 };
 
+use crate::ui::theme;
+
 pub struct Stepper {
     pub min: f64,
     pub max: f64,
@@ -32,14 +34,18 @@ pub fn number_stepper(
             .flex()
             .items_center()
             .justify_center()
-            .rounded_md()
-            .bg(rgb(0x34343c))
+            .rounded(px(theme::RADIUS_MD))
+            .bg(rgb(theme::BG))
+            .border_1()
+            .border_color(rgb(theme::INPUT))
             .child(label);
         if s.enabled {
-            b.cursor_pointer().hover(|h| h.bg(rgb(0x44444e))).on_click(move |ev, window, cx| {
-                let k = if ev.modifiers().shift { 10.0 } else { 1.0 };
-                on_change(&(value + sign * step * k).clamp(min, max), window, cx);
-            })
+            b.cursor_pointer().hover(|h| h.bg(rgb(theme::ACCENT))).on_click(
+                move |ev, window, cx| {
+                    let k = if ev.modifiers().shift { 10.0 } else { 1.0 };
+                    on_change(&(value + sign * step * k).clamp(min, max), window, cx);
+                },
+            )
         } else {
             b
         }

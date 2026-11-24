@@ -1,23 +1,26 @@
 //! A top-bar tab. Highlighted when `active`; add `.on_click(cx.listener(..))` at the call site.
 
-use gpui::{InteractiveElement, ParentElement, SharedString, Styled, div, rgb};
+use gpui::{InteractiveElement, ParentElement, SharedString, Styled, div, px, rgb};
+
+use crate::ui::theme;
 
 pub fn tab_button(label: &'static str, active: bool) -> gpui::Stateful<gpui::Div> {
     let text: SharedString = label.into();
-    div()
+    let tab = div()
         .id(text.clone())
+        .h(px(32.))
         .px_3()
-        .py_1()
-        .rounded_md()
+        .flex()
+        .items_center()
+        .rounded(px(theme::RADIUS_MD))
+        .text_sm()
+        .font_weight(gpui::FontWeight::MEDIUM)
         .cursor_pointer()
-        .when_active(active)
-        .hover(|s| s.bg(rgb(0x2c2c34)))
-        .child(text)
+        .hover(|s| s.bg(rgb(theme::ACCENT)).text_color(rgb(theme::FG)));
+    let tab = if active {
+        tab.bg(rgb(theme::MUTED)).text_color(rgb(theme::FG))
+    } else {
+        tab.text_color(rgb(theme::MUTED_FG))
+    };
+    tab.child(text)
 }
-
-trait WhenActive: Styled + Sized {
-    fn when_active(self, active: bool) -> Self {
-        if active { self.bg(rgb(0x3b3b46)) } else { self }
-    }
-}
-impl<T: Styled> WhenActive for T {}
