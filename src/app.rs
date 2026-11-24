@@ -444,6 +444,15 @@ impl ZeroClipApp {
         ui::overlay::show(cx, kind);
     }
 
+    /// Records which game `clip` came from (the game in focus now) so Clips can group by game.
+    fn tag_game(&self, clip: &Path) {
+        if let Some(game) = &self.status.game {
+            let name =
+                game.strip_suffix(".exe").or_else(|| game.strip_suffix(".EXE")).unwrap_or(game);
+            zc_core::game_tag::save(clip, name);
+        }
+    }
+
     fn drain_engine_events(&mut self, cx: &mut Context<Self>) {
         use ui::overlay::ToastKind;
         let events: Vec<EngineEvent> = self.engine.poll_events().collect();
@@ -457,6 +466,7 @@ impl ZeroClipApp {
                 }
                 EngineEvent::ClipSaving => self.show_toast(ToastKind::Saving, cx),
                 EngineEvent::ClipSaved { path, duration } => {
+                    self.tag_game(&path);
                     self.show_toast(ToastKind::ClipSaved { length: duration }, cx);
                     self.clips.invalidate();
                     self.notify(
@@ -481,6 +491,7 @@ impl ZeroClipApp {
                     self.notify(NoticeLevel::Info, format!("Recording to {}", path.display()));
                 }
                 EngineEvent::RecordingStopped { path, duration } => {
+                    self.tag_game(&path);
                     self.show_toast(ToastKind::RecordingStopped { length: duration }, cx);
                     self.clips.invalidate();
                     self.notify(
