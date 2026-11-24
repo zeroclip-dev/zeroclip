@@ -483,10 +483,66 @@ impl EditorView {
     }
 
     /// Timeline x, window-relative, to a time.
+    /// How much room the selected piece's trimmed-off parts get on the timeline (left, right):
+    /// they show as gray around it, so trimming doesn't zoom the picture in. Capped, so a short
+    /// piece of a long recording isn't a sliver. None while an edge is being dragged.
+    fn ghost(&self) -> (Hns, Hns) {
+        let Some(piece) = self.selected.filter(|_| self.trim.is_none()) else {
+            return (Hns::ZERO, Hns::ZERO);
+        };
+        let Some(piece) = self.timeline.pieces.get(piece) else { return (Hns::ZERO, Hns::ZERO) };
+        let Some(source) = self.sources.get(piece.source) else { return (Hns::ZERO, Hns::ZERO) };
+        let cap = Hns::from_secs_f64((piece.span().as_secs_f64() * 4.0).max(10.0));
+        let side = |cut: Hns| {
+            if cut < Hns::from_millis(200) { Hns::ZERO } else { cut.min(cap) }
+        };
+        (side(piece.a), side((source.info.duration - piece.b).max(Hns::ZERO)))
+    }
+
+    /// Timeline time to the time on the drawn scale, which has the gray room added.
+    fn to_disp(&self, t: Hns) -> Hns {
+        let (gl, gr) = self.ghost();
+        let Some(i) = self.selected.filter(|i| *i < self.timeline.pieces.len()) else { return t };
+        let s = self.timeline.start_of(i);
+        let e = s + self.timeline.pieces[i].span();
+        if t < s {
+            t
+        } else if t < e {
+            t + gl
+        } else {
+            t + gl + gr
+        }
+    }
+
+    /// The drawn scale's length.
+    fn disp_total(&self) -> Hns {
+        let (gl, gr) = self.ghost();
+        self.timeline.total() + gl + gr
+    }
+
+    /// The reverse of `to_disp`; a spot in the gray room is the piece's nearest edge.
+    fn undisp(&self, d: Hns) -> Hns {
+        let (gl, gr) = self.ghost();
+        let Some(i) = self.selected.filter(|i| *i < self.timeline.pieces.len()) else { return d };
+        let s = self.timeline.start_of(i);
+        let e = s + self.timeline.pieces[i].span();
+        if d < s {
+            d
+        } else if d < s + gl {
+            s
+        } else if d < e + gl {
+            d - gl
+        } else if d < e + gl + gr {
+            e
+        } else {
+            d - gl - gr
+        }
+    }
+
     fn time_at(&self, x: Pixels) -> Hns {
         let bounds = self.strip.get();
         let width = f32::from(bounds.size.width);
-        model::x_to_time(f32::from(x - bounds.origin.x), self.timeline.total(), width)
+        self.undisp(model::x_to_time(f32::from(x - bounds.origin.x), self.disp_total(), width))
     }
 
     /// Pauses and shows the frame at timeline time `t`.
@@ -624,10 +680,9 @@ impl EditorView {
         };
         let span = self.timeline.pieces[i].span();
         let bounds = self.strip.get();
-        let total = self.timeline.total();
-        let to_x = |at: Hns| {
-            model::time_to_x(self.timeline.start_of(i) + at, total, f32::from(bounds.size.width))
-        };
+        let total = self.disp_total();
+        let start = self.to_disp(self.timeline.start_of(i));
+        let to_x = |at: Hns| model::time_to_x(start + at, total, f32::from(bounds.size.width));
         let (mx, my) =
             (f32::from(ev.position.x - bounds.origin.x), f32::from(ev.position.y - lane.origin.y));
         let y_of = |db: f64| model::db_to_frac(db) * LANE_HEIGHT;
@@ -1518,8 +1573,10 @@ impl EditorView {
         let width = if self.drawn_width > 0.0 { self.drawn_width } else { FALLBACK_WIDTH };
         // While an edge is dragged the scale and the other pieces stay put, so the edge follows the
         // mouse and what was cut off shows as a gray area; the pieces close up on release.
-        let total = self.trim.as_ref().map_or_else(|| self.timeline.total(), |t| t.total);
-        let x_of = |t: Hns| model::time_to_x(t, total, width);
+        let total = self.trim.as_ref().map_or_else(|| self.disp_total(), |t| t.total);
+        let xd = |d: Hns| model::time_to_x(d, total, width);
+        let x_of = |t: Hns| xd(self.to_disp(t));
+        let (gl, gr) = self.ghost();
         let place = |i: usize| -> (f32, f32) {
             let span = self.timeline.pieces[i].span();
             let start = match &self.trim {
@@ -1533,7 +1590,8 @@ impl EditorView {
                 }
                 _ => self.timeline.start_of(i),
             };
-            (x_of(start), x_of(start + span))
+            let start = if self.trim.is_some() { start } else { self.to_disp(start) };
+            (xd(start), xd(start + span))
         };
         let tracks = self.timeline.pieces.first().map_or(0, |p| p.tracks.len());
 
@@ -1618,10 +1676,10 @@ impl EditorView {
                     .map(|left| {
                         let piece = piece.clone();
                         let starts: Vec<Hns> = (0..self.timeline.pieces.len())
-                            .map(|k| self.timeline.start_of(k))
+                            .map(|k| self.to_disp(self.timeline.start_of(k)))
                             .collect();
-                        let total_now = self.timeline.total();
-                        let per_px = f64::from(self.timeline.total().ticks() as f32)
+                        let total_now = self.disp_total();
+                        let per_px = f64::from(total_now.ticks() as f32)
                             / f64::from(f32::from(self.strip.get().size.width).max(1.0));
                         let side = div().id(("trim", i * 2 + usize::from(left))).absolute().top_0();
                         let side = if left { side.left_0() } else { side.right_0() };
@@ -1669,26 +1727,13 @@ impl EditorView {
                         .opacity(0.8),
                 );
             }
-            // What was trimmed off the selected piece stays visible, grayed out, beside its edges
-            // (as much as fits in the free space around it); the handles above still trim it.
+            // What was trimmed off the selected piece stays in place, grayed out, so the scale
+            // doesn't change; the handles above still trim it.
             if selected && self.trim.is_none() {
-                let cut_l = piece.a;
-                let cut_r = (self.sources[piece.source].info.duration - piece.b).max(Hns::ZERO);
-                // Only the free space beside the piece: up to its neighbours or the lane's ends.
-                let room_l = if i > 0 { place(i - 1).1 } else { 0.0 };
-                let room_r =
-                    if i + 1 < self.timeline.pieces.len() { place(i + 1).0 } else { width };
-                for (cut, left) in [(cut_l, true), (cut_r, false)] {
-                    if cut < Hns::from_millis(200) {
-                        continue;
-                    }
-                    let want = x_of(cut) - x_of(Hns::ZERO);
-                    let (g0, g1) = if left {
-                        ((x0 - want).max(room_l), x0)
-                    } else {
-                        (x1, (x1 + want).min(room_r))
-                    };
-                    if g1 - g0 < 4.0 {
+                for (g0, g1) in
+                    [(x0 - (xd(gl) - xd(Hns::ZERO)), x0), (x1, x1 + (xd(gr) - xd(Hns::ZERO)))]
+                {
+                    if g1 - g0 < 2.0 {
                         continue;
                     }
                     video_lane = video_lane.child(
@@ -1887,8 +1932,8 @@ impl EditorView {
             if let Some((_, i, a, b)) = self.range.filter(|r| r.0 == t && r.2 != r.3)
                 && i < self.timeline.pieces.len()
             {
-                let start = self.timeline.start_of(i);
-                let (x0, x1) = (x_of(start + a.min(b)), x_of(start + a.max(b)));
+                let start = self.to_disp(self.timeline.start_of(i));
+                let (x0, x1) = (xd(start + a.min(b)), xd(start + a.max(b)));
                 lane = lane.child(
                     div()
                         .absolute()
