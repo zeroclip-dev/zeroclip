@@ -48,6 +48,17 @@ pub struct Item {
     pub sound: Option<Sound>,
 }
 
+/// One small picture of `path` at `at`, `w` x `h` pixels, for the timeline's thumbnails. `None`
+/// when ffmpeg can't make it.
+pub fn still(ffmpeg: &Ffmpeg, path: &Path, at: Hns, w: u32, h: u32) -> Option<Arc<RenderImage>> {
+    let mut cmd = Command::new(&ffmpeg.exe);
+    cmd.args(frames_args(path, at, w, h, 1, Some(1))).stdin(Stdio::null()).stderr(Stdio::null());
+    no_window(&mut cmd);
+    let out = cmd.output().ok()?;
+    let buffer = RgbaImage::from_raw(w, h, out.stdout)?;
+    Some(Arc::new(RenderImage::new(vec![Frame::new(buffer)])))
+}
+
 /// A running ffmpeg decode, killed when dropped.
 struct Decoder {
     child: Child,
@@ -243,6 +254,15 @@ impl Player {
                 elapsed = 0.0;
             }
             self.playhead = self.base + Hns::from_secs_f64(elapsed);
+            // ffplay gone long before its piece ended means no sound: say why, once.
+            if let (Some(audio), Some(item)) = (self.audio.as_mut(), self.items.front())
+                && elapsed < (item.to - item.from).as_secs_f64() - 1.0
+                && let Ok(Some(status)) = audio.try_wait()
+            {
+                let said = std::fs::read_to_string(audio_log()).unwrap_or_default();
+                tracing::warn!(%status, said = said.trim(), "the preview's sound stopped early");
+                self.audio = None;
+            }
             while self.queue.len() >= 2 && self.queue[1].0 <= elapsed {
                 self.queue.pop_front();
             }
@@ -310,7 +330,7 @@ fn spawn_audio(ffmpeg: &Ffmpeg, item: &Item, sound: Sound) -> Option<Child> {
         return None;
     }
     let mut cmd = Command::new(ffplay);
-    cmd.args(["-nodisp", "-vn", "-autoexit", "-loglevel", "quiet", "-ast"])
+    cmd.args(["-nodisp", "-vn", "-autoexit", "-loglevel", "error", "-ast"])
         .arg(format!("a:{}", sound.track))
         .arg("-ss")
         .arg(format!("{:.3}", item.from.as_secs_f64()))
@@ -323,7 +343,14 @@ fn spawn_audio(ffmpeg: &Ffmpeg, item: &Item, sound: Sound) -> Option<Child> {
     } else if sound.gain_db != 0.0 {
         cmd.arg("-af").arg(format!("volume={}dB", sound.gain_db));
     }
-    cmd.arg(&item.path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    // Its complaints go to a file, so a silent preview can be explained (see `tick`).
+    let log = std::fs::File::create(audio_log()).map_or_else(|_| Stdio::null(), Stdio::from);
+    cmd.arg(&item.path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     no_window(&mut cmd);
     cmd.spawn().ok()
+}
+
+/// Where `ffplay` writes what it says went wrong.
+fn audio_log() -> PathBuf {
+    std::env::temp_dir().join("zeroclip-ffplay.log")
 }
