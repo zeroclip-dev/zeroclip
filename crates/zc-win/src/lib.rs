@@ -15,10 +15,12 @@
 //!
 //! Every `unsafe` block must carry a `// SAFETY:` comment.
 
+pub mod autostart;
 pub mod clock;
 pub mod com;
 pub mod drive;
 pub mod error;
+pub mod main_window;
 pub mod memory;
 pub mod message_thread;
 pub mod mf;

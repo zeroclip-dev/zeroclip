@@ -13,6 +13,7 @@ mod app;
 mod logging;
 mod paths;
 mod settings_store;
+mod tray;
 mod ui;
 mod wiring;
 
@@ -40,6 +41,8 @@ fn main() -> anyhow::Result<()> {
     };
 
     let settings = settings_store::load(&paths.settings_file);
+    // Windows starts ZeroClip with `--tray` at sign-in (P4.16): the window stays hidden.
+    let start_hidden = std::env::args().any(|arg| arg == "--tray");
 
     gpui_platform::application().run(move |cx| {
         let bounds = Bounds::centered(None, size(px(980.0), px(660.0)), cx);
@@ -51,17 +54,24 @@ fn main() -> anyhow::Result<()> {
                     title: Some("ZeroClip".into()),
                     ..Default::default()
                 }),
+                show: !start_hidden,
                 ..Default::default()
             },
-            |_, cx| {
-                cx.new(|cx| match app::ZeroClipApp::new(paths, settings, recorder, cx) {
+            |window, cx| {
+                let app = cx.new(|cx| match app::ZeroClipApp::new(paths, settings, recorder, cx) {
                     Ok(app) => app,
                     Err(error) => {
                         tracing::error!(%error, "couldn't start ZeroClip");
                         // ponytail: a failed engine start has no error screen yet; exit.
                         std::process::exit(1);
                     }
-                })
+                });
+                // Close-to-tray (P4.15): the app decides whether this close hides or quits.
+                let weak = app.downgrade();
+                window.on_window_should_close(cx, move |_, cx| {
+                    weak.update(cx, |app, cx| app.close_requested(cx)).unwrap_or(true)
+                });
+                app
             },
         );
         if let Err(error) = opened {
