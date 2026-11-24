@@ -310,7 +310,7 @@ impl Render for ProfilesView {
                     file.is_file()
                 });
             let name: AnyElement = if i == 0 {
-                div().w(px(190.0)).child("Any other game").into_any_element()
+                div().w(px(190.0)).flex_none().child("Any other game").into_any_element()
             } else {
                 let handle = self.fields[i - 1].clone();
                 let focused = handle.is_focused(window);
@@ -320,6 +320,7 @@ impl Render for ProfilesView {
                     .id(("exe", i))
                     .track_focus(&handle)
                     .w(px(190.0))
+                    .flex_none()
                     .px_2()
                     .py_1()
                     .rounded(px(theme::RADIUS_MD))
@@ -383,7 +384,14 @@ impl Render for ProfilesView {
                             .w(px(24.0))
                             .h(px(24.0))
                             .flex_none()
-                            .children(icon.map(exe_icon::view)),
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(match icon {
+                                Some(file) => exe_icon::view(file).into_any_element(),
+                                // No icon yet: the game has not run while ZeroClip was open.
+                                None => super::icons::icon("gamepad-2", MUTED).into_any_element(),
+                            }),
                     )
                     .child(name)
                     .child(duration_control(

@@ -696,6 +696,11 @@ fn track_chain(i: usize, edit: &AudioEdit) -> Result<Option<String>, FfmpegError
     Ok(Some(chain))
 }
 
+/// The `volume` filter that follows a volume line, for a live preview (`t` starts at 0).
+pub fn envelope_filter(points: &[EnvelopePoint]) -> Result<String, FfmpegError> {
+    Ok(format!("volume=volume='{}':eval=frame", envelope_expr(points)?))
+}
+
 /// The `volume` filter expression for a volume line: the gain (linear) at time `t`. The level in
 /// decibels is a chain of `if(lt(t,..))` straight pieces, and silence is written as exactly 0.
 /// Commas are escaped (`\,`) so they don't end the filter option.

@@ -211,6 +211,22 @@ impl TrackEdit {
         }
     }
 
+    /// The volume line from `offset` into the piece on, with time counted from `offset`. `None`
+    /// when the track has no line.
+    pub fn line_from(&self, offset: Hns) -> Option<Vec<EnvelopePoint>> {
+        if !self.has_line() {
+            return None;
+        }
+        let start = EnvelopePoint { secs: 0.0, db: self.db_at(offset) };
+        let rest = self
+            .points
+            .iter()
+            .filter(|p| p.at > offset + MIN_GAP)
+            .map(|p| EnvelopePoint { secs: (p.at - offset).as_secs_f64(), db: p.db });
+        let points: Vec<_> = std::iter::once(start).chain(rest).collect();
+        (points.len() >= 2).then_some(points)
+    }
+
     /// What ffmpeg does to the track.
     pub fn audio_edit(&self) -> AudioEdit {
         if self.mute {

@@ -30,11 +30,13 @@ const FPS: u32 = 24;
 const BACKLOG: usize = 6;
 
 /// What to hear while a piece plays.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Sound {
     /// Which audio track of the file (0 is Master).
     pub track: usize,
     pub gain_db: f64,
+    /// A volume line, counted from where the piece starts playing. It replaces `gain_db`.
+    pub line: Option<Vec<zc_editor::ffmpeg::EnvelopePoint>>,
 }
 
 /// One piece to play: `[from, to)` of a file. `sound` is `None` for a muted piece.
@@ -196,7 +198,7 @@ impl Player {
         if self.decoder.is_none() {
             return false;
         }
-        self.audio = item.sound.and_then(|s| spawn_audio(ffmpeg, item, s));
+        self.audio = item.sound.clone().and_then(|s| spawn_audio(ffmpeg, item, s));
         self.started = Some(Instant::now());
         true
     }
@@ -314,7 +316,11 @@ fn spawn_audio(ffmpeg: &Ffmpeg, item: &Item, sound: Sound) -> Option<Child> {
         .arg(format!("{:.3}", item.from.as_secs_f64()))
         .arg("-t")
         .arg(format!("{:.3}", (item.to - item.from).as_secs_f64()));
-    if sound.gain_db != 0.0 {
+    // The clock restarts at the seek, so a volume line counts from the start of what plays.
+    let line = sound.line.as_deref().and_then(|l| zc_editor::ffmpeg::envelope_filter(l).ok());
+    if let Some(filter) = line {
+        cmd.arg("-af").arg(format!("asetpts=PTS-STARTPTS,{filter}"));
+    } else if sound.gain_db != 0.0 {
         cmd.arg("-af").arg(format!("volume={}dB", sound.gain_db));
     }
     cmd.arg(&item.path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());

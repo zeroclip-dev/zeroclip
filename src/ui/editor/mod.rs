@@ -404,7 +404,7 @@ impl EditorView {
                 path: self.sources[piece.source].path.clone(),
                 from: if n == first { src } else { piece.a },
                 to: piece.b,
-                sound: self.sound_of(piece),
+                sound: self.sound_of(piece, if n == first { src } else { piece.a }),
             })
             .collect();
         self.player.play(ffmpeg, items, at);
@@ -413,11 +413,14 @@ impl EditorView {
     }
 
     /// What the preview plays for `piece`: the listened-to track, unless it is muted.
-    fn sound_of(&self, piece: &Piece) -> Option<Sound> {
+    fn sound_of(&self, piece: &Piece, from: Hns) -> Option<Sound> {
         let track = self.listen.min(piece.tracks.len().checked_sub(1)?);
         let edit = &piece.tracks[track];
-        // ponytail: the preview plays the flat level; a volume line is heard only in the export.
-        (!edit.mute).then_some(Sound { track, gain_db: edit.gain_db })
+        (!edit.mute).then(|| Sound {
+            track,
+            gain_db: edit.gain_db,
+            line: edit.line_from(from - piece.a),
+        })
     }
 
     /// Starts the task that refreshes the picture while the player has work, unless one runs.
@@ -975,8 +978,9 @@ impl EditorView {
     fn header(&self, cx: &mut Context<Self>) -> gpui::Div {
         let length = (!self.timeline.pieces.is_empty()).then(|| {
             format!(
-                "{} pieces, {} long",
+                "{} {}, {} long",
                 self.timeline.pieces.len(),
+                if self.timeline.pieces.len() == 1 { "piece" } else { "pieces" },
                 human_duration(self.timeline.total())
             )
         });
@@ -1265,7 +1269,7 @@ impl EditorView {
                         model::column_peaks(peaks, span, piece.a, piece.b, (w / BAR_STEP) as usize);
                     let n = columns.len().max(1);
                     block = block.children(columns.into_iter().enumerate().map(|(c, peak)| {
-                        let h = (peak.min(1.0) * LANE_HEIGHT).max(1.0);
+                        let h = (peak.min(1.0).sqrt() * LANE_HEIGHT).max(1.0);
                         div()
                             .absolute()
                             .left(px((c as f32 + 0.5) / n as f32 * w))
@@ -1454,6 +1458,7 @@ impl EditorView {
                 div()
                     .flex()
                     .flex_row()
+                    .flex_wrap()
                     .gap_2()
                     .child(
                         button_ghost("piece-left", "Move earlier")
