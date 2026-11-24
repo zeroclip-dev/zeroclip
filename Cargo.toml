@@ -100,6 +100,7 @@ zc-video.workspace = true
 zc-input.workspace = true
 zc-audio.workspace = true
 zc-win.workspace = true
+image.workspace = true
 zc-store.workspace = true
 zc-editor.workspace = true
 anyhow.workspace = true
