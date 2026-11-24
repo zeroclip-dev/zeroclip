@@ -2,8 +2,8 @@
 //! is clamped to `min..=max`. `on_change` gets the new value; wire it with `cx.listener`.
 
 use gpui::{
-    App, ElementId, InteractiveElement, ParentElement, StatefulInteractiveElement, Styled, Window,
-    div, px, rgb,
+    App, ElementId, InteractiveElement, ParentElement, SharedString, StatefulInteractiveElement,
+    Styled, Window, div, px, rgb,
 };
 
 use crate::ui::theme;
@@ -18,11 +18,12 @@ pub struct Stepper {
 }
 
 pub fn number_stepper(
-    id: &'static str,
+    id: impl Into<SharedString>,
     value: f64,
     s: Stepper,
     on_change: impl Fn(&f64, &mut Window, &mut App) + 'static,
 ) -> gpui::Div {
+    let id: SharedString = id.into();
     let on_change = std::rc::Rc::new(on_change);
     let button = |sub: &'static str, sign: f64, label: &'static str| {
         let on_change = on_change.clone();

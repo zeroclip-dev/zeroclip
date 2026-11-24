@@ -116,16 +116,44 @@ impl Ffmpeg {
         Ok(ProbeInfo { stream, duration, keyframes })
     }
 
+    /// Edits audio tracks and stream-copies the video (D38); see [`audio_edit_args`].
+    ///
+    /// # Errors
+    /// See [`FfmpegError`].
+    pub fn edit_audio(
+        &self,
+        input: &Path,
+        output: &Path,
+        tracks: &[AudioTrack],
+    ) -> Result<(), FfmpegError> {
+        run(&self.exe, &audio_edit_args(input, output, tracks)?).map(drop)
+    }
+
     /// Decodes the first audio track to mono f32 samples at `sample_rate`, for the waveform.
     /// A clip without audio is an `Err`; callers treat that as "no waveform".
     ///
     /// # Errors
     /// See [`FfmpegError`].
     pub fn audio_samples(&self, path: &Path, sample_rate: u32) -> Result<Vec<f32>, FfmpegError> {
+        self.track_samples(path, 0, sample_rate)
+    }
+
+    /// Like [`Self::audio_samples`] for audio track `track` (0-based), for a per-track waveform.
+    ///
+    /// # Errors
+    /// See [`FfmpegError`].
+    pub fn track_samples(
+        &self,
+        path: &Path,
+        track: usize,
+        sample_rate: u32,
+    ) -> Result<Vec<f32>, FfmpegError> {
         let mut args = common_args();
         args.push("-i".into());
         args.push(os(path));
-        args.extend(["-map", "0:a:0", "-ac", "1", "-ar"].map(OsString::from));
+        args.push("-map".into());
+        args.push(format!("0:a:{track}").into());
+        args.extend(["-ac", "1", "-ar"].map(OsString::from));
         args.push(sample_rate.to_string().into());
         args.extend(["-f", "f32le", "-"].map(OsString::from));
         let bytes = run(&self.exe, &args)?;
