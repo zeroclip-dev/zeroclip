@@ -11,6 +11,7 @@
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK, MessageBoxW};
 use windows::core::HSTRING;
 use zc_core::ports::SourceError;
 
@@ -53,6 +54,17 @@ pub fn acquire(name: &str) -> Result<Option<InstanceGuard>, SourceError> {
         return Ok(None);
     }
     Ok(Some(InstanceGuard(handle)))
+}
+
+/// Tells the user why this copy is about to exit. A release build has no console, so without
+/// this the second launch would just vanish. Blocks until the box is dismissed.
+/// See [`MessageBoxW`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-messageboxw).
+pub fn show_already_running() {
+    let text = HSTRING::from("ZeroClip is already running. Switch to its window.");
+    let title = HSTRING::from("ZeroClip");
+    // SAFETY: both strings are valid NUL-terminated wide strings that outlive the call; no owner
+    // window (None) is allowed. The return value (which button) carries no information for MB_OK.
+    let _ = unsafe { MessageBoxW(None, &text, &title, MB_OK | MB_ICONINFORMATION) };
 }
 
 #[cfg(test)]
