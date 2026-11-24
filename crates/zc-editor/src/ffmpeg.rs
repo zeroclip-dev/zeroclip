@@ -160,6 +160,140 @@ pub fn remux_args(input: &Path, output: &Path) -> Vec<OsString> {
     args
 }
 
+/// What the editor does to one audio track (D38). Anything but `Keep` re-encodes that track to
+/// AAC; video is never re-encoded.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AudioEdit {
+    /// Stream-copy the track as it is.
+    Keep,
+    /// Change its volume by `db` decibels (negative is quieter).
+    Gain {
+        /// Decibels; finite.
+        db: f64,
+    },
+    /// Silence the whole track.
+    Mute,
+    /// Silence `[start, end)`. The track keeps its length, so it stays in sync with the video.
+    Silence {
+        /// Where the silence starts.
+        start: Hns,
+        /// Where it ends; must be after `start`.
+        end: Hns,
+    },
+    /// Cut `[start, end)` out of this track only. The track gets shorter, so it ends earlier
+    /// than the video after the cut.
+    Remove {
+        /// Where the cut starts.
+        start: Hns,
+        /// Where the cut ends; must be after `start`.
+        end: Hns,
+    },
+}
+
+/// One audio track of the source, with its bitrate so a re-encode can match it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AudioTrack {
+    /// What to do to this track.
+    pub edit: AudioEdit,
+    /// The source track's bitrate, bits per second. Used only when the track is re-encoded.
+    pub bitrate_bps: u32,
+}
+
+/// Arguments that edit audio tracks and stream-copy the video (D38). `tracks` lists every audio
+/// track of `input` in order. Untouched tracks are stream-copied. Each edited track gets its own
+/// `-filter_complex` chain and is re-encoded to AAC at its source bitrate.
+///
+/// # Errors
+/// [`FfmpegError::Failed`] for a cut that is empty or starts before zero, or a non-finite gain.
+pub fn audio_edit_args(
+    input: &Path,
+    output: &Path,
+    tracks: &[AudioTrack],
+) -> Result<Vec<OsString>, FfmpegError> {
+    let mut chains = Vec::new();
+    for (i, track) in tracks.iter().enumerate() {
+        if let Some(chain) = track_chain(i, track.edit)? {
+            chains.push(chain);
+        }
+    }
+    let mut args = common_args();
+    args.push("-i".into());
+    args.push(os(input));
+    if !chains.is_empty() {
+        args.push("-filter_complex".into());
+        args.push(chains.join(";").into());
+    }
+    args.extend(["-map", "0:v:0", "-c:v", "copy"].map(OsString::from));
+    // Output audio tracks are mapped in input order, so output index `i` is input track `i`.
+    for (i, track) in tracks.iter().enumerate() {
+        if track.edit == AudioEdit::Keep {
+            args.push("-map".into());
+            args.push(format!("0:a:{i}").into());
+            args.push(format!("-c:a:{i}").into());
+            args.push("copy".into());
+        } else {
+            args.push("-map".into());
+            args.push(format!("[a{i}]").into());
+            args.push(format!("-c:a:{i}").into());
+            args.push("aac".into());
+            args.push(format!("-b:a:{i}").into());
+            args.push(track.bitrate_bps.to_string().into());
+        }
+    }
+    args.extend(["-movflags", "+faststart"].map(OsString::from));
+    args.push(os(output));
+    Ok(args)
+}
+
+/// The filter chain for audio track `i`, labelled `[a{i}]`. `None` for `Keep`.
+fn track_chain(i: usize, edit: AudioEdit) -> Result<Option<String>, FfmpegError> {
+    let input = format!("[0:a:{i}]");
+    let out = format!("[a{i}]");
+    let chain = match edit {
+        AudioEdit::Keep => return Ok(None),
+        AudioEdit::Gain { db } => {
+            if !db.is_finite() {
+                return Err(bad_audio("gain must be a finite number of decibels"));
+            }
+            format!("{input}volume={db}dB{out}")
+        }
+        AudioEdit::Mute => format!("{input}volume=0{out}"),
+        AudioEdit::Silence { start, end } => {
+            let (a, b) = cut_times(start, end)?;
+            // `\,` keeps the comma inside `between(...)` from ending the filter option.
+            format!("{input}volume=0:enable='between(t\\,{a}\\,{b})'{out}")
+        }
+        AudioEdit::Remove { start, end } => {
+            let (a, b) = cut_times(start, end)?;
+            if start == Hns::ZERO {
+                // Cutting from the start just drops the head, so no join is needed.
+                format!("{input}atrim=start={b},asetpts=PTS-STARTPTS{out}")
+            } else {
+                // Split the track, keep the part before the cut and the part after it, and join.
+                format!(
+                    "{input}asplit=2[s{i}a][s{i}b];\
+                     [s{i}a]atrim=end={a},asetpts=PTS-STARTPTS[p{i}a];\
+                     [s{i}b]atrim=start={b},asetpts=PTS-STARTPTS[p{i}b];\
+                     [p{i}a][p{i}b]concat=n=2:v=0:a=1{out}"
+                )
+            }
+        }
+    };
+    Ok(Some(chain))
+}
+
+/// Checks a cut range and formats both ends as ffmpeg seconds.
+fn cut_times(start: Hns, end: Hns) -> Result<(String, String), FfmpegError> {
+    if start < Hns::ZERO || end <= start {
+        return Err(bad_audio("audio cut must start at or after zero and end after it"));
+    }
+    Ok((ffmpeg_time(start), ffmpeg_time(end)))
+}
+
+fn bad_audio(message: &str) -> FfmpegError {
+    FfmpegError::Failed { stderr: message.into() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,6 +407,106 @@ mod tests {
                 "out.mp4",
             ]
         );
+    }
+
+    const KEEP: AudioTrack = AudioTrack { edit: AudioEdit::Keep, bitrate_bps: 128_000 };
+
+    #[test]
+    fn audio_edit_copies_untouched_tracks_and_the_video() {
+        let tracks =
+            [KEEP, AudioTrack { edit: AudioEdit::Gain { db: -6.0 }, bitrate_bps: 160_000 }];
+        let args = audio_edit_args(Path::new("in.mp4"), Path::new("out.mp4"), &tracks).unwrap();
+        assert_eq!(
+            strs(&args),
+            [
+                "-hide_banner",
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-n",
+                "-i",
+                "in.mp4",
+                "-filter_complex",
+                "[0:a:1]volume=-6dB[a1]",
+                "-map",
+                "0:v:0",
+                "-c:v",
+                "copy",
+                "-map",
+                "0:a:0",
+                "-c:a:0",
+                "copy",
+                "-map",
+                "[a1]",
+                "-c:a:1",
+                "aac",
+                "-b:a:1",
+                "160000",
+                "-movflags",
+                "+faststart",
+                "out.mp4",
+            ]
+        );
+    }
+
+    #[test]
+    fn audio_edit_with_no_changes_has_no_filter_graph() {
+        let args = audio_edit_args(Path::new("in.mp4"), Path::new("o.mp4"), &[KEEP]).unwrap();
+        let s = strs(&args);
+        assert!(!s.contains(&"-filter_complex".to_string()));
+        assert!(s.windows(2).any(|w| w == ["-c:a:0", "copy"]));
+    }
+
+    #[test]
+    fn mute_silences_the_whole_track() {
+        let tracks = [AudioTrack { edit: AudioEdit::Mute, bitrate_bps: 96_000 }];
+        let args = audio_edit_args(Path::new("in.mp4"), Path::new("o.mp4"), &tracks).unwrap();
+        let s = strs(&args);
+        assert_eq!(s[7], "-filter_complex");
+        assert_eq!(s[8], "[0:a:0]volume=0[a0]");
+        assert!(s.windows(2).any(|w| w == ["-b:a:0", "96000"]));
+    }
+
+    #[test]
+    fn silence_uses_a_timed_volume_filter_with_escaped_commas() {
+        let edit = AudioEdit::Silence { start: Hns::from_millis(2_500), end: Hns::from_secs(4) };
+        let tracks = [AudioTrack { edit, bitrate_bps: 128_000 }];
+        let args = audio_edit_args(Path::new("in.mp4"), Path::new("o.mp4"), &tracks).unwrap();
+        assert_eq!(
+            strs(&args)[8],
+            r"[0:a:0]volume=0:enable='between(t\,2.5000000\,4.0000000)'[a0]"
+        );
+    }
+
+    #[test]
+    fn remove_splits_joins_and_cuts_the_middle() {
+        let edit = AudioEdit::Remove { start: Hns::from_secs(1), end: Hns::from_secs(2) };
+        let tracks = [AudioTrack { edit, bitrate_bps: 128_000 }];
+        let args = audio_edit_args(Path::new("in.mp4"), Path::new("o.mp4"), &tracks).unwrap();
+        assert_eq!(
+            strs(&args)[8],
+            "[0:a:0]asplit=2[s0a][s0b];[s0a]atrim=end=1.0000000,asetpts=PTS-STARTPTS[p0a];\
+             [s0b]atrim=start=2.0000000,asetpts=PTS-STARTPTS[p0b];[p0a][p0b]concat=n=2:v=0:a=1[a0]"
+        );
+    }
+
+    #[test]
+    fn remove_from_zero_only_drops_the_head() {
+        let edit = AudioEdit::Remove { start: Hns::ZERO, end: Hns::from_secs(2) };
+        let tracks = [AudioTrack { edit, bitrate_bps: 128_000 }];
+        let args = audio_edit_args(Path::new("in.mp4"), Path::new("o.mp4"), &tracks).unwrap();
+        assert_eq!(strs(&args)[8], "[0:a:0]atrim=start=2.0000000,asetpts=PTS-STARTPTS[a0]");
+    }
+
+    #[test]
+    fn audio_edit_refuses_bad_ranges_and_gains() {
+        let bad_cut = AudioEdit::Silence { start: Hns::from_secs(3), end: Hns::from_secs(3) };
+        let negative = AudioEdit::Remove { start: Hns(-1), end: Hns::from_secs(1) };
+        let nan = AudioEdit::Gain { db: f64::NAN };
+        for edit in [bad_cut, negative, nan] {
+            let tracks = [AudioTrack { edit, bitrate_bps: 128_000 }];
+            assert!(audio_edit_args(Path::new("i"), Path::new("o"), &tracks).is_err(), "{edit:?}");
+        }
     }
 
     #[test]
