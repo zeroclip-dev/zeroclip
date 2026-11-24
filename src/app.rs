@@ -417,14 +417,18 @@ impl ZeroClipApp {
         if !self.settings.overlay_toasts {
             return;
         }
-        zc_win::chime::play(match kind {
-            ui::overlay::ToastKind::ClipSaved { .. } => zc_win::chime::Chime::ClipSaved,
-            ui::overlay::ToastKind::RecordingStarted => zc_win::chime::Chime::RecordingStarted,
-            ui::overlay::ToastKind::RecordingStopped { .. } => {
-                zc_win::chime::Chime::RecordingStopped
-            }
-            ui::overlay::ToastKind::ScreenshotTaken => zc_win::chime::Chime::Screenshot,
-        });
+        use zc_win::chime::Chime;
+        // The chime waits for the clip to be written.
+        let chime = match kind {
+            ui::overlay::ToastKind::Saving => None,
+            ui::overlay::ToastKind::ClipSaved { .. } => Some(Chime::ClipSaved),
+            ui::overlay::ToastKind::RecordingStarted => Some(Chime::RecordingStarted),
+            ui::overlay::ToastKind::RecordingStopped { .. } => Some(Chime::RecordingStopped),
+            ui::overlay::ToastKind::ScreenshotTaken => Some(Chime::Screenshot),
+        };
+        if let Some(chime) = chime {
+            zc_win::chime::play(chime);
+        }
         if let Some(old) = self.toast.take() {
             let _ = old.update(cx, |_, window, _| window.remove_window());
         }
@@ -442,6 +446,7 @@ impl ZeroClipApp {
                     // ponytail: egui flashed the taskbar here; GPUI has no equivalent yet.
                     // Never raise or activate the window (D35).
                 }
+                EngineEvent::ClipSaving => self.show_toast(ToastKind::Saving, cx),
                 EngineEvent::ClipSaved { path, duration } => {
                     self.show_toast(ToastKind::ClipSaved { length: duration }, cx);
                     self.clips.invalidate();

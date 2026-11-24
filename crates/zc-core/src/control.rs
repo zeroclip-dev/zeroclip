@@ -44,6 +44,9 @@ pub enum FocusChoice {
 pub enum EngineEvent {
     /// A fresh status snapshot.
     Status(EngineStatus),
+    /// The save hotkey was accepted and a clip is being written. Sent at once, so the overlay can
+    /// show before the (slow) write finishes.
+    ClipSaving,
     /// A DVR clip was written.
     ClipSaved {
         /// Where.
