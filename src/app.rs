@@ -79,6 +79,8 @@ pub struct ZeroClipApp {
     flight: Arc<crate::logging::FlightRecorder>,
     /// The startup scan's result, moved into `notices` and `rescues` when it arrives.
     repairs: mpsc::Receiver<StartupScan>,
+    /// The clip-saved toast on screen, if any. A new toast replaces it.
+    toast: Option<gpui::WindowHandle<ui::overlay::ToastView>>,
 }
 
 impl ZeroClipApp {
@@ -117,7 +119,7 @@ impl ZeroClipApp {
                 // Several wakes can pile up; one drain handles them all.
                 while wake_rx.try_recv().is_ok() {}
                 let alive = this.update(cx, |app, cx| {
-                    app.drain_engine_events();
+                    app.drain_engine_events(cx);
                     app.drain_repair_notices();
                     cx.notify();
                 });
@@ -143,6 +145,7 @@ impl ZeroClipApp {
             rescues: Vec::new(),
             flight,
             repairs,
+            toast: None,
         })
     }
 
@@ -246,7 +249,19 @@ impl ZeroClipApp {
         self.send(Command::FocusChoice(choice));
     }
 
-    fn drain_engine_events(&mut self) {
+    /// Puts a toast on screen, replacing the one that is up. Off when the setting is off.
+    fn show_toast(&mut self, kind: ui::overlay::ToastKind, cx: &mut gpui::App) {
+        if !self.settings.overlay_toasts {
+            return;
+        }
+        if let Some(old) = self.toast.take() {
+            let _ = old.update(cx, |_, window, _| window.remove_window());
+        }
+        self.toast = ui::overlay::show(cx, kind);
+    }
+
+    fn drain_engine_events(&mut self, cx: &mut Context<Self>) {
+        use ui::overlay::ToastKind;
         let events: Vec<EngineEvent> = self.engine.poll_events().collect();
         for event in events {
             match event {
@@ -257,6 +272,7 @@ impl ZeroClipApp {
                     // Never raise or activate the window (D35).
                 }
                 EngineEvent::ClipSaved { path, duration } => {
+                    self.show_toast(ToastKind::ClipSaved { length: duration }, cx);
                     self.clips.invalidate();
                     self.notify(
                         NoticeLevel::Info,
@@ -264,13 +280,16 @@ impl ZeroClipApp {
                     );
                 }
                 EngineEvent::ScreenshotSaved { path } => {
+                    self.show_toast(ToastKind::ScreenshotTaken, cx);
                     self.clips.invalidate();
                     self.notify(NoticeLevel::Info, format!("Screenshot saved: {}", path.display()));
                 }
                 EngineEvent::RecordingStarted { path } => {
+                    self.show_toast(ToastKind::RecordingStarted, cx);
                     self.notify(NoticeLevel::Info, format!("Recording to {}", path.display()));
                 }
                 EngineEvent::RecordingStopped { path, duration } => {
+                    self.show_toast(ToastKind::RecordingStopped { length: duration }, cx);
                     self.clips.invalidate();
                     self.notify(
                         NoticeLevel::Info,
