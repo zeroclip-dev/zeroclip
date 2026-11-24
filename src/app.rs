@@ -226,6 +226,24 @@ impl ZeroClipApp {
         cx.notify();
     }
 
+    /// Saves an editor preference (the Done choice, the listened-to track) at once. It writes the
+    /// file and nothing else: no engine restart, no notice, and the Settings screen keeps its
+    /// unsaved edits.
+    pub fn remember_editor(&mut self, f: impl FnOnce(&mut zc_core::settings::EditorSettings)) {
+        let mut settings = self.settings.clone();
+        f(&mut settings.editor);
+        if settings.editor == self.settings.editor {
+            return;
+        }
+        if let Err(e) = crate::settings_store::save(&self.paths.settings_file, &settings) {
+            self.notify(NoticeLevel::Error, format!("Couldn't save settings: {e:#}"));
+            return;
+        }
+        self.draft.settings.editor.finish = settings.editor.finish;
+        self.draft.settings.editor.listen_track = settings.editor.listen_track;
+        self.settings = settings;
+    }
+
     /// Where recordings are written right now.
     pub fn output_dir(&self) -> PathBuf {
         self.settings

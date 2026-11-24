@@ -173,6 +173,23 @@ pub struct EditorSettings {
     /// Full path to `ffmpeg.exe`. `None` looks next to ZeroClip, then on `PATH`. A path that
     /// doesn't exist is an error, not a silent fallback. `ffprobe` is expected beside it.
     pub ffmpeg_path: Option<PathBuf>,
+    /// What "Done" does. `Ask` shows the choice each time; the other two remember it.
+    pub finish: FinishChoice,
+    /// The audio track the preview plays (0 is Master). Remembered between sessions.
+    pub listen_track: u8,
+}
+
+/// What the editor does when you press Done.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FinishChoice {
+    /// Ask every time.
+    #[default]
+    Ask,
+    /// Join the pieces into one new file.
+    SaveAs,
+    /// Save each piece as its own file and keep editing.
+    Extract,
 }
 
 /// Output location and container.

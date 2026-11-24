@@ -7,19 +7,29 @@ use std::borrow::Cow;
 
 use gpui::{AssetSource, Result, SharedString, Styled, Svg, px, rgb, svg};
 
-const ICONS: [(&str, &[u8]); 12] = [
-    ("icons/house.svg", include_bytes!("../../assets/icons/house.svg")),
+const ICONS: [(&str, &[u8]); 22] = [
+    ("icons/check.svg", include_bytes!("../../assets/icons/check.svg")),
+    ("icons/chevron-left.svg", include_bytes!("../../assets/icons/chevron-left.svg")),
+    ("icons/chevron-right.svg", include_bytes!("../../assets/icons/chevron-right.svg")),
+    ("icons/download.svg", include_bytes!("../../assets/icons/download.svg")),
     ("icons/film.svg", include_bytes!("../../assets/icons/film.svg")),
-    ("icons/sliders-horizontal.svg", include_bytes!("../../assets/icons/sliders-horizontal.svg")),
-    ("icons/scissors.svg", include_bytes!("../../assets/icons/scissors.svg")),
-    ("icons/settings.svg", include_bytes!("../../assets/icons/settings.svg")),
+    ("icons/folder-open.svg", include_bytes!("../../assets/icons/folder-open.svg")),
+    ("icons/gamepad-2.svg", include_bytes!("../../assets/icons/gamepad-2.svg")),
+    ("icons/headphones.svg", include_bytes!("../../assets/icons/headphones.svg")),
+    ("icons/house.svg", include_bytes!("../../assets/icons/house.svg")),
+    ("icons/minus.svg", include_bytes!("../../assets/icons/minus.svg")),
     ("icons/pause.svg", include_bytes!("../../assets/icons/pause.svg")),
     ("icons/play.svg", include_bytes!("../../assets/icons/play.svg")),
+    ("icons/plus.svg", include_bytes!("../../assets/icons/plus.svg")),
     ("icons/save.svg", include_bytes!("../../assets/icons/save.svg")),
-    ("icons/minus.svg", include_bytes!("../../assets/icons/minus.svg")),
+    ("icons/scissors.svg", include_bytes!("../../assets/icons/scissors.svg")),
+    ("icons/settings.svg", include_bytes!("../../assets/icons/settings.svg")),
+    ("icons/sliders-horizontal.svg", include_bytes!("../../assets/icons/sliders-horizontal.svg")),
     ("icons/square.svg", include_bytes!("../../assets/icons/square.svg")),
+    ("icons/trash-2.svg", include_bytes!("../../assets/icons/trash-2.svg")),
+    ("icons/volume-2.svg", include_bytes!("../../assets/icons/volume-2.svg")),
+    ("icons/volume-x.svg", include_bytes!("../../assets/icons/volume-x.svg")),
     ("icons/x.svg", include_bytes!("../../assets/icons/x.svg")),
-    ("icons/folder-open.svg", include_bytes!("../../assets/icons/folder-open.svg")),
 ];
 
 /// The app's asset source; pass it to `Application::with_assets`.
