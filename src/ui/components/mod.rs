@@ -4,6 +4,7 @@
 pub mod banner;
 pub mod button;
 pub mod card;
+pub mod context_menu;
 pub mod exe_icon;
 pub mod field_row;
 pub mod labeled_toggle;

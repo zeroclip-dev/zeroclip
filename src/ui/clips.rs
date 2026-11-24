@@ -17,6 +17,7 @@ use zc_editor::ffmpeg::Ffmpeg;
 
 use super::components::{
     button::{button, button_ghost},
+    context_menu::{context_menu, menu_item, menu_separator},
     segmented::segmented,
     text_field::text_field,
 };
@@ -181,6 +182,8 @@ pub struct ClipsView {
     renaming: Option<Renaming>,
     /// The file the mouse went down on, and where. Moving on with the button held drags it out.
     drag_from: Option<(PathBuf, Point<Pixels>)>,
+    /// The clip the right-click menu is open for, and where it was opened.
+    menu: Option<(PathBuf, Point<Pixels>)>,
     /// Cards in a grid instead of rows in a list.
     grid: bool,
     thumbs: Thumbs,
@@ -261,6 +264,7 @@ impl ClipsView {
             rename_focus: None,
             renaming: None,
             drag_from: None,
+            menu: None,
             grid: true,
             thumbs: Thumbs::default(),
         }
@@ -408,7 +412,15 @@ impl ClipsView {
     /// chat. A press then a move of a few pixels starts the drag; a plain click is untouched.
     fn drag_source<E: InteractiveElement>(&self, el: E, path: &Path, cx: &Context<Self>) -> E {
         let path = path.to_path_buf();
+        let menu_path = path.clone();
         el.on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                this.menu = Some((menu_path.clone(), ev.position));
+                cx.notify();
+            }),
+        )
+        .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, ev: &MouseDownEvent, _, _| {
                 this.drag_from = Some((path.clone(), ev.position));
@@ -430,6 +442,95 @@ impl ClipsView {
                 tracing::warn!(%error, "couldn't drag the clip out");
             }
         }))
+    }
+}
+
+impl ClipsView {
+    /// The right-click menu of one clip: watch, edit, show in Explorer, rename, delete.
+    fn clip_menu(
+        &self,
+        window: &Window,
+        path: PathBuf,
+        at: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let is_video = path.file_name().is_some_and(|n| Kind::Videos.accepts(&n.to_string_lossy()));
+        // Each item closes the menu, then does its thing.
+        let item =
+            |id: &'static str,
+             label: &'static str,
+             danger: bool,
+             act: fn(&mut Self, PathBuf, &mut Window, &mut Context<Self>)| {
+                let path = path.clone();
+                menu_item(id, label, danger)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.menu = None;
+                        act(this, path.clone(), window, cx);
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            };
+        let mut items = Vec::new();
+        if is_video {
+            items.push(item("menu-watch", "Watch", false, |this, path, _, cx| {
+                let _ = this.app.update(cx, |app, cx| app.play_clip(path, cx));
+            }));
+            items.push(item("menu-edit", "Edit", false, |this, path, _, cx| {
+                let _ = this.app.update(cx, |app, cx| app.open_in_editor(path, false, cx));
+            }));
+            items.push(menu_separator().into_any_element());
+        }
+        items.push(item("menu-reveal", "Show in folder", false, |this, path, _, cx| {
+            if let Err(error) = zc_win::shell::reveal(&path) {
+                let _ = this.app.update(cx, |app, _| {
+                    app.notify(NoticeLevel::Error, format!("Couldn't open Explorer: {error}"));
+                });
+            }
+        }));
+        items.push(item("menu-rename", "Rename", false, |this, path, window, cx| {
+            let text =
+                path.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+            this.renaming = Some(Renaming { path, text, error: None });
+            if let Some(focus) = &this.rename_focus {
+                focus.focus(window, cx);
+            }
+        }));
+        items.push(menu_separator().into_any_element());
+        items.push(item("menu-delete", "Move to Recycle Bin", true, |this, path, _, cx| {
+            let outcome = zc_win::shell::recycle(&path);
+            if outcome.is_ok() {
+                let _ = std::fs::remove_file(zc_core::bookmarks::sidecar(&path));
+                zc_core::game_tag::remove(&path);
+            }
+            let _ = this.app.update(cx, |app, cx| {
+                match outcome {
+                    Ok(()) => {
+                        app.clips.invalidate();
+                        app.notify(NoticeLevel::Info, "Moved to the Recycle Bin");
+                    }
+                    Err(error) => {
+                        app.notify(NoticeLevel::Error, format!("Couldn't delete: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        context_menu(
+            window,
+            at,
+            items.len(),
+            {
+                let view = cx.entity();
+                move |_, cx| {
+                    view.update(cx, |this, cx| {
+                        this.menu = None;
+                        cx.notify();
+                    });
+                }
+            },
+            items,
+        )
+        .into_any_element()
     }
 }
 
@@ -781,6 +882,9 @@ impl Render for ClipsView {
                 )
         });
 
+        let list_error = clips.error.clone();
+        let menu = self.menu.clone().map(|(path, at)| self.clip_menu(window, path, at, cx));
+
         div()
             .size_full()
             .flex()
@@ -792,13 +896,14 @@ impl Render for ClipsView {
                 div().text_sm().text_color(rgb(theme::MUTED_FG)).child(dir.display().to_string()),
             )
             .children(
-                clips.error.as_ref().map(|error| {
+                list_error.map(|error| {
                     div().text_sm().text_color(rgb(theme::DANGER)).child(error.clone())
                 }),
             )
             .child(tools)
             .children(rename_bar)
             .child(body)
+            .children(menu)
             .into_any_element()
     }
 }
