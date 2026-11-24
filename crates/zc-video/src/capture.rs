@@ -62,7 +62,7 @@ pub struct CapturedFrame {
 pub struct MonitorInfo {
     /// The index a [`CaptureTarget::Monitor`] takes (`EnumDisplayMonitors` order).
     pub index: u32,
-    /// Label for the UI, such as `Display 1 – 2560×1440`.
+    /// Label for the UI, such as `Display 1, 2560×1440`.
     pub name: String,
     /// Whether this is the primary display.
     pub primary: bool,
@@ -132,7 +132,7 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
             let height = info.rcMonitor.bottom.saturating_sub(info.rcMonitor.top);
             Some(MonitorInfo {
                 index,
-                name: format!("Display {} – {width}×{height}", index + 1),
+                name: format!("Display {}, {width}×{height}", index + 1),
                 primary: info.dwFlags & PRIMARY_FLAG != 0,
             })
         })

@@ -1,6 +1,7 @@
 //! The Profiles screen (DESIGN §7): how much footage to keep, and whether to record the whole
 //! session, per game. Edits go to `app.draft`; the save bar at the bottom writes them.
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, ParentElement,
     Render, StatefulInteractiveElement, Styled, WeakEntity, Window, deferred, div, px, rgb,
@@ -9,7 +10,7 @@ use zc_core::Hns;
 use zc_core::profile::{GameProfile, ProfileSet, exe_name};
 use zc_core::settings::MAX_APP_TRACKS;
 
-use super::components::button::{button, button_primary};
+use super::components::button::{button, button_primary_if};
 use super::components::exe_icon;
 use super::components::open_apps::{
     has_live_track, same_exe, set_audio_track, set_game_profile, track_slot_free,
@@ -242,6 +243,8 @@ fn duration_control(
         .flex_row()
         .items_center()
         .gap_3()
+        .flex_shrink(1.)
+        .min_w_0()
         .child(slider(format!("duration-{i}"), fraction_of(secs), state, move |f, _, cx| {
             view.update(cx, |this, cx| this.edit(cx, |app| set_secs(app, i, secs_at(f)))).ok();
         }))
@@ -255,6 +258,13 @@ fn profile_mut(profiles: &mut ProfileSet, i: usize) -> &mut GameProfile {
 
 fn set_secs(app: &mut ZeroClipApp, i: usize, secs: u32) {
     profile_mut(&mut app.draft.settings.profiles, i).buffer_secs = secs;
+}
+
+/// Whether row `i` (1.., a game) repeats the exe of an earlier game row.
+fn is_duplicate(profiles: &ProfileSet, i: usize) -> bool {
+    let Some(game) = i.checked_sub(1).and_then(|g| profiles.games.get(g)) else { return false };
+    !game.exe.is_empty()
+        && profiles.games[..i - 1].iter().any(|g| g.exe.eq_ignore_ascii_case(&game.exe))
 }
 
 fn memory_note(secs: u32, max_kbps: u32, ceiling_mb: u64) -> AnyElement {
@@ -310,7 +320,7 @@ impl Render for ProfilesView {
                     file.is_file()
                 });
             let name: AnyElement = if i == 0 {
-                div().w(px(190.0)).flex_none().child("Any other game").into_any_element()
+                div().w(px(140.0)).flex_none().child("Any other game").into_any_element()
             } else {
                 let handle = self.fields[i - 1].clone();
                 let focused = handle.is_focused(window);
@@ -319,7 +329,7 @@ impl Render for ProfilesView {
                 div()
                     .id(("exe", i))
                     .track_focus(&handle)
-                    .w(px(190.0))
+                    .w(px(140.0))
                     .flex_none()
                     .px_2()
                     .py_1()
@@ -372,7 +382,7 @@ impl Render for ProfilesView {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_4()
+                    .gap_3()
                     .px_3()
                     .py_2()
                     .rounded(px(theme::RADIUS))
@@ -414,16 +424,27 @@ impl Render for ProfilesView {
                             });
                         }),
                     )))
-                    .child(div().flex_1().text_sm().child(memory_note(
-                        profile.buffer_secs,
-                        max_kbps,
-                        ceiling_mb,
-                    )))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(96.0))
+                            .text_sm()
+                            .child(memory_note(profile.buffer_secs, max_kbps, ceiling_mb))
+                            // Only the first row for an exe is used, so a repeat is a mistake.
+                            .when(is_duplicate(&profiles, i), |d| {
+                                d.child(
+                                    div()
+                                        .text_color(rgb(WARN))
+                                        .child("Same game as a row above, this one is ignored"),
+                                )
+                            }),
+                    )
                     .child(if i == 0 {
                         div().w(px(88.0)).into_any_element()
                     } else {
                         button(("remove", i), "Remove")
                             .w(px(88.0))
+                            .flex_none()
                             .text_sm()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.fields.remove(i - 1);
@@ -440,12 +461,12 @@ impl Render for ProfilesView {
         let header = div()
             .flex()
             .flex_row()
-            .gap_4()
+            .gap_3()
             .px_3()
             .child(div().w(px(24.0)).flex_none())
-            .child(div().w(px(190.0)).child(label("Executable")))
-            .child(div().w(px(280.0)).child(label("DVR buffer")))
-            .child(div().w(px(60.0)).child(label("Whole session")))
+            .child(div().w(px(140.0)).child(label("Executable")))
+            .child(div().w(px(244.0)).child(label("DVR buffer")))
+            .child(div().w(px(60.0)).child(label("Session")))
             .child(div().flex_1().child(label("Memory at max bitrate")));
 
         let apps = self.open_apps_section(&app_entity, &profiles, &tracks, cx);
@@ -633,7 +654,7 @@ fn save_bar(
     problems: Vec<String>,
     cx: &mut Context<ProfilesView>,
 ) -> impl IntoElement {
-    let mut save = button_primary("save", "Save");
+    let mut save = button_primary_if("save", "Save", dirty);
     let mut revert = button("revert", "Revert");
     if dirty {
         save = save.on_click(cx.listener(|this, _, _, cx| {
@@ -644,7 +665,6 @@ fn save_bar(
             this.fields.clear();
         }));
     } else {
-        save = save.opacity(0.4);
         revert = revert.opacity(0.4);
     }
     div()

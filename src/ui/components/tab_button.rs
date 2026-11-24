@@ -1,6 +1,9 @@
 //! A top-bar tab. Highlighted when `active`; add `.on_click(cx.listener(..))` at the call site.
 
-use gpui::{InteractiveElement, ParentElement, SharedString, Styled, div, px, rgb};
+use gpui::{
+    InteractiveElement, ParentElement, Role, SharedString, StatefulInteractiveElement, Styled, div,
+    px, rgb,
+};
 
 use crate::ui::icons::icon;
 use crate::ui::theme;
@@ -9,6 +12,10 @@ pub fn tab_button(icon_name: &str, label: &'static str, active: bool) -> gpui::S
     let text: SharedString = label.into();
     let tab = div()
         .id(text.clone())
+        .tab_stop(true)
+        .focus_visible(|s| s.border_1().border_color(rgb(theme::RING)))
+        .role(Role::Tab)
+        .aria_label(text.clone())
         .h(px(32.))
         .px_3()
         .flex()

@@ -86,9 +86,11 @@ pub fn slider(
     div()
         .id(id.into())
         .relative()
+        // 200 px when there is room, shrinking to 110 in a narrow window.
         .w(px(200.0))
+        .min_w(px(110.0))
         .h(px(20.0))
-        .flex_none()
+        .flex_shrink(1.)
         .cursor_pointer()
         .child(track)
         .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, window, cx| {

@@ -24,6 +24,9 @@ pub fn segmented(
         let active = selected == Some(i);
         let chip = div()
             .id(ElementId::Name(format!("{id}-{i}").into()))
+            .tab_stop(true)
+            .focus_visible(|s| s.border_color(rgb(theme::RING)))
+            .role(gpui::Role::RadioButton)
             .h(px(26.))
             .px(px(10.))
             .flex()
@@ -33,9 +36,14 @@ pub fn segmented(
             .font_weight(gpui::FontWeight::MEDIUM)
             .child(label);
         let chip = if active {
-            chip.bg(rgb(theme::BG)).text_color(rgb(theme::FG))
+            chip.bg(rgb(theme::CARD))
+                .border_1()
+                .border_color(rgb(theme::INPUT))
+                .text_color(rgb(theme::FG))
+                .aria_selected(true)
         } else {
-            chip.text_color(rgb(theme::MUTED_FG))
+            // Same border width as the active chip, so choosing one doesn't shift the row.
+            chip.border_1().border_color(gpui::transparent_black()).text_color(rgb(theme::MUTED_FG))
         };
         if !enabled {
             return chip;

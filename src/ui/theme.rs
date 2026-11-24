@@ -7,6 +7,8 @@ pub const FG: u32 = 0xfafafa;
 pub const CARD: u32 = 0x101012;
 pub const MUTED: u32 = 0x27272a;
 pub const MUTED_FG: u32 = 0xa1a1aa;
+/// Secondary actions: lighter than `MUTED_FG` so a ghost button reads as clickable, not disabled.
+pub const FG_SOFT: u32 = 0xd4d4d8;
 pub const BORDER: u32 = 0x27272a;
 pub const INPUT: u32 = 0x3f3f46;
 pub const RING: u32 = 0x71717a;
@@ -14,13 +16,10 @@ pub const PRIMARY: u32 = 0xfafafa;
 pub const PRIMARY_FG: u32 = 0x18181b;
 pub const ACCENT: u32 = 0x1f1f23;
 pub const BRAND: u32 = 0x2dd4bf;
-#[allow(dead_code)] // token mirrors the preview; banners and status pill use the soft fills
 pub const BRAND_SOFT: u32 = 0x0f2f2c;
 pub const WARN: u32 = 0xfbbf24;
 pub const WARN_SOFT: u32 = 0x2a2108;
 pub const DANGER: u32 = 0xf87171;
-#[allow(dead_code)]
-pub const DANGER_SOFT: u32 = 0x301212;
 
 /// Corner radii in px: cards, controls, small chips (`--r`, `--r-md`, `--r-sm`).
 pub const RADIUS: f32 = 10.0;

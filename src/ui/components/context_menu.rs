@@ -4,8 +4,9 @@
 //! `Some`. Items are [`menu_item`]s with `.on_click(cx.listener(..))`, and each closes the menu.
 
 use gpui::{
-    App, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point, SharedString,
-    Styled, Window, anchored, deferred, div, point, px, rgb,
+    App, FocusHandle, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point,
+    Role, SharedString, StatefulInteractiveElement, Styled, Window, anchored, deferred, div, point,
+    px, rgb,
 };
 
 use crate::ui::theme;
@@ -23,6 +24,9 @@ pub fn menu_item(
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
+        .tab_stop(true)
+        .focus_visible(|s| s.bg(rgb(theme::ACCENT)))
+        .role(Role::MenuItem)
         .h(px(ITEM_HEIGHT))
         .px_2()
         .flex()
@@ -41,9 +45,10 @@ pub fn menu_separator() -> gpui::Div {
 }
 
 /// The menu, placed at `at` (window coordinates) and kept inside the window. `rows` is the number
-/// of items plus separators, for the height. `on_close` runs on a click outside the menu.
+/// of items plus separators, for the height. `on_close` runs on a click outside the menu or Esc.
 pub fn context_menu(
     window: &Window,
+    focus: &FocusHandle,
     at: Point<Pixels>,
     rows: usize,
     on_close: impl Fn(&mut Window, &mut App) + 'static,
@@ -55,6 +60,7 @@ pub fn context_menu(
     let y = f32::from(at.y).min(f32::from(view.height) - height).max(MARGIN);
     let on_close = std::rc::Rc::new(on_close);
     let close_left = std::rc::Rc::clone(&on_close);
+    let close_key = std::rc::Rc::clone(&on_close);
     let menu = div()
         .absolute()
         .left(px(x))
@@ -70,6 +76,13 @@ pub fn context_menu(
         .shadow_lg()
         // Clicks inside must not reach the backdrop, which closes the menu.
         .occlude()
+        // Esc closes it. The owner focuses `focus` when it opens the menu.
+        .track_focus(focus)
+        .on_key_down(move |ev, window, cx| {
+            if ev.keystroke.key == "escape" {
+                close_key(window, cx);
+            }
+        })
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
         .children(items);

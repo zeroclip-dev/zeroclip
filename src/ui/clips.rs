@@ -179,6 +179,8 @@ pub struct ClipsView {
     focus: Option<FocusHandle>,
     /// Rename box focus, made on the first render.
     rename_focus: Option<FocusHandle>,
+    /// Right-click menu focus, so Esc reaches it.
+    menu_focus: Option<FocusHandle>,
     renaming: Option<Renaming>,
     /// The file the mouse went down on, and where. Moving on with the button held drags it out.
     drag_from: Option<(PathBuf, Point<Pixels>)>,
@@ -262,6 +264,7 @@ impl ClipsView {
             game: None,
             focus: None,
             rename_focus: None,
+            menu_focus: None,
             renaming: None,
             drag_from: None,
             menu: None,
@@ -393,6 +396,17 @@ fn renamed_path(path: &Path, stem: &str) -> Result<PathBuf, String> {
 }
 
 /// The small picture at the start of a row. `source` is the image file, if there is one yet.
+/// A clip's title in the UI: the date and time, without the repeated "ZeroClip clip" prefix and the
+/// extension, so near-identical names stay tellable apart when the card truncates them.
+pub fn display_name(file_name: &str) -> String {
+    let stem = file_name.rsplit_once('.').map_or(file_name, |(stem, _)| stem);
+    let short = stem
+        .strip_prefix("ZeroClip clip ")
+        .or_else(|| stem.strip_prefix("ZeroClip "))
+        .unwrap_or(stem);
+    short.to_owned()
+}
+
 pub fn thumb_box(source: Option<PathBuf>, w: f32, h: f32) -> gpui::Div {
     let frame = div()
         .w(px(w))
@@ -415,8 +429,12 @@ impl ClipsView {
         let menu_path = path.clone();
         el.on_mouse_down(
             MouseButton::Right,
-            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+            cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                tracing::debug!(path = %menu_path.display(), "clip right-click");
                 this.menu = Some((menu_path.clone(), ev.position));
+                if let Some(focus) = &this.menu_focus {
+                    focus.focus(window, cx);
+                }
                 cx.notify();
             }),
         )
@@ -515,8 +533,10 @@ impl ClipsView {
                 cx.notify();
             });
         }));
+        let focus = self.menu_focus.clone().unwrap_or_else(|| cx.focus_handle());
         context_menu(
             window,
+            &focus,
             at,
             items.len(),
             {
@@ -549,6 +569,7 @@ impl Render for ClipsView {
             }
         });
         let rename_focus = self.rename_focus.get_or_insert_with(|| cx.focus_handle()).clone();
+        self.menu_focus.get_or_insert_with(|| cx.focus_handle());
 
         // Thumbnails live next to the database. Any that are missing are made in the background.
         let (ffmpeg_path, thumb_dir) = {
@@ -718,12 +739,54 @@ impl Render for ClipsView {
                 } else {
                     Some(file.path.clone())
                 };
-                let actions = div()
-                    .flex()
-                    .flex_row()
-                    .gap_1()
-                    .children(edit.into_iter().flatten())
-                    .child(rename);
+                // Cards show Watch and a "more" button (the same menu as a right-click); the list
+                // has room for every action.
+                let more = {
+                    let path = file.path.clone();
+                    div()
+                        .id(("clip-more", i))
+                        .tab_stop(true)
+                        .focus_visible(|s| s.border_1().border_color(rgb(theme::RING)))
+                        .role(gpui::Role::Button)
+                        .aria_label("More actions")
+                        .size(px(32.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(theme::RADIUS_MD))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(theme::ACCENT)))
+                        .child(super::icons::icon("ellipsis", theme::FG_SOFT))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                                // Not a drag start for the card underneath.
+                                cx.stop_propagation();
+                                this.menu = Some((path.clone(), ev.position));
+                                if let Some(focus) = &this.menu_focus {
+                                    focus.focus(window, cx);
+                                }
+                                cx.notify();
+                            }),
+                        )
+                };
+                let actions = if self.grid {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .children(edit.into_iter().flatten().take(1))
+                        .child(div().flex_1())
+                        .child(more)
+                } else {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_1()
+                        .children(edit.into_iter().flatten())
+                        .child(rename)
+                };
                 if self.grid {
                     return self
                         .drag_source(div(), &file.path, cx)
@@ -765,7 +828,7 @@ impl Render for ClipsView {
                                 },
                             )
                         })
-                        .child(div().text_sm().truncate().child(file.name.clone()))
+                        .child(div().text_sm().truncate().child(display_name(&file.name)))
                         .child(div().text_xs().text_color(rgb(theme::MUTED_FG)).child(format!(
                             "{:.1} MB \u{b7} {}",
                             file.size_bytes as f64 / 1_000_000.0,
