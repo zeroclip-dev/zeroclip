@@ -21,6 +21,9 @@ use super::components::{
 use super::theme;
 use crate::app::{NoticeLevel, ZeroClipApp};
 
+/// Width of a card in the grid view.
+const CARD_W: f32 = 220.0;
+
 const EXTENSIONS: &[&str] = &["mp4", "mkv", "png", "jpg"];
 
 #[derive(Debug, Default)]
@@ -151,6 +154,8 @@ pub struct ClipsView {
     /// Rename box focus, made on the first render.
     rename_focus: Option<FocusHandle>,
     renaming: Option<Renaming>,
+    /// Cards in a grid instead of rows in a list.
+    grid: bool,
     /// Thumbnail files known to exist.
     thumbs_ready: HashSet<PathBuf>,
     /// Thumbnails already asked for, so a failed one is not retried on every frame.
@@ -166,6 +171,7 @@ impl ClipsView {
             focus: None,
             rename_focus: None,
             renaming: None,
+            grid: false,
             thumbs_ready: HashSet::new(),
             thumbs_pending: HashSet::new(),
         }
@@ -302,16 +308,16 @@ fn renamed_path(path: &Path, stem: &str) -> Result<PathBuf, String> {
 }
 
 /// The small picture at the start of a row. `source` is the image file, if there is one yet.
-fn thumb_box(source: Option<PathBuf>) -> gpui::Div {
+fn thumb_box(source: Option<PathBuf>, w: f32, h: f32) -> gpui::Div {
     let frame = div()
-        .w(px(64.))
-        .h(px(36.))
+        .w(px(w))
+        .h(px(h))
         .flex_none()
         .rounded(px(theme::RADIUS_MD))
         .overflow_hidden()
         .bg(rgb(theme::ACCENT));
     match source {
-        Some(path) => frame.child(img(path).w(px(64.)).h(px(36.)).object_fit(ObjectFit::Cover)),
+        Some(path) => frame.child(img(path).w(px(w)).h(px(h)).object_fit(ObjectFit::Cover)),
         None => frame,
     }
 }
@@ -421,6 +427,16 @@ impl Render for ClipsView {
                     cx.notify();
                 }),
             ))
+            .child(segmented(
+                "clips-layout",
+                vec![SharedString::from("List"), SharedString::from("Grid")],
+                Some(usize::from(self.grid)),
+                true,
+                cx.listener(|this, i: &usize, _, cx| {
+                    this.grid = *i == 1;
+                    cx.notify();
+                }),
+            ))
             .child(div().ml_auto().text_sm().text_color(rgb(theme::MUTED_FG)).child(format!(
                 "{} of {} files",
                 shown.len(),
@@ -468,14 +484,35 @@ impl Render for ClipsView {
                 } else {
                     Some(file.path.clone())
                 };
+                let actions = div().flex().flex_row().gap_1().children(edit).child(rename);
+                if self.grid {
+                    return div()
+                        .w(px(CARD_W))
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .p_2()
+                        .rounded(px(theme::RADIUS))
+                        .bg(rgb(theme::CARD))
+                        .border_1()
+                        .border_color(rgb(theme::BORDER))
+                        .hover(|s| s.bg(rgb(theme::ACCENT)))
+                        .child(thumb_box(thumb, CARD_W - 18., (CARD_W - 18.) * 9. / 16.))
+                        .child(div().text_sm().truncate().child(file.name.clone()))
+                        .child(div().text_xs().text_color(rgb(theme::MUTED_FG)).child(format!(
+                            "{:.1} MB \u{b7} {}",
+                            file.size_bytes as f64 / 1_000_000.0,
+                            file.modified.map_or_else(|| "\u{2014}".to_owned(), age)
+                        )))
+                        .child(actions);
+                }
                 let name = div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_3()
-                    .child(thumb_box(thumb))
+                    .child(thumb_box(thumb, 64., 36.))
                     .child(div().min_w_0().child(file.name.clone()));
-                let actions = div().flex().flex_row().gap_1().children(edit).child(rename);
                 table_row(
                     name,
                     format!("{:.1} MB", file.size_bytes as f64 / 1_000_000.0),
@@ -486,32 +523,47 @@ impl Render for ClipsView {
                 .border_color(rgb(theme::BORDER))
                 .hover(|s| s.bg(rgb(theme::ACCENT)))
             });
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_h_0()
-                .rounded(px(theme::RADIUS))
-                .bg(rgb(theme::CARD))
-                .border_1()
-                .border_color(rgb(theme::BORDER))
-                .child(
-                    table_row("File", "Size", "Saved", None::<gpui::Div>)
-                        .text_sm()
-                        .text_color(rgb(theme::MUTED_FG)),
-                )
-                .child(
-                    div()
-                        .id("clips-list")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .flex()
-                        .flex_col()
-                        .text_sm()
-                        .children(rows),
-                )
-                .into_any_element()
+            if self.grid {
+                div()
+                    .id("clips-grid")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .content_start()
+                    .gap_3()
+                    .children(rows)
+                    .into_any_element()
+            } else {
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .rounded(px(theme::RADIUS))
+                    .bg(rgb(theme::CARD))
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .child(
+                        table_row("File", "Size", "Saved", None::<gpui::Div>)
+                            .text_sm()
+                            .text_color(rgb(theme::MUTED_FG)),
+                    )
+                    .child(
+                        div()
+                            .id("clips-list")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .text_sm()
+                            .children(rows),
+                    )
+                    .into_any_element()
+            }
         };
 
         // The rename bar sits above the list while a rename is open: the typed name, the kept
