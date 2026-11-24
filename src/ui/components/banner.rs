@@ -3,8 +3,10 @@
 
 use gpui::{Div, Styled, div, rgb};
 
-const BANNER_BG: u32 = 0x3a3320;
-const BANNER_EDGE: u32 = 0x5c4f20;
+use crate::ui::theme;
+
+const BANNER_BG: u32 = theme::WARN_SOFT;
+const BANNER_EDGE: u32 = theme::WARN;
 
 pub fn banner() -> Div {
     div()

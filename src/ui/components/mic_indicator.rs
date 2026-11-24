@@ -5,9 +5,10 @@ use gpui::{IntoElement, ParentElement, Styled, div, rgb};
 use zc_core::control::MicState;
 
 use super::status_dot::status_dot;
+use crate::ui::theme;
 
-const RED: u32 = 0xf08080;
-const GRAY: u32 = 0x909090;
+const RED: u32 = theme::DANGER;
+const GRAY: u32 = theme::MUTED_FG;
 
 /// The label and dot colour for a mic state. `None` when the mic is off, so the caller adds no
 /// separator for it.
