@@ -185,6 +185,30 @@ impl TrackEdit {
         self.simplify();
     }
 
+    /// Silences `a..b` of a piece `span` long with a dip in the volume line, short ramps either side
+    /// so there is no click. The video and the other tracks are untouched.
+    pub fn silence(&mut self, a: Hns, b: Hns, span: Hns) {
+        if self.mute || b <= a {
+            return;
+        }
+        let (lo, hi) = ((a - MIN_GAP).max(Hns::ZERO), (b + MIN_GAP).min(span));
+        let (before, after) = (self.db_at(a), self.db_at(b));
+        let old = self.line(span);
+        let mut points: Vec<EnvPoint> = old.iter().copied().filter(|p| p.at < lo).collect();
+        if lo < a {
+            points.push(EnvPoint { at: lo, db: before });
+        }
+        points.push(EnvPoint { at: a, db: MIN_DB });
+        points.push(EnvPoint { at: b, db: MIN_DB });
+        if hi > b {
+            points.push(EnvPoint { at: hi, db: after });
+        }
+        points.extend(old.iter().copied().filter(|p| p.at > hi));
+        self.mute = false;
+        self.points = points;
+        self.simplify();
+    }
+
     /// Drops a line that does nothing: fewer than two points, or all at one level.
     pub fn simplify(&mut self) {
         let flat = match self.points.as_slice() {
@@ -670,6 +694,20 @@ mod tests {
         assert_eq!(plan.tracks[0].edit, AudioEdit::Gain { db: 3.0 });
         assert_eq!(plan.tracks[1].edit, AudioEdit::Mute);
         assert!(plan.has_audio_edits());
+    }
+
+    #[test]
+    fn silencing_a_range_dips_the_line_and_leaves_the_rest() {
+        let mut e = TrackEdit::default();
+        e.silence(secs(4), secs(6), secs(10));
+        assert_eq!(e.db_at(secs(1)), 0.0);
+        assert_eq!(e.db_at(secs(5)), MIN_DB);
+        assert_eq!(e.db_at(secs(9)), 0.0);
+        assert!(e.points.windows(2).all(|w| w[0].at < w[1].at));
+        // The whole piece silenced is just a mute.
+        let mut all = TrackEdit::default();
+        all.silence(Hns::ZERO, secs(10), secs(10));
+        assert!(all.mute);
     }
 
     #[test]
