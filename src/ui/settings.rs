@@ -17,17 +17,18 @@ use zc_core::settings::{
 use zc_video::capture::MonitorInfo;
 
 use super::components::{
-    button::button,
+    button::{button, button_primary},
     labeled_toggle::labeled_toggle,
     number_stepper::{Stepper, number_stepper},
     segmented::segmented,
     text_field::text_field,
 };
+use super::theme;
 use super::{dvr_megabytes, dvr_ring_megabytes, effective_ceiling, human_duration};
 use crate::app::ZeroClipApp;
 
 const MIC_POLL: Duration = Duration::from_secs(2);
-const HINT: u32 = 0x909090;
+const HINT: u32 = theme::MUTED_FG;
 
 /// Settings being edited. Free-text fields (paths, hotkeys) stay strings until saved.
 #[derive(Clone, Debug)]
@@ -48,6 +49,8 @@ pub struct Draft {
     ring_drive: Option<(String, bool)>,
     /// Problems from the last save attempt.
     pub problems: Vec<String>,
+    /// The user picked "Custom" for the frame rate. UI state only; never saved.
+    fps_custom: bool,
 }
 
 impl Draft {
@@ -70,6 +73,7 @@ impl Draft {
             monitors: zc_video::capture::list_monitors(),
             ring_drive: None,
             problems: Vec::new(),
+            fps_custom: false,
         }
     }
 
@@ -166,8 +170,10 @@ fn section(title: &'static str) -> gpui::Div {
         .flex_col()
         .gap_3()
         .p_4()
-        .rounded_lg()
-        .bg(rgb(0x23232a))
+        .rounded(px(theme::RADIUS))
+        .bg(rgb(theme::CARD))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
         .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(title))
 }
 
@@ -178,12 +184,27 @@ fn row(label: &'static str, control: impl IntoElement) -> gpui::Div {
         .items_center()
         .gap_4()
         .min_h(px(30.))
-        .child(div().w(px(190.)).flex_shrink_0().text_color(rgb(0xc8c8d0)).child(label))
+        .pb_2()
+        .border_b_1()
+        .border_color(rgb(theme::BORDER))
+        .child(div().w(px(190.)).flex_shrink_0().text_color(rgb(theme::FG)).child(label))
         .child(control)
 }
 
 fn hint(text: impl Into<SharedString>) -> gpui::Div {
     div().text_sm().text_color(rgb(HINT)).child(text.into())
+}
+
+/// Frame-rate presets, in segment order; the segment after them is "Custom".
+const FPS_PRESETS: [u32; 3] = [30, 60, 120];
+
+/// Which frame-rate segment is selected: the preset equal to `fps`, else (or when the user chose
+/// Custom) the Custom segment, whose index is `FPS_PRESETS.len()`.
+fn fps_segment(fps: u32, custom: bool) -> usize {
+    if custom {
+        return FPS_PRESETS.len();
+    }
+    FPS_PRESETS.iter().position(|p| *p == fps).unwrap_or(FPS_PRESETS.len())
 }
 
 fn labels<const N: usize>(items: [&str; N]) -> Vec<SharedString> {
@@ -298,6 +319,7 @@ impl Render for SettingsView {
         } else {
             refresh
         };
+        let fps_sel = fps_segment(video.fps, d.fps_custom);
         let video_sec = section("Video")
             .child(row(
                 "Capture",
@@ -350,13 +372,31 @@ impl Render for SettingsView {
             ))
             .child(row(
                 "Frame rate",
-                number_stepper(
-                    "fps",
-                    f64::from(video.fps),
-                    stepper(1., 240., 1., " fps", true),
-                    bind!(cx, |d, v: &f64| d.settings.video.fps = *v as u32),
+                segmented(
+                    "fps-preset",
+                    labels(["30", "60", "120", "Custom"]),
+                    Some(fps_sel),
+                    true,
+                    bind!(cx, |d, i: &usize| match FPS_PRESETS.get(*i) {
+                        Some(p) => {
+                            d.settings.video.fps = *p;
+                            d.fps_custom = false;
+                        }
+                        None => d.fps_custom = true,
+                    }),
                 ),
             ))
+            .children((fps_sel == FPS_PRESETS.len()).then(|| {
+                row(
+                    "",
+                    number_stepper(
+                        "fps",
+                        f64::from(video.fps),
+                        stepper(1., 240., 1., " fps", true),
+                        bind!(cx, |d, v: &f64| d.settings.video.fps = *v as u32),
+                    ),
+                )
+            }))
             .child(row(
                 "Minimum bitrate (VBR)",
                 number_stepper(
@@ -435,7 +475,7 @@ impl Render for SettingsView {
                 dvr_ring_megabytes(longest, max_kbps, audio.bitrate_kbps),
             )));
             if on_hdd {
-                dvr_sec = dvr_sec.child(div().text_sm().text_color(rgb(0xe0b050)).child(
+                dvr_sec = dvr_sec.child(div().text_sm().text_color(rgb(theme::WARN)).child(
                     "That folder is on a hard disk. Constant buffer writes can make games stutter; pick an SSD.",
                 ));
             }
@@ -613,7 +653,7 @@ impl Render for SettingsView {
             ));
 
         let dim = if dirty { 1.0 } else { 0.4 };
-        let save = button("save", "Save").opacity(dim);
+        let save = button_primary("save", "Save").opacity(dim);
         let revert = button("revert", "Revert").opacity(dim);
         let (save, revert) = if dirty {
             (
@@ -645,7 +685,9 @@ impl Render for SettingsView {
             .gap_1()
             .px_4()
             .py_2()
-            .bg(rgb(0x23232a))
+            .bg(rgb(theme::BG))
+            .border_t_1()
+            .border_color(rgb(theme::BORDER))
             .child(
                 div()
                     .flex()
@@ -659,7 +701,7 @@ impl Render for SettingsView {
             .children(
                 d.problems
                     .iter()
-                    .map(|p| div().text_sm().text_color(rgb(super::RED)).child(p.clone())),
+                    .map(|p| div().text_sm().text_color(rgb(theme::DANGER)).child(p.clone())),
             );
 
         let sections: [AnyElement; 8] = [
@@ -695,6 +737,15 @@ impl Render for SettingsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fps_presets_select_themselves_everything_else_is_custom() {
+        for (fps, seg) in [(30, 0), (60, 1), (120, 2), (144, 3), (1, 3), (240, 3)] {
+            assert_eq!(fps_segment(fps, false), seg, "{fps}");
+        }
+        // Choosing Custom keeps the stepper open even on a preset value.
+        assert_eq!(fps_segment(60, true), 3);
+    }
 
     #[test]
     fn untouched_draft_is_clean() {
