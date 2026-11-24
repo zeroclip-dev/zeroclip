@@ -420,10 +420,10 @@ impl Render for ProfilesView {
                         ceiling_mb,
                     )))
                     .child(if i == 0 {
-                        div().w(px(64.0)).into_any_element()
+                        div().w(px(88.0)).into_any_element()
                     } else {
                         button(("remove", i), "Remove")
-                            .w(px(64.0))
+                            .w(px(88.0))
                             .text_sm()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.fields.remove(i - 1);
