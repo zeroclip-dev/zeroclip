@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use gpui::{
-    Context, FocusHandle, FontWeight, InteractiveElement as _, IntoElement, ObjectFit,
-    ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled, StyledImage as _,
-    WeakEntity, Window, div, img, px, rgb,
+    Context, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point, Render, SharedString,
+    StatefulInteractiveElement as _, Styled, StyledImage as _, WeakEntity, Window, div, img, px,
+    rgb,
 };
 use zc_core::Hns;
 use zc_editor::ffmpeg::Ffmpeg;
@@ -154,6 +155,8 @@ pub struct ClipsView {
     /// Rename box focus, made on the first render.
     rename_focus: Option<FocusHandle>,
     renaming: Option<Renaming>,
+    /// The file the mouse went down on, and where. Moving on with the button held drags it out.
+    drag_from: Option<(PathBuf, Point<Pixels>)>,
     /// Cards in a grid instead of rows in a list.
     grid: bool,
     /// Thumbnail files known to exist.
@@ -171,6 +174,7 @@ impl ClipsView {
             focus: None,
             rename_focus: None,
             renaming: None,
+            drag_from: None,
             grid: false,
             thumbs_ready: HashSet::new(),
             thumbs_pending: HashSet::new(),
@@ -319,6 +323,36 @@ fn thumb_box(source: Option<PathBuf>, w: f32, h: f32) -> gpui::Div {
     match source {
         Some(path) => frame.child(img(path).w(px(w)).h(px(h)).object_fit(ObjectFit::Cover)),
         None => frame,
+    }
+}
+
+impl ClipsView {
+    /// Lets `el` be dragged out of the window as a file: onto a browser's upload box, Explorer, a
+    /// chat. A press then a move of a few pixels starts the drag; a plain click is untouched.
+    fn drag_source<E: InteractiveElement>(&self, el: E, path: &Path, cx: &Context<Self>) -> E {
+        let path = path.to_path_buf();
+        el.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, ev: &MouseDownEvent, _, _| {
+                this.drag_from = Some((path.clone(), ev.position));
+            }),
+        )
+        .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, _| {
+            let Some((path, from)) = this.drag_from.clone() else { return };
+            if !ev.dragging() {
+                this.drag_from = None;
+                return;
+            }
+            let moved = ev.position - from;
+            if f32::from(moved.x).abs() + f32::from(moved.y).abs() < 8.0 {
+                return;
+            }
+            this.drag_from = None;
+            // Blocks until the drop or a cancel.
+            if let Err(error) = zc_win::drag::drag_file(&path) {
+                tracing::warn!(%error, "couldn't drag the clip out");
+            }
+        }))
     }
 }
 
@@ -486,7 +520,8 @@ impl Render for ClipsView {
                 };
                 let actions = div().flex().flex_row().gap_1().children(edit).child(rename);
                 if self.grid {
-                    return div()
+                    return self
+                        .drag_source(div(), &file.path, cx)
                         .w(px(CARD_W))
                         .flex()
                         .flex_col()
@@ -513,15 +548,16 @@ impl Render for ClipsView {
                     .gap_3()
                     .child(thumb_box(thumb, 64., 36.))
                     .child(div().min_w_0().child(file.name.clone()));
-                table_row(
+                let row = table_row(
                     name,
                     format!("{:.1} MB", file.size_bytes as f64 / 1_000_000.0),
                     file.modified.map_or_else(|| "\u{2014}".to_owned(), age),
                     Some(actions),
-                )
-                .border_t_1()
-                .border_color(rgb(theme::BORDER))
-                .hover(|s| s.bg(rgb(theme::ACCENT)))
+                );
+                self.drag_source(row, &file.path, cx)
+                    .border_t_1()
+                    .border_color(rgb(theme::BORDER))
+                    .hover(|s| s.bg(rgb(theme::ACCENT)))
             });
             if self.grid {
                 div()
