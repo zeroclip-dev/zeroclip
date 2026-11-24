@@ -24,7 +24,7 @@ use zc_core::ports::{
 use zc_core::profile::{
     GameProfile, ProfileSet, WindowClamp, clamp_window, effective_ram_ceiling, exe_name,
 };
-use zc_core::settings::{CaptureMode, DvrStorage, MicMode, Settings};
+use zc_core::settings::{CaptureMode, DvrStorage, MicMode, Settings, StorageLayout};
 use zc_core::sink::{SharedSink, SinkId};
 use zc_core::watchdog::{HealthEvent, Watchdog, WatchdogAction, WatchdogConfig, WatchdogState};
 use zc_core::{Codec, Hns};
@@ -1502,9 +1502,10 @@ impl Actor {
     /// Runs on the engine thread, off the hot path, so a ~100 ms PNG encode is fine.
     fn take_screenshot(&mut self) {
         let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
-        let path = self.output_dir.join(format!("ZeroClip {}.png", file_stamp(now)));
+        let dir = self.media_dir("Screenshots");
+        let path = dir.join(format!("ZeroClip {}.png", file_stamp(now)));
         let result = match self.ports.video.as_mut() {
-            Some(video) if self.status.capturing => std::fs::create_dir_all(&self.output_dir)
+            Some(video) if self.status.capturing => std::fs::create_dir_all(&dir)
                 .map_err(|e| SourceError::Other(e.to_string()))
                 .and_then(|()| video.screenshot(&path)),
             _ => Err(SourceError::Other("capture isn't running".into())),
@@ -1545,6 +1546,21 @@ impl Actor {
         }
     }
 
+    /// Where a `kind` file ("Clips", "Recordings", "Screenshots") goes under the chosen layout.
+    fn media_dir(&self, kind: &str) -> PathBuf {
+        let game = self.status.game.as_deref().map(|g| g.strip_suffix(".exe").unwrap_or(g));
+        match (self.settings.recording.layout, game) {
+            (StorageLayout::PerGame, Some(game)) => {
+                let safe: String = game
+                    .chars()
+                    .map(|c| if r#"<>:"/\|?*"#.contains(c) || c.is_control() { '_' } else { c })
+                    .collect();
+                self.output_dir.join(safe.trim()).join(kind)
+            }
+            _ => self.output_dir.clone(),
+        }
+    }
+
     /// Starts a recording into a new file in the output folder. Packets reach it through the
     /// spool, which an IO thread drains into the file (P3.21). The DVR keeps buffering.
     fn start_recording(&mut self, label: &str) {
@@ -1557,7 +1573,7 @@ impl Actor {
         // Recordings stream at the encode bitrate. Pacing is for DVR dumps, which come in bursts.
         let cfg = OutputConfig {
             pacer: WritePacer::unlimited(),
-            ..OutputConfig::from_settings(&self.settings, self.output_dir.clone(), self.drive)
+            ..OutputConfig::from_settings(&self.settings, self.media_dir("Recordings"), self.drive)
         };
         let (partial, container) = match output::create_recording(&cfg, &tracks, label) {
             Ok(created) => created,
@@ -1721,7 +1737,7 @@ impl Actor {
             .chain(self.audio_tracks.iter().filter(|t| !silent.contains(&t.track)).cloned())
             .collect();
         let mut cfg =
-            OutputConfig::from_settings(&self.settings, self.output_dir.clone(), self.drive);
+            OutputConfig::from_settings(&self.settings, self.media_dir("Clips"), self.drive);
         if self.pace_dumps {
             let hdd_rate = u64::from(self.settings.storage.hdd_write_mb_per_sec) * 1_000_000;
             cfg.pacer = WritePacer::limited(hdd_rate);

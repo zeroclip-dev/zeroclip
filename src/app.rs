@@ -648,27 +648,44 @@ fn spawn_repair(dir: PathBuf, result: mpsc::Sender<StartupScan>, wake: async_cha
     }
 }
 
+const MAX_SCAN_DEPTH: usize = 4;
+
 /// One pass over `dir`: repairs every `*.partial` file (D18, one notice per file) and collects
 /// the `recovery-*.tmp` files for the rescue prompt. A folder that doesn't exist yet has nothing.
 fn startup_scan(dir: &Path) -> StartupScan {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) => {
-            if error.kind() != io::ErrorKind::NotFound {
-                tracing::warn!(%error, dir = %dir.display(), "startup repair can't read the output folder");
-            }
-            return StartupScan::default();
-        }
-    };
     let mut scan = StartupScan::default();
-    for path in entries.flatten().map(|entry| entry.path()).filter(|p| p.is_file()) {
+    if let Err(error) = walk_startup_scan(dir, 0, &mut scan)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(%error, dir = %dir.display(), "startup repair can't read the output folder");
+    }
+    scan
+}
+
+/// Walks `dir` up to `MAX_SCAN_DEPTH` sub-folders deep for partial and rescue files.
+fn walk_startup_scan(dir: &Path, depth: usize, scan: &mut StartupScan) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
+            if depth < MAX_SCAN_DEPTH {
+                let _ = walk_startup_scan(&path, depth + 1, scan);
+            }
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
         if path.extension().is_some_and(|ext| ext == "partial") {
             scan.notices.push(repair_notice(&path));
         } else if ui::rescue::kept_name(&path).is_some() {
             scan.rescues.push(path);
         }
     }
-    scan
+    Ok(())
 }
 
 /// Repairs one `.partial` file and words the outcome for the activity feed.
@@ -726,5 +743,31 @@ mod tests {
         assert!(notices[0].text.contains("broken.mp4.partial"), "{}", notices[0].text);
         assert_eq!(scan.rescues, vec![dir.join("recovery-9.mp4.tmp")]);
         assert!(missing.notices.is_empty() && missing.rescues.is_empty());
+    }
+
+    #[test]
+    fn startup_scan_recurses_subfolders_up_to_depth_limit() {
+        let dir = std::env::temp_dir().join(format!("zc-app-repair-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sub = dir.join("Clips").join("Valorant");
+        let d4 = dir.join("a").join("b").join("c").join("d");
+        let d5 = d4.join("e");
+        let hidden = dir.join(".hidden");
+        for d in [&sub, &d4, &d5, &hidden] {
+            std::fs::create_dir_all(d).expect("scratch dir");
+        }
+        std::fs::write(sub.join("nested.mp4.partial"), b"not a recording").expect("nested partial");
+        std::fs::write(sub.join("recovery-2.mp4.tmp"), b"x").expect("nested rescue");
+        std::fs::write(d4.join("d4.mp4.partial"), b"not a recording").expect("d4 partial");
+        std::fs::write(d5.join("d5.mp4.partial"), b"not a recording").expect("d5 partial");
+        std::fs::write(hidden.join("h.mp4.partial"), b"not a recording").expect("hidden partial");
+
+        let scan = startup_scan(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(scan.notices.len(), 2);
+        assert!(scan.notices.iter().any(|n| n.text.contains("nested.mp4.partial")));
+        assert!(scan.notices.iter().any(|n| n.text.contains("d4.mp4.partial")));
+        assert_eq!(scan.rescues, vec![sub.join("recovery-2.mp4.tmp")]);
     }
 }

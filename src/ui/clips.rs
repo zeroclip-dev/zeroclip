@@ -27,6 +27,7 @@ use crate::app::{NoticeLevel, ZeroClipApp};
 const CARD_W: f32 = 220.0;
 
 const EXTENSIONS: &[&str] = &["mp4", "mkv", "png", "jpg"];
+const MAX_SCAN_DEPTH: usize = 4;
 
 #[derive(Debug, Default)]
 pub struct ClipList {
@@ -76,34 +77,49 @@ impl ClipList {
         self.scanned = true;
         self.files.clear();
         self.error = None;
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
+        match walk(dir, 0, &mut self.files) {
+            Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(e) => {
                 self.error = Some(format!("Couldn't read {}: {e}", dir.display()));
                 return;
             }
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let wanted = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)));
-            let Ok(meta) = entry.metadata() else { continue };
-            if wanted && meta.is_file() {
-                let game = zc_core::game_tag::load(&path);
-                self.files.push(ClipFile {
-                    name: entry.file_name().to_string_lossy().into_owned(),
-                    path,
-                    size_bytes: meta.len(),
-                    modified: meta.modified().ok(),
-                    game,
-                });
-            }
         }
         self.files.sort_by_key(|file| std::cmp::Reverse(file.modified));
     }
+}
+
+/// Walks `dir` up to `MAX_SCAN_DEPTH` sub-folders deep, pushing matching clips to `out`.
+fn walk(dir: &Path, depth: usize, out: &mut Vec<ClipFile>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
+            if depth < MAX_SCAN_DEPTH {
+                let _ = walk(&path, depth + 1, out);
+            }
+            continue;
+        }
+        let wanted = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)));
+        if wanted && meta.is_file() {
+            let game = zc_core::game_tag::load(&path);
+            out.push(ClipFile {
+                name: name.to_string_lossy().into_owned(),
+                path,
+                size_bytes: meta.len(),
+                modified: meta.modified().ok(),
+                game,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Which kinds of file the list shows.
@@ -941,5 +957,37 @@ mod tests {
         );
         assert_eq!(names(&filter_files(&files, Kind::Videos, "clutch", None)), ["Clutch.MP4"]);
         assert!(filter_files(&files, Kind::Screenshots, "ace", None).is_empty());
+    }
+
+    #[test]
+    fn rescan_walks_subfolders_skips_hidden_and_caps_depth() {
+        let root = std::env::temp_dir().join(format!("zc-clips-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let d1 = root.join("Valorant");
+        let d4 = root.join("a").join("b").join("c").join("d");
+        let d5 = d4.join("e");
+        let hidden = root.join(".hidden");
+        for d in [&d1, &d4, &d5, &hidden] {
+            std::fs::create_dir_all(d).expect("create dir");
+        }
+        std::fs::write(root.join("top.mp4"), b"1").expect("top");
+        std::fs::write(root.join(".dot.mp4"), b"1").expect("dot file");
+        std::fs::write(d1.join("sub.mkv"), b"1").expect("sub");
+        std::fs::write(d4.join("depth4.png"), b"1").expect("depth4");
+        std::fs::write(d5.join("too_deep.mp4"), b"1").expect("depth5");
+        std::fs::write(hidden.join("secret.mp4"), b"1").expect("hidden");
+
+        let mut list = ClipList::default();
+        list.rescan(&root);
+        let mut found: Vec<String> = list.files.iter().map(|f| f.name.clone()).collect();
+        found.sort();
+
+        let mut missing = ClipList::default();
+        missing.rescan(&root.join("does-not-exist"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(found, ["depth4.png", "sub.mkv", "top.mp4"]);
+        assert!(list.error.is_none());
+        assert!(missing.files.is_empty() && missing.error.is_none());
     }
 }
