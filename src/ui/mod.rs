@@ -8,14 +8,21 @@ pub mod home;
 pub mod profiles;
 pub mod rescue;
 pub mod settings;
+pub mod simple;
 pub mod theme;
 
-use gpui::{Context, IntoElement, ParentElement, StatefulInteractiveElement, Styled, div, rgb};
+use gpui::{
+    Context, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, rgb,
+};
 use zc_core::Hns;
 use zc_core::media::Codec;
+use zc_core::settings::UiMode;
 
 use crate::app::{Tab, ZeroClipApp};
-use components::{mic_indicator::mic_indicator, status_dot::status_dot, tab_button::tab_button};
+use components::{
+    mic_indicator::mic_indicator, segmented::segmented, status_dot::status_dot,
+    tab_button::tab_button,
+};
 
 const RED: u32 = theme::DANGER;
 const GREEN: u32 = theme::BRAND;
@@ -31,7 +38,10 @@ pub fn shell(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoEleme
         .child(top_bar(app, cx))
         .children(focus_prompt::banner(app, cx))
         .children(rescue::banner(app, cx))
-        .child(div().flex_1().min_h_0().overflow_hidden().child(app.screens.view(app.tab)))
+        .child(div().flex_1().min_h_0().overflow_hidden().child(match app.settings.ui_mode {
+            UiMode::Simple => simple::screen(app, cx).into_any_element(),
+            UiMode::Advanced => app.screens.view(app.tab).into_any_element(),
+        }))
         .child(status_bar(app))
 }
 
@@ -55,12 +65,17 @@ fn top_bar(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoElement
         .px_3()
         .py_2()
         .child(div().text_xl().font_weight(gpui::FontWeight::BOLD).mr_4().child("ZeroClip"))
-        .children(Tab::ALL.map(|tab| {
-            tab_button(tab.label(), app.tab == tab).on_click(cx.listener(move |app, _, _, cx| {
-                app.tab = tab;
-                cx.notify();
-            }))
-        }))
+        .children(Tab::ALL.into_iter().filter(|_| app.settings.ui_mode == UiMode::Advanced).map(
+            |tab| {
+                tab_button(tab.label(), app.tab == tab).on_click(cx.listener(
+                    move |app, _, _, cx| {
+                        app.tab = tab;
+                        cx.notify();
+                    },
+                ))
+            },
+        ))
+        .child(mode_switch(app, cx))
         .child(
             div()
                 .ml_auto()
@@ -95,6 +110,26 @@ fn status_bar(app: &ZeroClipApp) -> impl IntoElement {
         .child(format!("Game: {}", status.game.as_deref().unwrap_or("none")))
         .children(mic_indicator(status.mic))
         .child(div().ml_auto().child(concat!("v", env!("CARGO_PKG_VERSION"))))
+}
+
+/// The Simple | Advanced switch in the header.
+fn mode_switch(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoElement {
+    let options = vec![SharedString::from("Simple"), SharedString::from("Advanced")];
+    let selected = match app.settings.ui_mode {
+        UiMode::Simple => 0,
+        UiMode::Advanced => 1,
+    };
+    segmented(
+        "ui-mode",
+        options,
+        Some(selected),
+        true,
+        cx.listener(|app, ix: &usize, _, cx| {
+            let mode = if *ix == 0 { UiMode::Simple } else { UiMode::Advanced };
+            app.set_ui_mode(mode);
+            cx.notify();
+        }),
+    )
 }
 
 /// "45 s", "2 min", "1 min 30 s".

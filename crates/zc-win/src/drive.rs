@@ -5,7 +5,7 @@ use std::ptr;
 
 use windows::Win32::Foundation::{ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDiskFreeSpaceExW,
     GetVolumeNameForVolumeMountPointW, GetVolumePathNameW, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::DeviceIoControl;
@@ -41,6 +41,23 @@ pub fn seek_penalty(path: &Path) -> Result<Option<bool>, SourceError> {
     // Closed when `handle` drops, on every path out of this function.
     let handle = open_volume(&volume)?;
     query_seek_penalty(*handle)
+}
+
+/// Bytes free to this user on the volume holding `dir`, which must exist. Simple mode's space
+/// check uses it. No access rights are needed.
+///
+/// # Errors
+/// If Windows can't read the volume.
+pub fn free_bytes(dir: &Path) -> Result<u64, SourceError> {
+    let mut available = 0_u64;
+    // SAFETY: `available` is a writable u64 that lives for the call. The total and free-total
+    // out pointers are optional and passed as None. The HSTRING holds a nul-terminated copy of
+    // `dir` for the call.
+    unsafe {
+        GetDiskFreeSpaceExW(&HSTRING::from(dir), Some(&mut available as *mut u64), None, None)
+    }
+    .context("GetDiskFreeSpaceExW")?;
+    Ok(available)
 }
 
 /// The volume GUID path (`\\?\Volume{...}`) of the volume holding `path`, nul-terminated.
