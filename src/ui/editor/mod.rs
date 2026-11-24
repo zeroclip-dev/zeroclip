@@ -9,7 +9,7 @@
 //! the job updates the view when the job returns.
 
 mod export;
-mod model;
+pub(crate) mod model;
 pub mod player;
 
 use std::cell::{Cell, RefCell};

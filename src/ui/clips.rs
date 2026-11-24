@@ -313,6 +313,30 @@ fn thumb_file_name(file: &ClipFile) -> String {
     format!("{hash:016x}.jpg")
 }
 
+/// Rewrites `clip` as a plain MP4 at `to`: index up front, the video and the Master audio only.
+/// Recordings are fragmented so a crash can't corrupt them, but VLC and Windows Media Player
+/// mishandle seeking in those, and in files with several audio tracks.
+pub fn remux_plain(ffmpeg_path: Option<&Path>, clip: &Path, to: &Path) -> Result<(), String> {
+    let ffmpeg = Ffmpeg::locate(ffmpeg_path).map_err(|e| e.to_string())?;
+    let result = ffmpeg.remux_for_export(clip, to).map_err(|e| e.to_string());
+    if result.is_err() || std::fs::metadata(to).map_or(true, |m| m.len() == 0) {
+        let _ = std::fs::remove_file(to);
+        return result.and(Err("ffmpeg wrote nothing".into()));
+    }
+    Ok(())
+}
+
+/// Replaces `clip` with its plain-MP4 remux. The original stays if anything goes wrong, and
+/// when something else (the player) holds it open.
+pub fn make_plain_in_place(ffmpeg_path: Option<&Path>, clip: &Path) -> Result<(), String> {
+    let tmp = clip.with_extension("zc-plain.mp4");
+    remux_plain(ffmpeg_path, clip, &tmp)?;
+    std::fs::rename(&tmp, clip).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("couldn't replace {}: {e}", clip.display())
+    })
+}
+
 /// Writes the thumbnail for `clip` to `thumb`. Returns whether the file now exists.
 fn make_thumbnail(ffmpeg_path: Option<&Path>, clip: &Path, thumb: &Path) -> bool {
     let Ok(ffmpeg) = Ffmpeg::locate(ffmpeg_path) else { return false };
