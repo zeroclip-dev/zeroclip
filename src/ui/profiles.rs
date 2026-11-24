@@ -10,7 +10,7 @@ use zc_core::Hns;
 use zc_core::profile::{GameProfile, ProfileSet, exe_name};
 use zc_core::settings::MAX_APP_TRACKS;
 
-use super::components::button::{button, button_primary_if};
+use super::components::button::{button, button_ghost, button_primary, button_primary_if};
 use super::components::exe_icon;
 use super::components::open_apps::{
     has_live_track, same_exe, set_audio_track, set_game_profile, track_slot_free,
@@ -95,6 +95,11 @@ fn secs_label(secs: u32) -> String {
 
 fn label(text: &'static str) -> gpui::Div {
     div().text_xs().text_color(rgb(MUTED)).child(text)
+}
+
+/// A labelled column of a profile card: a small caption, then what it controls.
+fn block(title: &'static str) -> gpui::Div {
+    div().flex().flex_col().gap_2().child(label(title))
 }
 
 /// Buffer lengths offered by the dropdown, in seconds.
@@ -320,7 +325,10 @@ impl Render for ProfilesView {
                     file.is_file()
                 });
             let name: AnyElement = if i == 0 {
-                div().w(px(140.0)).flex_none().child("Any other game").into_any_element()
+                div()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("Any other game")
+                    .into_any_element()
             } else {
                 let handle = self.fields[i - 1].clone();
                 let focused = handle.is_focused(window);
@@ -329,8 +337,8 @@ impl Render for ProfilesView {
                 div()
                     .id(("exe", i))
                     .track_focus(&handle)
-                    .w(px(140.0))
-                    .flex_none()
+                    .w(px(240.0))
+                    .max_w_full()
                     .px_2()
                     .py_1()
                     .rounded(px(theme::RADIUS_MD))
@@ -377,97 +385,132 @@ impl Render for ProfilesView {
                     .into_any_element()
             };
             let session = profile.session_recording;
+            let icon_el = div()
+                .size(px(32.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(theme::RADIUS_MD))
+                .bg(rgb(FIELD))
+                .child(match icon {
+                    Some(file) => exe_icon::view(file).into_any_element(),
+                    // No icon yet: the game has not run while ZeroClip was open.
+                    None => super::icons::icon("gamepad-2", MUTED).into_any_element(),
+                });
+            let remove: AnyElement = if i == 0 {
+                div().into_any_element()
+            } else {
+                button_ghost(("remove", i), "Remove")
+                    .flex_none()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.fields.remove(i - 1);
+                        this.edit(cx, |app| {
+                            app.draft.settings.profiles.games.remove(i - 1);
+                        });
+                    }))
+                    .into_any_element()
+            };
+            let caption = if i == 0 {
+                "Used for any game without its own profile"
+            } else {
+                "Matched by the name of the game's program"
+            };
+            let head = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .child(icon_el)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(name)
+                        .child(div().text_xs().text_color(rgb(MUTED)).child(caption)),
+                )
+                .child(remove);
+            let buffer = block("Keep the last")
+                .flex_1()
+                .min_w(px(300.0))
+                .child(duration_control(
+                    i,
+                    profile.buffer_secs,
+                    &self.sliders[i],
+                    MenuArgs {
+                        open: self.menu == Some(i),
+                        custom: self.custom.clone(),
+                        custom_focus: self.custom_focus.clone(),
+                        custom_focused: self.custom_focus.is_focused(window),
+                    },
+                    cx,
+                ))
+                .child(div().text_xs().child(memory_note(
+                    profile.buffer_secs,
+                    max_kbps,
+                    ceiling_mb,
+                )));
+            let session_block = block("Whole session")
+                .w(px(220.0))
+                .flex_none()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(toggle(("session", i), session, true).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.edit(cx, |app| {
+                                    let p = profile_mut(&mut app.draft.settings.profiles, i);
+                                    p.session_recording = !p.session_recording;
+                                });
+                            },
+                        )))
+                        .child(div().text_sm().child(if session { "Recorded" } else { "Off" })),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child("Keep the full session on disk, not only saved clips"),
+                );
             rows.push(
                 div()
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_3()
-                    .px_3()
-                    .py_2()
+                    .flex_col()
+                    .gap_4()
+                    .p_4()
                     .rounded(px(theme::RADIUS))
                     .border_1()
                     .border_color(rgb(theme::BORDER))
                     .bg(rgb(SURFACE))
+                    .child(head)
                     .child(
                         div()
-                            .w(px(24.0))
-                            .h(px(24.0))
-                            .flex_none()
                             .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(match icon {
-                                Some(file) => exe_icon::view(file).into_any_element(),
-                                // No icon yet: the game has not run while ZeroClip was open.
-                                None => super::icons::icon("gamepad-2", MUTED).into_any_element(),
-                            }),
+                            .flex_row()
+                            .flex_wrap()
+                            .items_start()
+                            .gap_x_6()
+                            .gap_y_4()
+                            .child(buffer)
+                            .child(session_block),
                     )
-                    .child(name)
-                    .child(duration_control(
-                        i,
-                        profile.buffer_secs,
-                        &self.sliders[i],
-                        MenuArgs {
-                            open: self.menu == Some(i),
-                            custom: self.custom.clone(),
-                            custom_focus: self.custom_focus.clone(),
-                            custom_focused: self.custom_focus.is_focused(window),
-                        },
-                        cx,
-                    ))
-                    .child(div().w(px(60.0)).child(toggle(("session", i), session, true).on_click(
-                        cx.listener(move |this, _, _, cx| {
-                            this.edit(cx, |app| {
-                                let p = profile_mut(&mut app.draft.settings.profiles, i);
-                                p.session_recording = !p.session_recording;
-                            });
-                        }),
-                    )))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(96.0))
-                            .text_sm()
-                            .child(memory_note(profile.buffer_secs, max_kbps, ceiling_mb))
-                            // Only the first row for an exe is used, so a repeat is a mistake.
-                            .when(is_duplicate(&profiles, i), |d| {
-                                d.child(
-                                    div()
-                                        .text_color(rgb(WARN))
-                                        .child("Same game as a row above, this one is ignored"),
-                                )
-                            }),
-                    )
-                    .child(if i == 0 {
-                        div().w(px(88.0)).into_any_element()
-                    } else {
-                        button(("remove", i), "Remove")
-                            .w(px(88.0))
-                            .flex_none()
-                            .text_sm()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.fields.remove(i - 1);
-                                this.edit(cx, |app| {
-                                    app.draft.settings.profiles.games.remove(i - 1);
-                                });
-                            }))
-                            .into_any_element()
+                    // Only the first row for an exe is used, so a repeat is a mistake.
+                    .when(is_duplicate(&profiles, i), |d| {
+                        d.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(WARN))
+                                .child("Same game as a row above, this one is ignored"),
+                        )
                     })
                     .into_any_element(),
             );
         }
-
-        let header = div()
-            .flex()
-            .flex_row()
-            .gap_3()
-            .px_3()
-            .child(div().w(px(24.0)).flex_none())
-            .child(div().w(px(140.0)).child(label("Executable")))
-            .child(div().w(px(244.0)).child(label("DVR buffer")))
-            .child(div().w(px(60.0)).child(label("Session")))
-            .child(div().flex_1().child(label("Memory at max bitrate")));
 
         let apps = self.open_apps_section(&app_entity, &profiles, &tracks, cx);
 
@@ -485,34 +528,48 @@ impl Render for ProfilesView {
                     .py_3()
                     .flex()
                     .flex_col()
-                    .gap_2()
+                    .gap_3()
                     .child(
                         div()
-                            .text_xl()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child("Game profiles"),
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(280.0))
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_xl()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .child("Game profiles"),
+                                    )
+                                    .child(div().text_sm().text_color(rgb(MUTED)).child(
+                                        "How much footage to keep, and whether to record the whole \
+                                         session, per game.",
+                                    )),
+                            )
+                            .child(button_primary("add_game", "Add game").on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.edit(cx, |app| {
+                                        app.draft.settings.profiles.games.push(GameProfile {
+                                            exe: String::new(),
+                                            buffer_secs: 60,
+                                            session_recording: false,
+                                        });
+                                    });
+                                    // Put the cursor in the new row's field.
+                                    let handle = cx.focus_handle();
+                                    window.focus(&handle, cx);
+                                    this.fields.push(handle);
+                                },
+                            ))),
                     )
-                    .child(div().text_sm().text_color(rgb(MUTED)).mb_2().child(
-                        "How much footage to keep, and whether to record the whole session, \
-                         per game. Games without a profile use the first row.",
-                    ))
-                    .child(header)
                     .children(rows)
-                    .child(div().mt_1().child(button("add_game", "Add game").w(px(96.0)).on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.edit(cx, |app| {
-                                app.draft.settings.profiles.games.push(GameProfile {
-                                    exe: String::new(),
-                                    buffer_secs: 60,
-                                    session_recording: false,
-                                });
-                            });
-                            // Put the cursor in the new row's field.
-                            let handle = cx.focus_handle();
-                            window.focus(&handle, cx);
-                            this.fields.push(handle);
-                        }),
-                    )))
                     .child(apps),
             )
             .child(save_bar(dirty, problems, cx))
@@ -589,7 +646,7 @@ impl ProfilesView {
                     .flex_row()
                     .items_center()
                     .justify_between()
-                    .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child("Open apps"))
+                    .child(div().text_lg().font_weight(gpui::FontWeight::SEMIBOLD).child("Running now"))
                     .child(button("refresh_apps", "Refresh").text_sm().on_click(cx.listener(
                         |this, _, _, cx| {
                             this.edit(cx, |app| app.open_apps.refresh());
@@ -597,7 +654,7 @@ impl ProfilesView {
                     ))),
             )
             .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                "Game makes an app a profile. Audio track records it on its own track (up to {MAX_APP_TRACKS})."
+                "Turn on Profile to give an app its own settings. Turn on Audio track to record its sound on a separate track (up to {MAX_APP_TRACKS})."
             )))
             .child(
                 div()
@@ -607,7 +664,7 @@ impl ProfilesView {
                     .px_3()
                     .child(div().w(px(160.0)).child(label("App")))
                     .child(div().flex_1().child(label("Window")))
-                    .child(div().w(px(60.0)).child(label("Game")))
+                    .child(div().w(px(60.0)).child(label("Profile")))
                     .child(div().w(px(60.0)).child(label("Audio track"))),
             )
             .children(if rows.is_empty() {
