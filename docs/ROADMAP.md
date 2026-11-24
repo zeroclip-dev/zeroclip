@@ -101,7 +101,7 @@ Measured 2026-10-05 with `spike-phase2`: every track within ±11 ms of its minut
 ## Phase 5 — Editor
 
 - [ ] Keyframe thumbnail strip; preview in an external player (D22)
-- [ ] Specs: `snap_in_point`, `check_compatible`, `rms_peaks`
+- [x] Specs: `snap_in_point`, `check_compatible`, `rms_peaks`
 - [ ] `zc-editor::ffmpeg` jobs; trim with visible snap points; stitch; export remux
 - [ ] Waveform extraction on a background task, cached by file hash
 
