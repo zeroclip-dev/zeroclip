@@ -30,17 +30,17 @@ const EXTENSIONS: &[&str] = &["mp4", "mkv", "png", "jpg"];
 
 #[derive(Debug, Default)]
 pub struct ClipList {
-    files: Vec<ClipFile>,
+    pub files: Vec<ClipFile>,
     scanned: bool,
     error: Option<String>,
 }
 
-#[derive(Debug)]
-struct ClipFile {
-    name: String,
-    path: PathBuf,
-    size_bytes: u64,
-    modified: Option<SystemTime>,
+#[derive(Clone, Debug)]
+pub struct ClipFile {
+    pub name: String,
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub modified: Option<SystemTime>,
 }
 
 impl ClipList {
@@ -63,6 +63,11 @@ impl ClipList {
             .filter(|f| Kind::Videos.accepts(&f.name))
             .map(|f| (f.name.clone(), f.path.clone()))
             .collect()
+    }
+
+    /// The newest `n` videos.
+    pub fn recent_videos(&self, n: usize) -> impl Iterator<Item = &ClipFile> {
+        self.files.iter().filter(|f| Kind::Videos.accepts(&f.name)).take(n)
     }
 
     fn rescan(&mut self, dir: &Path) {
@@ -99,7 +104,7 @@ impl ClipList {
 
 /// Which kinds of file the list shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Kind {
+pub enum Kind {
     #[default]
     All,
     Videos,
@@ -118,7 +123,7 @@ impl Kind {
     }
 
     /// mp4 and mkv are videos; everything else the list shows (png, jpg) is a screenshot.
-    fn accepts(self, name: &str) -> bool {
+    pub fn accepts(self, name: &str) -> bool {
         let ext = Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("");
         let is_video = ext.eq_ignore_ascii_case("mp4") || ext.eq_ignore_ascii_case("mkv");
         match self {
@@ -160,10 +165,71 @@ pub struct ClipsView {
     drag_from: Option<(PathBuf, Point<Pixels>)>,
     /// Cards in a grid instead of rows in a list.
     grid: bool,
+    thumbs: Thumbs,
+}
+
+/// Thumbnails of the clips: which exist, and the background job that makes the missing ones. Shared
+/// by every screen that shows clip pictures.
+#[derive(Default)]
+pub struct Thumbs {
     /// Thumbnail files known to exist.
-    thumbs_ready: HashSet<PathBuf>,
+    ready: HashSet<PathBuf>,
     /// Thumbnails already asked for, so a failed one is not retried on every frame.
-    thumbs_pending: HashSet<PathBuf>,
+    pending: HashSet<PathBuf>,
+}
+
+impl Thumbs {
+    /// The picture of `file` if it has been made.
+    pub fn get(&self, dir: &Path, file: &ClipFile) -> Option<PathBuf> {
+        Some(dir.join(thumb_file_name(file))).filter(|t| self.ready.contains(t))
+    }
+
+    /// Starts making the missing thumbnails of the `files` that are videos, one ffmpeg at a time so
+    /// a big folder doesn't start hundreds of processes, repainting `V` as each one lands.
+    /// `of` finds these thumbnails inside the view.
+    pub fn ensure<'a, V: 'static>(
+        &mut self,
+        files: impl Iterator<Item = &'a ClipFile>,
+        dir: &Path,
+        ffmpeg_path: Option<PathBuf>,
+        of: fn(&mut V) -> &mut Thumbs,
+        cx: &mut Context<V>,
+    ) {
+        let mut todo = Vec::new();
+        for file in files.filter(|f| Kind::Videos.accepts(&f.name)) {
+            let thumb = dir.join(thumb_file_name(file));
+            if self.ready.contains(&thumb) || self.pending.contains(&thumb) {
+                continue;
+            }
+            if thumb.is_file() {
+                self.ready.insert(thumb);
+            } else {
+                self.pending.insert(thumb.clone());
+                todo.push((file.path.clone(), thumb));
+            }
+        }
+        if todo.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            for (clip, thumb) in todo {
+                let ffmpeg_path = ffmpeg_path.clone();
+                let made = cx
+                    .background_executor()
+                    .spawn(async move {
+                        make_thumbnail(ffmpeg_path.as_deref(), &clip, &thumb).then_some(thumb)
+                    })
+                    .await;
+                if let Some(thumb) = made {
+                    let _ = this.update(cx, |this, cx| {
+                        of(this).ready.insert(thumb);
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
 }
 
 impl ClipsView {
@@ -177,43 +243,8 @@ impl ClipsView {
             renaming: None,
             drag_from: None,
             grid: true,
-            thumbs_ready: HashSet::new(),
-            thumbs_pending: HashSet::new(),
+            thumbs: Thumbs::default(),
         }
-    }
-
-    /// Makes the missing thumbnails one after another in the background (one ffmpeg at a time, so
-    /// a big folder doesn't start hundreds of processes) and repaints as each one lands.
-    fn request_thumbs(
-        &mut self,
-        todo: Vec<(PathBuf, PathBuf)>,
-        ffmpeg_path: Option<PathBuf>,
-        cx: &mut Context<Self>,
-    ) {
-        if todo.is_empty() {
-            return;
-        }
-        for (_, thumb) in &todo {
-            self.thumbs_pending.insert(thumb.clone());
-        }
-        cx.spawn(async move |this, cx| {
-            for (clip, thumb) in todo {
-                let ffmpeg_path = ffmpeg_path.clone();
-                let made = cx
-                    .background_executor()
-                    .spawn(async move {
-                        make_thumbnail(ffmpeg_path.as_deref(), &clip, &thumb).then_some(thumb)
-                    })
-                    .await;
-                if let Some(thumb) = made {
-                    let _ = this.update(cx, |this, cx| {
-                        this.thumbs_ready.insert(thumb);
-                        cx.notify();
-                    });
-                }
-            }
-        })
-        .detach();
     }
 
     /// Renames the file being edited, keeping its extension. A problem stays in the rename bar.
@@ -313,7 +344,7 @@ fn renamed_path(path: &Path, stem: &str) -> Result<PathBuf, String> {
 }
 
 /// The small picture at the start of a row. `source` is the image file, if there is one yet.
-fn thumb_box(source: Option<PathBuf>, w: f32, h: f32) -> gpui::Div {
+pub fn thumb_box(source: Option<PathBuf>, w: f32, h: f32) -> gpui::Div {
     let frame = div()
         .w(px(w))
         .h(px(h))
@@ -382,26 +413,16 @@ impl Render for ClipsView {
             )
         };
         if let Some(thumb_dir) = &thumb_dir {
-            let wanted: Vec<(PathBuf, PathBuf)> = entity
-                .read(cx)
-                .clips
-                .files
-                .iter()
-                .filter(|f| Kind::Videos.accepts(&f.name))
-                .map(|f| (f.path.clone(), thumb_dir.join(thumb_file_name(f))))
-                .collect();
-            let mut todo = Vec::new();
-            for (clip, thumb) in wanted {
-                if self.thumbs_ready.contains(&thumb) || self.thumbs_pending.contains(&thumb) {
-                    continue;
-                }
-                if thumb.is_file() {
-                    self.thumbs_ready.insert(thumb);
-                } else {
-                    todo.push((clip, thumb));
-                }
-            }
-            self.request_thumbs(todo, ffmpeg_path, cx);
+            let mut thumbs = std::mem::take(&mut self.thumbs);
+            let files = entity.read(cx).clips.files.clone();
+            thumbs.ensure(
+                files.iter(),
+                thumb_dir,
+                ffmpeg_path,
+                |this: &mut Self| &mut this.thumbs,
+                cx,
+            );
+            self.thumbs = thumbs;
         }
 
         let clips = &entity.read(cx).clips;
@@ -518,10 +539,7 @@ impl Render for ClipsView {
                 };
                 // A video shows its frame once ffmpeg has made it; a screenshot is its own picture.
                 let thumb = if is_video {
-                    thumb_dir
-                        .as_ref()
-                        .map(|dir| dir.join(thumb_file_name(file)))
-                        .filter(|thumb| self.thumbs_ready.contains(thumb))
+                    thumb_dir.as_ref().and_then(|dir| self.thumbs.get(dir, file))
                 } else {
                     Some(file.path.clone())
                 };
@@ -742,7 +760,7 @@ fn table_row(
         .child(div().w(px(150.)).flex().justify_end().children(action))
 }
 
-fn age(when: SystemTime) -> String {
+pub fn age(when: SystemTime) -> String {
     let secs = SystemTime::now().duration_since(when).map_or(0, |d| d.as_secs());
     match secs {
         0..60 => "just now".to_owned(),
