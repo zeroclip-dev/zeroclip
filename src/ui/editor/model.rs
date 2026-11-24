@@ -737,7 +737,8 @@ mod tests {
         let plan = plan_piece(&t.pieces[1], secs(20), &keyframes(), 96_000).unwrap();
         assert_eq!(plan.trim, Some((secs(6), secs(20))));
         assert_eq!(plan.tracks[0].edit, AudioEdit::Gain { db: 3.0 });
-        assert_eq!(plan.tracks[1].edit, AudioEdit::Mute);
+        // Only Master is exported, so the muted second track is left out.
+        assert_eq!(plan.tracks.len(), 1);
         assert!(plan.has_audio_edits());
     }
 
