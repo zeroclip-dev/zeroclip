@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use zc_core::media::Codec;
 use zc_editor::concat::{StreamInfo, check_compatible};
 use zc_editor::ffmpeg::Ffmpeg;
 
@@ -18,20 +19,28 @@ struct Made {
 
 /// Makes one piece into a file next to `output`. A piece that is the whole clip with no edits is
 /// the source file itself.
+///
+/// `exact` is the video codec when the video is re-encoded to start on the exact frame.
 fn make(
     ffmpeg: &Ffmpeg,
     plan: &PiecePlan,
     source: &Path,
     output: &Path,
     tag: &str,
+    exact: Option<Codec>,
 ) -> Result<Made> {
-    let trimmed = match plan.trim {
-        Some((start, end)) => {
+    let trimmed = match (exact, plan.trim) {
+        (Some(codec), _) => {
+            let path = scratch_name(output, &format!("{tag}t"));
+            ffmpeg.trim_exact(source, plan.range.0, plan.range.1, &path, codec)?;
+            Made { path, scratch: true }
+        }
+        (None, Some((start, end))) => {
             let path = scratch_name(output, &format!("{tag}t"));
             ffmpeg.trim(source, start, end, &path)?;
             Made { path, scratch: true }
         }
-        None => Made { path: source.to_owned(), scratch: false },
+        (None, None) => Made { path: source.to_owned(), scratch: false },
     };
     if !plan.has_audio_edits() {
         return Ok(trimmed);
@@ -60,8 +69,12 @@ pub fn run(
     let started = Instant::now();
     let mut made: Vec<Made> = Vec::new();
     let result = (|| {
+        // One piece off a keyframe re-encodes every piece's video the same way, so the joined
+        // file has one set of video parameters.
+        let exact = plans.iter().any(|p| p.reencode);
         for (n, plan) in plans.iter().enumerate() {
-            made.push(make(ffmpeg, plan, &sources[plan.source], output, &n.to_string())?);
+            let codec = exact.then(|| infos[plan.source].codec);
+            made.push(make(ffmpeg, plan, &sources[plan.source], output, &n.to_string(), codec)?);
         }
         match made.as_slice() {
             [] => anyhow::bail!("nothing to save"),
