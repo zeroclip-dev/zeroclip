@@ -6,6 +6,7 @@ pub mod components;
 pub mod focus_prompt;
 pub mod home;
 pub mod profiles;
+pub mod rescue;
 pub mod settings;
 pub mod theme;
 
@@ -29,6 +30,7 @@ pub fn shell(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoEleme
         .text_color(rgb(0xe6e6e6))
         .child(top_bar(app, cx))
         .children(focus_prompt::banner(app, cx))
+        .children(rescue::banner(app, cx))
         .child(div().flex_1().min_h_0().overflow_hidden().child(app.screens.view(app.tab)))
         .child(status_bar(app))
 }
