@@ -691,7 +691,13 @@ impl EditorView {
                     .child(number_stepper(
                         format!("gain-{i}"),
                         edit.gain_db,
-                        Stepper { min: -30.0, max: 12.0, step: 1.0, suffix: " dB", enabled: !edit.mute },
+                        Stepper {
+                            min: -30.0,
+                            max: 12.0,
+                            step: 1.0,
+                            suffix: " dB",
+                            enabled: !edit.mute,
+                        },
                         cx.listener(move |this, v: &f64, _, cx| {
                             let v = *v;
                             this.edit_track(i, cx, |e| e.gain_db = v);
@@ -707,15 +713,26 @@ impl EditorView {
                             this.edit_track(i, cx, |e| e.mute = on);
                         }),
                     ))
-                    .child(div().ml_auto().child(
-                        button_ghost(("cut-open", i), if open { "Hide cut" } else { "Cut a range" })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.edit_track(i, cx, |e| e.cut_open = !e.cut_open);
-                            })),
-                    )),
+                    .child(
+                        div().ml_auto().child(
+                            button_ghost(
+                                ("cut-open", i),
+                                if open { "Hide cut" } else { "Cut a range" },
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.edit_track(i, cx, |e| e.cut_open = !e.cut_open);
+                                },
+                            )),
+                        ),
+                    ),
             );
             if open {
-                let cut_field = |slot: usize, id: &'static str, value: &str, ph: &str, cx: &mut Context<Self>| {
+                let cut_field = |slot: usize,
+                                 id: &'static str,
+                                 value: &str,
+                                 ph: &str,
+                                 cx: &mut Context<Self>| {
                     text_field(
                         (id, i),
                         &self.focus[i * 2 + slot],
@@ -749,7 +766,8 @@ impl EditorView {
                             Some(usize::from(edit.cut_mode == CutMode::Remove)),
                             true,
                             cx.listener(move |this, ix: &usize, _, cx| {
-                                let mode = if *ix == 0 { CutMode::Silence } else { CutMode::Remove };
+                                let mode =
+                                    if *ix == 0 { CutMode::Silence } else { CutMode::Remove };
                                 this.edit_track(i, cx, |e| e.cut_mode = mode);
                             }),
                         )),
