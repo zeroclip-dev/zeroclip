@@ -15,7 +15,8 @@ use zc_audio::MicDevice;
 use zc_core::hotkey::Chord;
 use zc_core::media::{Codec, ContainerFormat};
 use zc_core::settings::{
-    AAC_BITRATES_KBPS, CaptureMode, DvrStorage, MIX_GAIN_DB, MicMode, Settings, UiMode,
+    AAC_BITRATES_KBPS, CaptureMode, DvrStorage, MIX_GAIN_DB, MicMode, Settings, StorageLayout,
+    UiMode,
 };
 use zc_video::capture::MonitorInfo;
 
@@ -527,19 +528,32 @@ impl Render for SettingsView {
             return page(view_switch(saved.ui_mode, cx), sections, bar);
         }
 
-        let recording = section("Recording").child(row("Output folder", f_out)).child(row(
-            "Container",
-            // Fragmented MP4 is the only container written (D18). A settings file that still
-            // says Matroska shows no chip selected, and Settings::problems blocks saving it.
-            segmented(
-                "container",
-                labels(["Fragmented MP4 (.mp4)"]),
-                (d.settings.recording.container == ContainerFormat::FragmentedMp4).then_some(0),
-                true,
-                bind!(cx, |d, _i: &usize| d.settings.recording.container =
-                    ContainerFormat::FragmentedMp4),
-            ),
-        ));
+        let recording = section("Recording")
+            .child(row("Output folder", f_out))
+            .child(row(
+                "Container",
+                // Fragmented MP4 is the only container written (D18). A settings file that still
+                // says Matroska shows no chip selected, and Settings::problems blocks saving it.
+                segmented(
+                    "container",
+                    labels(["Fragmented MP4 (.mp4)"]),
+                    (d.settings.recording.container == ContainerFormat::FragmentedMp4).then_some(0),
+                    true,
+                    bind!(cx, |d, _i: &usize| d.settings.recording.container =
+                        ContainerFormat::FragmentedMp4),
+                ),
+            ))
+            .child(row(
+                "Organise by game",
+                segmented(
+                    "layout",
+                    labels(["One folder", "Folder per game"]),
+                    Some(usize::from(d.settings.recording.layout == StorageLayout::PerGame)),
+                    true,
+                    bind!(cx, |d, i: &usize| d.settings.recording.layout =
+                        if *i == 1 { StorageLayout::PerGame } else { StorageLayout::Single }),
+                ),
+            ));
 
         let screen_on = video.capture_mode == CaptureMode::Screen;
         let mut monitor_opts = labels(["Primary display (default)"]);

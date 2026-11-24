@@ -201,6 +201,19 @@ pub struct RecordingSettings {
     pub output_dir: Option<PathBuf>,
     /// Container for recordings. Only fragmented MP4 is written (D18).
     pub container: ContainerFormat,
+    /// How files are laid out inside the output folder.
+    pub layout: StorageLayout,
+}
+
+/// How clips, recordings and screenshots are arranged in the output folder.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageLayout {
+    /// Everything in the output folder itself.
+    #[default]
+    Single,
+    /// `<folder>\<Game>\Clips`, `Recordings` and `Screenshots`. Without a game: the folder itself.
+    PerGame,
 }
 
 /// DVR buffer settings.
