@@ -149,6 +149,13 @@ pub trait AudioSource: Send {
         let _ = open;
     }
 
+    /// Whether this source made any sound in the last `window`. A clip leaves out the per-app
+    /// tracks that did not, so a closed or silent app has no track. Default: always.
+    fn audible_within(&self, window: Hns) -> bool {
+        let _ = window;
+        true
+    }
+
     /// Follows a new game: loopback capture of that process tree (include mode,
     /// DESIGN §6). `None` means no game has focus. Default: ignored.
     fn set_target_process(&mut self, pid: Option<u32>) {

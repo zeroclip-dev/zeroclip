@@ -1038,7 +1038,7 @@ impl Actor {
                 return;
             }
         };
-        let (tracks, cfg) = self.dump_output(video);
+        let (tracks, cfg) = self.dump_output(video, None);
         // Milliseconds, so two rescues never share a name. `create_new` still refuses a name in
         // use rather than overwrite an unanswered rescue.
         let unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
@@ -1658,7 +1658,7 @@ impl Actor {
     /// new `label` file, then reports `Msg::ClipWritten`. Returns whether the thread started; if
     /// not, the error has been reported.
     fn spawn_clip(&mut self, label: &'static str, window: Hns, video: TrackInfo) -> bool {
-        let (tracks, cfg) = self.dump_output(video);
+        let (tracks, cfg) = self.dump_output(video, Some(window));
         // The clip ends at the press. The Master mix trails real time (D30), so when it runs the
         // copy waits until the mix has reached that point.
         let end = self.recorder.video_end();
@@ -1678,9 +1678,21 @@ impl Actor {
 
     /// The tracks and output settings for a dump whose video track is `video`. Dumps come in
     /// bursts, so they are paced on a spinning disk, and always once the watchdog saw a slow one.
-    fn dump_output(&self, video: TrackInfo) -> (Vec<TrackInfo>, OutputConfig) {
-        let tracks: Vec<TrackInfo> =
-            std::iter::once(video).chain(self.audio_tracks.iter().cloned()).collect();
+    fn dump_output(&self, video: TrackInfo, window: Option<Hns>) -> (Vec<TrackInfo>, OutputConfig) {
+        // An app that made no sound in the clip's window gets no track. `None` keeps them all.
+        let silent: Vec<TrackId> = window
+            .map(|w| {
+                self.ports
+                    .app_audio
+                    .iter()
+                    .filter(|(_, source)| !source.audible_within(w))
+                    .map(|(_, source)| source.track())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let tracks: Vec<TrackInfo> = std::iter::once(video)
+            .chain(self.audio_tracks.iter().filter(|t| !silent.contains(&t.track)).cloned())
+            .collect();
         let mut cfg =
             OutputConfig::from_settings(&self.settings, self.output_dir.clone(), self.drive);
         if self.pace_dumps {
