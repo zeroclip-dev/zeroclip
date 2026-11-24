@@ -37,6 +37,11 @@ impl Screens {
         &self.editor
     }
 
+    /// The Clips view, so the clip menu can start a rename there.
+    pub fn clips(&self) -> &Entity<ClipsView> {
+        &self.clips
+    }
+
     /// The video player, so other screens can play a clip in it.
     pub fn player(&self) -> &Entity<VideoPlayerView> {
         &self.player

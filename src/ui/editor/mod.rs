@@ -1601,13 +1601,10 @@ impl EditorView {
             let piece = &self.timeline.pieces[i];
             let room = xd(gl) - xd(Hns::ZERO);
             let room_r = xd(gr) - xd(Hns::ZERO);
-            [
-                (x0 - room, x0, piece.a - gl, piece.a),
-                (x1, x1 + room_r, piece.b, piece.b + gr),
-            ]
-            .into_iter()
-            .filter(|(g0, g1, a, b)| g1 - g0 >= 2.0 && b > a)
-            .collect()
+            [(x0 - room, x0, piece.a - gl, piece.a), (x1, x1 + room_r, piece.b, piece.b + gr)]
+                .into_iter()
+                .filter(|(g0, g1, a, b)| g1 - g0 >= 2.0 && b > a)
+                .collect()
         };
 
         // Above the ruler: each piece's letter, its length and the extract button.
@@ -1882,8 +1879,8 @@ impl EditorView {
                             let columns =
                                 model::column_peaks(peaks, span, a, b, (gw / BAR_STEP) as usize);
                             let n = columns.len().max(1);
-                            ghost = ghost.children(columns.into_iter().enumerate().map(
-                                |(c, peak)| {
+                            ghost =
+                                ghost.children(columns.into_iter().enumerate().map(|(c, peak)| {
                                     let h = (peak.min(1.0).sqrt() * LANE_HEIGHT).max(1.0);
                                     div()
                                         .absolute()
@@ -1892,8 +1889,7 @@ impl EditorView {
                                         .w(px(2.))
                                         .h(px(h))
                                         .bg(rgb(theme::MUTED_FG))
-                                },
-                            ));
+                                }));
                         }
                         lane = lane.child(ghost);
                     }
