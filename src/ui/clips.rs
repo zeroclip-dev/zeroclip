@@ -5,12 +5,16 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use gpui::{
-    Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement, Render,
-    StatefulInteractiveElement as _, Styled, WeakEntity, Window, div, px, rgb,
+    Context, FocusHandle, FontWeight, InteractiveElement as _, IntoElement, ParentElement, Render,
+    SharedString, StatefulInteractiveElement as _, Styled, WeakEntity, Window, div, px, rgb,
 };
 
-use super::components::button::button;
-use super::{GRAY, RED};
+use super::components::{
+    button::{button, button_ghost},
+    segmented::segmented,
+    text_field::text_field,
+};
+use super::theme;
 use crate::app::{NoticeLevel, ZeroClipApp};
 
 const EXTENSIONS: &[&str] = &["mp4", "mkv", "png", "jpg"];
@@ -66,22 +70,69 @@ impl ClipList {
     }
 }
 
-/// The Clips screen: the folder listing with Refresh and Open folder.
+/// Which kinds of file the list shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Kind {
+    #[default]
+    All,
+    Videos,
+    Screenshots,
+}
+
+impl Kind {
+    const ALL: [Kind; 3] = [Kind::All, Kind::Videos, Kind::Screenshots];
+
+    fn label(self) -> &'static str {
+        match self {
+            Kind::All => "All",
+            Kind::Videos => "Videos",
+            Kind::Screenshots => "Screenshots",
+        }
+    }
+
+    /// mp4 and mkv are videos; everything else the list shows (png, jpg) is a screenshot.
+    fn accepts(self, name: &str) -> bool {
+        let ext = Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("");
+        let is_video = ext.eq_ignore_ascii_case("mp4") || ext.eq_ignore_ascii_case("mkv");
+        match self {
+            Kind::All => true,
+            Kind::Videos => is_video,
+            Kind::Screenshots => !is_video,
+        }
+    }
+}
+
+/// The files of `kind` whose name contains `query` (case-insensitive, surrounding spaces
+/// ignored), in the original order.
+fn filter_files<'a>(files: &'a [ClipFile], kind: Kind, query: &str) -> Vec<&'a ClipFile> {
+    let query = query.trim().to_lowercase();
+    files
+        .iter()
+        .filter(|f| kind.accepts(&f.name) && f.name.to_lowercase().contains(&query))
+        .collect()
+}
+
+/// The Clips screen: the folder listing with Refresh, Open folder, search and a kind filter.
 pub struct ClipsView {
     app: WeakEntity<ZeroClipApp>,
+    query: String,
+    kind: Kind,
+    /// Search box focus, made on the first render.
+    focus: Option<FocusHandle>,
 }
 
 impl ClipsView {
     pub fn new(app: WeakEntity<ZeroClipApp>) -> Self {
-        Self { app }
+        Self { app, query: String::new(), kind: Kind::All, focus: None }
     }
 }
 
 impl Render for ClipsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(entity) = self.app.upgrade() else {
             return div().into_any_element();
         };
+        let focus = self.focus.get_or_insert_with(|| cx.focus_handle()).clone();
         let dir = entity.read(cx).output_dir();
         // The listing lives on the app (other screens invalidate it), so it is re-read here,
         // lazily, the first time the tab is shown after a change.
@@ -91,17 +142,20 @@ impl Render for ClipsView {
             }
         });
         let clips = &entity.read(cx).clips;
+        let shown = filter_files(&clips.files, self.kind, &self.query);
 
         let header = div()
             .flex()
             .flex_row()
             .items_center()
-            .gap_3()
-            .child(div().text_xl().font_weight(FontWeight::BOLD).child("Clips"))
-            .child(button("clips-refresh", "Refresh").on_click(cx.listener(|this, _, _, cx| {
-                let _ = this.app.update(cx, |app, _| app.clips.invalidate());
-                cx.notify();
-            })))
+            .gap_2()
+            .child(div().flex_1().text_xl().font_weight(FontWeight::SEMIBOLD).child("Clips"))
+            .child(button_ghost("clips-refresh", "Refresh").on_click(cx.listener(
+                |this, _, _, cx| {
+                    let _ = this.app.update(cx, |app, _| app.clips.invalidate());
+                    cx.notify();
+                },
+            )))
             .child(button("clips-open", "Open folder").on_click({
                 let dir = dir.clone();
                 cx.listener(move |this, _, _, cx| {
@@ -117,27 +171,67 @@ impl Render for ClipsView {
                 })
             }));
 
+        let tools = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .child(text_field(
+                "clips-search",
+                &focus,
+                window,
+                &self.query,
+                "Search clips",
+                240.,
+                cx.listener(|this, v: &String, _, cx| {
+                    this.query = v.clone();
+                    cx.notify();
+                }),
+            ))
+            .child(segmented(
+                "clips-kind",
+                Kind::ALL.iter().map(|k| SharedString::from(k.label())).collect(),
+                Kind::ALL.iter().position(|k| *k == self.kind),
+                true,
+                cx.listener(|this, i: &usize, _, cx| {
+                    this.kind = Kind::ALL.get(*i).copied().unwrap_or_default();
+                    cx.notify();
+                }),
+            ))
+            .child(div().ml_auto().text_sm().text_color(rgb(theme::MUTED_FG)).child(format!(
+                "{} of {} files",
+                shown.len(),
+                clips.files.len()
+            )));
+
         let body = if clips.files.is_empty() {
-            div()
-                .text_color(rgb(GRAY))
-                .child("No clips yet. Saved clips and screenshots will show up here.")
-                .into_any_element()
+            empty("No clips yet. Saved clips and screenshots will show up here.")
+        } else if shown.is_empty() {
+            empty(format!("No clips match \u{201c}{}\u{201d}.", self.query.trim()))
         } else {
-            let rows = clips.files.iter().enumerate().map(|(i, file)| {
-                let stripe = if i % 2 == 1 { 0x24242a } else { 0x1b1b1f };
+            let rows = shown.iter().map(|file| {
                 table_row(
                     file.name.clone(),
                     format!("{:.1} MB", file.size_bytes as f64 / 1_000_000.0),
-                    file.modified.map_or_else(|| "—".to_owned(), age),
+                    file.modified.map_or_else(|| "\u{2014}".to_owned(), age),
                 )
-                .bg(rgb(stripe))
+                .border_t_1()
+                .border_color(rgb(theme::BORDER))
+                .hover(|s| s.bg(rgb(theme::ACCENT)))
             });
             div()
                 .flex()
                 .flex_col()
                 .flex_1()
                 .min_h_0()
-                .child(table_row("File", "Size", "Saved").font_weight(FontWeight::BOLD))
+                .rounded(px(theme::RADIUS))
+                .bg(rgb(theme::CARD))
+                .border_1()
+                .border_color(rgb(theme::BORDER))
+                .child(
+                    table_row("File", "Size", "Saved").text_sm().text_color(rgb(theme::MUTED_FG)),
+                )
                 .child(
                     div()
                         .id("clips-list")
@@ -146,6 +240,7 @@ impl Render for ClipsView {
                         .overflow_y_scroll()
                         .flex()
                         .flex_col()
+                        .text_sm()
                         .children(rows),
                 )
                 .into_any_element()
@@ -155,16 +250,31 @@ impl Render for ClipsView {
             .size_full()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_3()
             .p_4()
             .child(header)
-            .child(div().text_color(rgb(GRAY)).child(dir.display().to_string()))
-            .children(
-                clips.error.as_ref().map(|error| div().text_color(rgb(RED)).child(error.clone())),
+            .child(
+                div().text_sm().text_color(rgb(theme::MUTED_FG)).child(dir.display().to_string()),
             )
+            .children(
+                clips.error.as_ref().map(|error| {
+                    div().text_sm().text_color(rgb(theme::DANGER)).child(error.clone())
+                }),
+            )
+            .child(tools)
             .child(body)
             .into_any_element()
     }
+}
+
+fn empty(text: impl Into<SharedString>) -> gpui::AnyElement {
+    div()
+        .py_8()
+        .flex()
+        .justify_center()
+        .text_color(rgb(theme::MUTED_FG))
+        .child(text.into())
+        .into_any_element()
 }
 
 /// One row of the table: the name takes the spare width, size and age keep fixed widths.
@@ -173,7 +283,8 @@ fn table_row(name: impl IntoElement, size: impl IntoElement, saved: impl IntoEle
         .flex()
         .flex_row()
         .gap_6()
-        .py_1()
+        .px_3()
+        .py_2()
         .child(div().flex_1().min_w_0().child(name))
         .child(div().w(px(90.)).child(size))
         .child(div().w(px(120.)).child(saved))
@@ -194,4 +305,34 @@ fn open_folder(dir: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     std::process::Command::new("explorer").arg(dir).spawn()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(name: &str) -> ClipFile {
+        ClipFile { name: name.to_owned(), size_bytes: 1, modified: None }
+    }
+
+    fn names(files: &[&ClipFile]) -> Vec<String> {
+        files.iter().map(|f| f.name.clone()).collect()
+    }
+
+    #[test]
+    fn filters_by_kind_and_case_insensitive_name() {
+        let files = [file("Clutch.MP4"), file("ace.mkv"), file("shot-clutch.png"), file("a.jpg")];
+        assert_eq!(filter_files(&files, Kind::All, "").len(), 4);
+        assert_eq!(names(&filter_files(&files, Kind::Videos, "")), ["Clutch.MP4", "ace.mkv"]);
+        assert_eq!(
+            names(&filter_files(&files, Kind::Screenshots, "")),
+            ["shot-clutch.png", "a.jpg"]
+        );
+        assert_eq!(
+            names(&filter_files(&files, Kind::All, " CLUTCH ")),
+            ["Clutch.MP4", "shot-clutch.png"]
+        );
+        assert_eq!(names(&filter_files(&files, Kind::Videos, "clutch")), ["Clutch.MP4"]);
+        assert!(filter_files(&files, Kind::Screenshots, "ace").is_empty());
+    }
 }
