@@ -13,9 +13,13 @@ use windows::core::PCWSTR;
 /// Which chime to play.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Chime {
+    /// A DVR clip was saved: two rising notes.
     ClipSaved,
+    /// A recording started: two rising notes.
     RecordingStarted,
+    /// A recording stopped: two falling notes.
     RecordingStopped,
+    /// A screenshot was taken: one short high note.
     Screenshot,
 }
 
