@@ -7,7 +7,7 @@ use std::sync::{Arc, mpsc};
 
 use gpui::{Context, IntoElement, Render, Window};
 use zc_core::control::{Command, EngineEvent, EngineStatus, FocusChoice};
-use zc_core::settings::{CaptureMode, Settings};
+use zc_core::settings::{CaptureMode, Settings, UiMode};
 use zc_engine::{Engine, EngineConfig, EngineHandle};
 use zc_mux::repair::{Repaired, repair_partial};
 
@@ -191,6 +191,20 @@ impl ZeroClipApp {
         self.clips.invalidate(); // the output folder may have changed
         self.send(Command::ApplySettings(Box::new(settings)));
         self.notify(NoticeLevel::Info, "Settings saved.");
+    }
+
+    /// Switches between Simple and Advanced and saves the choice like any other setting. The
+    /// Settings draft keeps its unsaved edits, as in [`Self::clip_desktop`].
+    pub fn set_ui_mode(&mut self, mode: UiMode) {
+        if self.settings.ui_mode == mode {
+            return;
+        }
+        let mut settings = self.settings.clone();
+        settings.ui_mode = mode;
+        let draft = self.draft.clone();
+        self.apply_settings(settings);
+        self.draft = draft;
+        self.draft.settings.ui_mode = mode;
     }
 
     /// The focus prompt's "Clip desktop" (D35): the capture mode becomes the whole screen, the
