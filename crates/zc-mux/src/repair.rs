@@ -418,8 +418,11 @@ fn traf_times(traf: &[u8]) -> Option<TrafTimes> {
     if entries.len() != 12 * usize::try_from(samples).ok()? {
         return None;
     }
+    // The length check above means there is no partial entry left over, so `.0` is every entry.
     let duration: u64 = entries
-        .chunks_exact(12)
+        .as_chunks::<12>()
+        .0
+        .iter()
         .map(|entry| u64::from(u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]])))
         .sum();
     Some(TrafTimes { track_id, base, end: base + duration })

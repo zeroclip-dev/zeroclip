@@ -7,8 +7,8 @@ use std::time::SystemTime;
 
 use gpui::{
     Context, FocusHandle, FontWeight, InteractiveElement as _, IntoElement, ObjectFit,
-    ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled,
-    StyledImage as _, WeakEntity, Window, div, img, px, rgb,
+    ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled, StyledImage as _,
+    WeakEntity, Window, div, img, px, rgb,
 };
 use zc_core::Hns;
 use zc_editor::ffmpeg::Ffmpeg;
@@ -450,7 +450,8 @@ impl Render for ClipsView {
                             let text = path
                                 .file_stem()
                                 .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
-                            this.renaming = Some(Renaming { path: path.clone(), text, error: None });
+                            this.renaming =
+                                Some(Renaming { path: path.clone(), text, error: None });
                             if let Some(focus) = &this.rename_focus {
                                 focus.focus(window, cx);
                             }
