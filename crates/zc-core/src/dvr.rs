@@ -66,6 +66,44 @@ impl DvrConfig {
     }
 }
 
+/// The answer from [`simple_mode_check`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimpleCheck {
+    /// The drive has room. `needed_bytes` includes the 10% margin.
+    Ok {
+        /// Bytes the window needs, margin included.
+        needed_bytes: u64,
+    },
+    /// The drive is too small for the requested window.
+    TooLittleSpace {
+        /// Bytes the window needs, margin included.
+        needed_bytes: u64,
+        /// Bytes free on the drive.
+        free_bytes: u64,
+    },
+    /// Zero minutes is not a window.
+    InvalidMinutes,
+}
+
+/// Simple mode's storage check: can `free_bytes` hold `minutes` of footage at `bitrate_bps`?
+/// The need is `minutes * 60 * bitrate / 8` bytes plus a 10% margin. Saturating math, so
+/// huge inputs saturate rather than panic.
+#[must_use]
+pub fn simple_mode_check(minutes: u32, bitrate_bps: u64, free_bytes: u64) -> SimpleCheck {
+    if minutes == 0 {
+        return SimpleCheck::InvalidMinutes;
+    }
+    // u128 holds u32::MAX * 60 * u64::MAX, so the product can't overflow. Only the final
+    // narrowing back to u64 can saturate.
+    let bytes = u128::from(minutes) * 60 * u128::from(bitrate_bps) / 8;
+    let needed_bytes = u64::try_from(bytes * 11 / 10).unwrap_or(u64::MAX);
+    if free_bytes >= needed_bytes {
+        SimpleCheck::Ok { needed_bytes }
+    } else {
+        SimpleCheck::TooLittleSpace { needed_bytes, free_bytes }
+    }
+}
+
 /// What [`DvrBuffer::push`] did with a packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PushOutcome {
@@ -624,6 +662,33 @@ mod tests {
         assert!((150_000_000..=155_000_000).contains(&cfg.video_bytes), "{cfg:?}");
         // 192 kbps = 24 KB/s → 1.44 MB per track, plus ≤ 2 s headroom.
         assert!((1_440_000..=1_488_000).contains(&cfg.audio_bytes), "{cfg:?}");
+    }
+
+    #[test]
+    fn simple_mode_check_passes_when_the_drive_has_room() {
+        // 1 min at 20 Mbps = 150 MB; with the 10% margin, 165 MB.
+        let check = simple_mode_check(1, 20_000_000, 200_000_000);
+        assert_eq!(check, SimpleCheck::Ok { needed_bytes: 165_000_000 });
+    }
+
+    #[test]
+    fn simple_mode_check_fails_when_the_drive_is_too_small() {
+        let check = simple_mode_check(1, 20_000_000, 100_000_000);
+        assert_eq!(
+            check,
+            SimpleCheck::TooLittleSpace { needed_bytes: 165_000_000, free_bytes: 100_000_000 }
+        );
+    }
+
+    #[test]
+    fn simple_mode_check_rejects_zero_minutes() {
+        assert_eq!(simple_mode_check(0, 20_000_000, u64::MAX), SimpleCheck::InvalidMinutes);
+    }
+
+    #[test]
+    fn simple_mode_check_saturates_instead_of_overflowing() {
+        let check = simple_mode_check(u32::MAX, u64::MAX, 1_000);
+        assert!(matches!(check, SimpleCheck::TooLittleSpace { needed_bytes: u64::MAX, .. }));
     }
 
     #[test]
