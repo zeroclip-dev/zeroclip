@@ -73,8 +73,10 @@ pub struct ZeroClipApp {
     pub open_apps: ui::components::open_apps::OpenAppsList,
     /// The focus prompt on screen, if a second game asked to take over (D35).
     pub focus_prompt: Option<ui::focus_prompt::FocusPrompt>,
-    /// Results from the startup repair thread, moved into `notices` as they arrive.
-    repairs: mpsc::Receiver<Notice>,
+    /// Footage waiting for Keep / Discard / Later (P4.12); the first one is on screen.
+    pub rescues: Vec<ui::rescue::Rescue>,
+    /// The startup scan's result, moved into `notices` and `rescues` when it arrives.
+    repairs: mpsc::Receiver<StartupScan>,
 }
 
 impl ZeroClipApp {
@@ -135,6 +137,7 @@ impl ZeroClipApp {
             clips: ui::clips::ClipList::default(),
             open_apps: Default::default(),
             focus_prompt: None,
+            rescues: Vec::new(),
             repairs,
         })
     }
@@ -200,7 +203,34 @@ impl ZeroClipApp {
 
     /// Moves the startup repair's notices into the activity feed.
     fn drain_repair_notices(&mut self) {
-        while let Ok(notice) = self.repairs.try_recv() {
+        while let Ok(scan) = self.repairs.try_recv() {
+            for notice in scan.notices {
+                self.notify(notice.level, notice.text);
+            }
+            for path in scan.rescues {
+                self.add_rescue(ui::rescue::Rescue { path, game: None, duration: None });
+            }
+        }
+    }
+
+    /// Queues footage for the prompt, unless that file is already waiting.
+    fn add_rescue(&mut self, rescue: ui::rescue::Rescue) {
+        if !self.rescues.iter().any(|r| r.path == rescue.path) {
+            self.rescues.push(rescue);
+        }
+    }
+
+    /// Answers the rescue prompt. Whatever happens, the prompt is dropped (no loop on an io error).
+    pub fn answer_rescue(&mut self, choice: ui::rescue::RescueChoice) {
+        if self.rescues.is_empty() {
+            return;
+        }
+        let rescue = self.rescues.remove(0);
+        let (notice, kept) = ui::rescue::resolve(&rescue.path, choice);
+        if kept {
+            self.clips.invalidate();
+        }
+        if let Some(notice) = notice {
             self.notify(notice.level, notice.text);
         }
     }
@@ -250,12 +280,18 @@ impl ZeroClipApp {
                         format!("{exe}: keeping the last {}{note}", ui::human_duration(window)),
                     );
                 }
-                // P4.12 replaces this notice with the keep-or-discard prompt.
-                EngineEvent::RecoveryReady { path, .. } => {
+                EngineEvent::RecoveryReady { path, game, duration } => {
                     self.notify(
                         NoticeLevel::Warning,
-                        format!("Rescued footage: {}", path.display()),
+                        format!("{game} closed unexpectedly; its footage was saved."),
                     );
+                    self.add_rescue(ui::rescue::Rescue {
+                        path,
+                        game: Some(game),
+                        duration: Some(duration),
+                    });
+                    // ponytail: egui flashed the taskbar here; GPUI has no equivalent yet.
+                    // Never raise or activate the window (the user may be relaunching the game).
                 }
                 EngineEvent::Warning(text) => self.notify(NoticeLevel::Warning, text),
                 EngineEvent::Error(text) => self.notify(NoticeLevel::Error, text),
@@ -275,14 +311,21 @@ impl Render for ZeroClipApp {
     }
 }
 
-/// Runs [`repair_partials`] on a background thread and sends its notices to the UI. It asks for
-/// a repaint at the end, so the notices show even when the window is idle.
-fn spawn_repair(dir: PathBuf, notices: mpsc::Sender<Notice>, wake: async_channel::Sender<()>) {
+/// What the startup pass over the output folder found.
+#[derive(Default)]
+struct StartupScan {
+    /// One per repaired `*.partial` file.
+    notices: Vec<Notice>,
+    /// `recovery-*.tmp` files the user hasn't answered for yet.
+    rescues: Vec<PathBuf>,
+}
+
+/// Runs [`startup_scan`] on a background thread and sends the result to the UI. It asks for
+/// a repaint at the end, so the result shows even when the window is idle.
+fn spawn_repair(dir: PathBuf, result: mpsc::Sender<StartupScan>, wake: async_channel::Sender<()>) {
     let spawned = std::thread::Builder::new().name("zc-repair".into()).spawn(move || {
-        for notice in repair_partials(&dir) {
-            if notices.send(notice).is_err() {
-                return; // the app has closed
-            }
+        if result.send(startup_scan(&dir)).is_err() {
+            return; // the app has closed
         }
         let _ = wake.try_send(());
     });
@@ -291,24 +334,27 @@ fn spawn_repair(dir: PathBuf, notices: mpsc::Sender<Notice>, wake: async_channel
     }
 }
 
-/// Repairs every `*.partial` file in `dir` (D18) and returns one notice per file. A folder that
-/// doesn't exist yet has nothing to repair.
-fn repair_partials(dir: &Path) -> Vec<Notice> {
+/// One pass over `dir`: repairs every `*.partial` file (D18, one notice per file) and collects
+/// the `recovery-*.tmp` files for the rescue prompt. A folder that doesn't exist yet has nothing.
+fn startup_scan(dir: &Path) -> StartupScan {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) => {
             if error.kind() != io::ErrorKind::NotFound {
                 tracing::warn!(%error, dir = %dir.display(), "startup repair can't read the output folder");
             }
-            return Vec::new();
+            return StartupScan::default();
         }
     };
-    entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "partial") && path.is_file())
-        .map(|path| repair_notice(&path))
-        .collect()
+    let mut scan = StartupScan::default();
+    for path in entries.flatten().map(|entry| entry.path()).filter(|p| p.is_file()) {
+        if path.extension().is_some_and(|ext| ext == "partial") {
+            scan.notices.push(repair_notice(&path));
+        } else if ui::rescue::kept_name(&path).is_some() {
+            scan.rescues.push(path);
+        }
+    }
+    scan
 }
 
 /// Repairs one `.partial` file and words the outcome for the activity feed.
@@ -347,13 +393,16 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("scratch dir");
         std::fs::write(dir.join("broken.mp4.partial"), b"not a recording").expect("partial file");
         std::fs::write(dir.join("notes.txt"), b"not a recording either").expect("other file");
-        let notices = repair_partials(&dir);
-        let missing = repair_partials(&dir.join("missing"));
+        std::fs::write(dir.join("recovery-9.mp4.tmp"), b"x").expect("rescue file");
+        let scan = startup_scan(&dir);
+        let notices = scan.notices;
+        let missing = startup_scan(&dir.join("missing"));
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].level, NoticeLevel::Warning);
         assert!(notices[0].text.contains("broken.mp4.partial"), "{}", notices[0].text);
-        assert!(missing.is_empty());
+        assert_eq!(scan.rescues, vec![dir.join("recovery-9.mp4.tmp")]);
+        assert!(missing.notices.is_empty() && missing.rescues.is_empty());
     }
 }
