@@ -101,8 +101,6 @@ pub struct ZeroClipApp {
     quitting: bool,
     /// The "keeps running in the tray" notice is shown once per session.
     tray_hint_shown: bool,
-    /// The clip-saved toast on screen, if any. A new toast replaces it.
-    toast: Option<gpui::WindowHandle<ui::overlay::ToastView>>,
 }
 
 impl ZeroClipApp {
@@ -210,7 +208,6 @@ impl ZeroClipApp {
             rescues: Vec::new(),
             flight,
             repairs,
-            toast: None,
         })
     }
 
@@ -429,10 +426,7 @@ impl ZeroClipApp {
         if let Some(chime) = chime {
             zc_win::chime::play(chime);
         }
-        if let Some(old) = self.toast.take() {
-            let _ = old.update(cx, |_, window, _| window.remove_window());
-        }
-        self.toast = ui::overlay::show(cx, kind);
+        ui::overlay::show(cx, kind);
     }
 
     fn drain_engine_events(&mut self, cx: &mut Context<Self>) {
