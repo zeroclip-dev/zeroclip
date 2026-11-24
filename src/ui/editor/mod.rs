@@ -55,8 +55,8 @@ const LANE_HEIGHT: f32 = 40.0;
 /// One waveform bar is at least this far from the previous one.
 const BAR_STEP: f32 = 3.0;
 /// The picture's height is this share of the window's, within these limits.
-const VIDEO_SHARE: f32 = 0.5;
-const VIDEO_MIN: f32 = 300.0;
+const VIDEO_SHARE: f32 = 0.38;
+const VIDEO_MIN: f32 = 200.0;
 const VIDEO_MAX: f32 = 760.0;
 /// The editing panel beside the picture, and the window width from which it sits beside it.
 const SIDE_WIDTH: f32 = 380.0;
@@ -1252,7 +1252,7 @@ impl EditorView {
                     .on_click(cx.listener(|this, _, _, cx| this.delete_selected(cx))),
             );
         div().flex().flex_col().gap_2().child(video).child(controls).child(muted(
-            "Space plays, S splits at the playhead, J joins, Delete removes the selected piece, Ctrl+Z undoes. Drag across a lane to pick a stretch of that track and press Delete to silence it. Click the line to add a volume point, drag it to change the level (to the bottom mutes), Shift-click removes it. Cuts land on keyframes, so no video is re-encoded.",
+            "Space plays, S splits, J joins, Delete removes, Ctrl+Z undoes. On a lane, drag to pick a stretch and press Delete to silence it; click the line to add a volume point.",
         ))
     }
 
