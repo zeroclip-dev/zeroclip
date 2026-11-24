@@ -22,7 +22,7 @@ state machine; editing never re-encodes; nothing is ever deleted unverified.
 | `zc-video` | D3D11 device, WGC capture, BGRA→NV12, MF hardware encoder, screenshots | `zc-core`, `zc-win` | Windows |
 | `zc-audio` | WASAPI process loopback, mic + push-to-talk, MF AAC encoder | `zc-core`, `zc-win` | Windows |
 | `zc-input` | Raw Input hotkeys, foreground-window tracking | `zc-core`, `zc-win` | Windows |
-| `zc-win` | COM/MF lifetimes, QPC clock, message-only window thread, drive detection, page-locking | `zc-core` | Windows |
+| `zc-win` | COM/MF lifetimes, QPC clock, message-only window thread, drive detection, page-locking, single-instance mutex | `zc-core` | Windows |
 | `zc-store` | SQLite metadata: clips, keyframes, profiles, probe cache, waveforms, uploads | `zc-core` | any |
 | `zc-editor` | keyframe snapping, stitch compatibility, waveform peaks, ffmpeg CLI jobs | `zc-core` | any* |
 | `zc-destinations` | the `Destination` trait, Discord webhooks, YouTube (BYO credentials) | `zc-core` | any |

@@ -25,6 +25,23 @@ fn main() -> anyhow::Result<()> {
     let (_log_guard, recorder) = logging::init(&paths.logs_dir)?;
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "ZeroClip starting");
 
+    // Two copies would share the disk-ring DVR file and one would truncate the other's buffer.
+    // Held until `main` returns. A failing guard must not block startup.
+    let _instance = match zc_win::single_instance::acquire(zc_win::single_instance::INSTANCE_MUTEX)
+    {
+        Ok(Some(guard)) => Some(guard),
+        Ok(None) => {
+            tracing::warn!("ZeroClip is already running; exiting this copy");
+            // ponytail: no message box (needs a new windows feature); stderr + log only.
+            eprintln!("ZeroClip is already running.");
+            return Ok(());
+        }
+        Err(error) => {
+            tracing::warn!(%error, "single-instance guard failed; continuing without it");
+            None
+        }
+    };
+
     let settings = settings_store::load(&paths.settings_file);
 
     Application::new().run(move |cx| {
