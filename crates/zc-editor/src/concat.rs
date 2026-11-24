@@ -42,8 +42,27 @@ pub enum ConcatError {
 /// [`ConcatError::TooFew`] for fewer than two clips; [`ConcatError::Mismatch`]
 /// naming the first clip that differs.
 pub fn check_compatible(clips: &[StreamInfo]) -> Result<(), ConcatError> {
-    let _ = clips;
-    todo!("Phase 5: compare against clips[0] (see the `concat_*` specs)")
+    let Some((first, rest)) = clips.split_first() else {
+        return Err(ConcatError::TooFew);
+    };
+    if rest.is_empty() {
+        return Err(ConcatError::TooFew);
+    }
+    for (index, clip) in clips.iter().enumerate().skip(1) {
+        let what = if clip.codec != first.codec {
+            format!("codec {} vs {}", first.codec.name(), clip.codec.name())
+        } else if clip.size != first.size {
+            format!("size {}×{} vs {}×{}", first.size.0, first.size.1, clip.size.0, clip.size.1)
+        } else if clip.fps != first.fps {
+            format!("frame rate {} vs {} fps", first.fps, clip.fps)
+        } else if clip.audio_tracks != first.audio_tracks {
+            format!("audio tracks {} vs {}", first.audio_tracks, clip.audio_tracks)
+        } else {
+            continue;
+        };
+        return Err(ConcatError::Mismatch { index, what });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -54,13 +73,11 @@ mod tests {
         StreamInfo { codec: Codec::Hevc, size: (1920, 1080), fps: 60, audio_tracks: 2 };
 
     #[test]
-    #[ignore = "spec: check_compatible (Phase 5)"]
     fn concat_accepts_matching_clips() {
         assert_eq!(check_compatible(&[HEVC_1080P60; 3]), Ok(()));
     }
 
     #[test]
-    #[ignore = "spec: check_compatible (Phase 5)"]
     fn concat_names_the_first_mismatch() {
         let fallback = StreamInfo { codec: Codec::H264, ..HEVC_1080P60 };
         let err = check_compatible(&[HEVC_1080P60, HEVC_1080P60, fallback]).unwrap_err();
@@ -68,7 +85,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spec: check_compatible (Phase 5)"]
     fn concat_needs_two_clips() {
         assert_eq!(check_compatible(&[HEVC_1080P60]), Err(ConcatError::TooFew));
     }
