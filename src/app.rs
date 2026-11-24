@@ -12,6 +12,7 @@ use zc_engine::{Engine, EngineConfig, EngineHandle};
 use zc_mux::repair::{Repaired, repair_partial};
 
 use crate::paths::AppPaths;
+use crate::tray::{self, TrayCommand};
 use crate::ui;
 use crate::ui::components::screens::Screens;
 
@@ -79,6 +80,12 @@ pub struct ZeroClipApp {
     flight: Arc<crate::logging::FlightRecorder>,
     /// The startup scan's result, moved into `notices` and `rescues` when it arrives.
     repairs: mpsc::Receiver<StartupScan>,
+    /// The tray icon (P4.15). `None` when it couldn't be created: the app then quits on close.
+    tray: Option<tray::Tray>,
+    /// Set by the tray's Quit, so the window closes for real instead of hiding.
+    quitting: bool,
+    /// The "keeps running in the tray" notice is shown once per session.
+    tray_hint_shown: bool,
 }
 
 impl ZeroClipApp {
@@ -110,7 +117,34 @@ impl ZeroClipApp {
             .output_dir
             .clone()
             .unwrap_or_else(|| paths.default_output_dir.clone());
+        // The tray's menu and icon wake the same task, so its commands drain with the window hidden.
+        let tray_wake: Arc<dyn Fn() + Send + Sync> = {
+            let wake_tx = wake_tx.clone();
+            Arc::new(move || {
+                let _ = wake_tx.try_send(());
+            })
+        };
         spawn_repair(output_dir, repairs_tx, wake_tx);
+
+        let mut notices = VecDeque::new();
+        let tray = match tray::create(tray_wake) {
+            Ok(tray) => Some(tray),
+            Err(error) => {
+                tracing::warn!(%error, "the tray icon couldn't start");
+                notices.push_front(Notice {
+                    level: NoticeLevel::Warning,
+                    text: format!("The tray icon couldn't start: {error:#}"),
+                });
+                None
+            }
+        };
+        if tray.is_none() {
+            // `--tray` starts the window hidden. With no tray icon there would be no way back, so show it.
+            cx.spawn(async move |_, _| {
+                let _ = zc_win::main_window::set_shown(true);
+            })
+            .detach();
+        }
 
         cx.spawn(async move |this, cx| {
             while wake_rx.recv().await.is_ok() {
@@ -119,6 +153,7 @@ impl ZeroClipApp {
                 let alive = this.update(cx, |app, cx| {
                     app.drain_engine_events();
                     app.drain_repair_notices();
+                    app.drain_tray(cx);
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -136,7 +171,10 @@ impl ZeroClipApp {
             settings,
             status: EngineStatus::default(),
             tab: Tab::Home,
-            notices: VecDeque::new(),
+            notices,
+            tray,
+            quitting: false,
+            tray_hint_shown: false,
             clips: ui::clips::ClipList::default(),
             open_apps: Default::default(),
             focus_prompt: None,
@@ -186,11 +224,67 @@ impl ZeroClipApp {
             self.notify(NoticeLevel::Error, format!("Couldn't save settings: {e:#}"));
             return;
         }
+        if settings.app.start_with_windows != self.settings.app.start_with_windows
+            && let Err(error) = set_start_with_windows(settings.app.start_with_windows)
+        {
+            self.notify(
+                NoticeLevel::Error,
+                format!("Couldn't change start with Windows: {error:#}"),
+            );
+        }
         self.draft = ui::settings::Draft::from_settings(&settings);
         self.settings = settings.clone();
         self.clips.invalidate(); // the output folder may have changed
         self.send(Command::ApplySettings(Box::new(settings)));
         self.notify(NoticeLevel::Info, "Settings saved.");
+    }
+
+    /// The window's close button (P4.15). With close-to-tray on and a tray icon to come back from,
+    /// the window hides and the app keeps running. Otherwise the window closes and the app quits.
+    /// Returns whether the window may close.
+    pub fn close_requested(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.quitting || !self.settings.app.close_to_tray || self.tray.is_none() {
+            return true;
+        }
+        if let Err(error) = zc_win::main_window::set_shown(false) {
+            self.notify(
+                NoticeLevel::Error,
+                format!("Couldn't hide the window to the tray: {error}"),
+            );
+            return false;
+        }
+        if !self.tray_hint_shown {
+            self.tray_hint_shown = true;
+            self.notify(NoticeLevel::Info, "ZeroClip keeps running in the tray.");
+        }
+        cx.notify();
+        false
+    }
+
+    /// Handles the tray's menu and icon commands (P4.15).
+    fn drain_tray(&mut self, cx: &mut Context<Self>) {
+        let commands: Vec<TrayCommand> = match &self.tray {
+            Some(tray) => tray.commands.try_iter().collect(),
+            None => return,
+        };
+        for command in commands {
+            match command {
+                TrayCommand::Show => {
+                    if let Err(error) = zc_win::main_window::set_shown(true) {
+                        self.notify(
+                            NoticeLevel::Error,
+                            format!("Couldn't show the window: {error}"),
+                        );
+                    }
+                    cx.activate(true);
+                }
+                TrayCommand::SaveClip => self.send(Command::SaveClip),
+                TrayCommand::Quit => {
+                    self.quitting = true;
+                    cx.quit();
+                }
+            }
+        }
     }
 
     /// The focus prompt's "Clip desktop" (D35): the capture mode becomes the whole screen, the
@@ -333,6 +427,13 @@ struct StartupScan {
     notices: Vec<Notice>,
     /// `recovery-*.tmp` files the user hasn't answered for yet.
     rescues: Vec<PathBuf>,
+}
+
+/// Adds or removes ZeroClip's Run value, so Windows starts it at sign-in (P4.16).
+fn set_start_with_windows(enabled: bool) -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    zc_win::autostart::set(enabled, &zc_win::autostart::run_value(&exe))?;
+    Ok(())
 }
 
 /// Runs [`startup_scan`] on a background thread and sends the result to the UI. It asks for
