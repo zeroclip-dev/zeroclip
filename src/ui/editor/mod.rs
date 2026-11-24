@@ -611,6 +611,8 @@ impl EditorView {
         let frame = div()
             .w_full()
             .h(px(FRAME_HEIGHT))
+            // The page scrolls, so without this the flex column squeezes the frame to nothing.
+            .flex_none()
             .rounded(px(theme::RADIUS_MD))
             .bg(rgb(theme::BG))
             .border_1()

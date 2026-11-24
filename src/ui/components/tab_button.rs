@@ -19,10 +19,10 @@ pub fn tab_button(icon_name: &str, label: &'static str, active: bool) -> gpui::S
         .font_weight(gpui::FontWeight::MEDIUM)
         .cursor_pointer()
         .hover(|s| s.bg(rgb(theme::ACCENT)).text_color(rgb(theme::FG)));
-    let tab = if active {
-        tab.bg(rgb(theme::MUTED)).text_color(rgb(theme::FG))
+    let (tab, color) = if active {
+        (tab.bg(rgb(theme::MUTED)).text_color(rgb(theme::FG)), theme::FG)
     } else {
-        tab.text_color(rgb(theme::MUTED_FG))
+        (tab.text_color(rgb(theme::MUTED_FG)), theme::MUTED_FG)
     };
-    tab.child(icon(icon_name)).child(text)
+    tab.child(icon(icon_name, color)).child(text)
 }
