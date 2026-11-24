@@ -33,6 +33,21 @@ pub struct Settings {
     pub uploads: UploadSettings,
     /// Per-game profiles.
     pub profiles: ProfileSet,
+    /// Simple mode ("clip the last N minutes") or the full settings.
+    #[serde(default)]
+    pub ui_mode: UiMode,
+}
+
+/// How the app presents itself. Old settings files have no `ui_mode`, so they load as
+/// [`Advanced`](UiMode::Advanced), the full settings they already had.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UiMode {
+    /// Just "clip the last N minutes"; the app only checks that storage is enough.
+    Simple,
+    /// The full settings.
+    #[default]
+    Advanced,
 }
 
 impl Settings {
@@ -453,6 +468,15 @@ mod tests {
         assert_eq!(older.video.monitor, None);
         let picked: Settings = toml::from_str("[video]\nmonitor = 1\n").unwrap();
         assert_eq!(picked.video.monitor, Some(1));
+    }
+
+    #[test]
+    fn old_settings_without_ui_mode_load_as_advanced() {
+        let older: Settings = toml::from_str("[video]\nfps = 60\n").unwrap();
+        assert_eq!(older.ui_mode, UiMode::Advanced);
+        assert_eq!(Settings::default().ui_mode, UiMode::Advanced);
+        let simple: Settings = toml::from_str("ui_mode = \"simple\"\n").unwrap();
+        assert_eq!(simple.ui_mode, UiMode::Simple);
     }
 
     #[test]
