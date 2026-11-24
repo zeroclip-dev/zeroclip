@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Context, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point, Render, SharedString,
@@ -175,7 +176,7 @@ impl ClipsView {
             rename_focus: None,
             renaming: None,
             drag_from: None,
-            grid: false,
+            grid: true,
             thumbs_ready: HashSet::new(),
             thumbs_pending: HashSet::new(),
         }
@@ -543,7 +544,36 @@ impl Render for ClipsView {
                         .border_1()
                         .border_color(rgb(theme::BORDER))
                         .hover(|s| s.bg(rgb(theme::ACCENT)))
-                        .child(thumb_box(thumb, CARD_W - 18., (CARD_W - 18.) * 9. / 16.))
+                        .child({
+                            let path = file.path.clone();
+                            let picture =
+                                thumb_box(thumb, CARD_W - 18., (CARD_W - 18.) * 9. / 16.);
+                            // A video's picture is a play button: click to watch it.
+                            div()
+                                .id(("clip-play", i))
+                                .relative()
+                                .child(picture)
+                                .when(is_video, |d| {
+                                    d.cursor_pointer()
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .inset_0()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .text_color(rgb(0xffffff))
+                                                .text_2xl()
+                                                .child("\u{25b6}"),
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let path = path.clone();
+                                            let _ = this.app.update(cx, |app, cx| {
+                                                app.open_in_editor(path, true, cx)
+                                            });
+                                        }))
+                                })
+                        })
                         .child(div().text_sm().truncate().child(file.name.clone()))
                         .child(div().text_xs().text_color(rgb(theme::MUTED_FG)).child(format!(
                             "{:.1} MB \u{b7} {}",

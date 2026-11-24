@@ -217,9 +217,10 @@ impl ZeroClipApp {
         let ffmpeg = self.settings.editor.ffmpeg_path.clone();
         let store = self.store.clone();
         let bitrate_bps = self.settings.audio.bitrate_kbps * 1_000;
-        self.screens
-            .editor()
-            .update(cx, |editor, cx| editor.open(path, watch, ffmpeg, store, bitrate_bps, cx));
+        let prefs = (self.settings.editor.finish, usize::from(self.settings.editor.listen_track));
+        self.screens.editor().update(cx, |editor, cx| {
+            editor.open(path, watch, Some(prefs), ffmpeg, store, bitrate_bps, cx)
+        });
         self.tab = Tab::Editor;
         cx.notify();
     }

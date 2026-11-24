@@ -209,10 +209,12 @@ impl EditorView {
     }
 
     /// Starts a new project with `path` on the timeline.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         &mut self,
         path: PathBuf,
         watch: bool,
+        prefs: Option<(FinishChoice, usize)>,
         ffmpeg_path: Option<PathBuf>,
         store: Option<Arc<Mutex<Store>>>,
         bitrate_bps: u32,
@@ -223,9 +225,10 @@ impl EditorView {
         self.bitrate_bps = bitrate_bps;
         self.reset();
         self.editing = !watch;
-        if let Some(app) = self.app.upgrade() {
-            let editor = &app.read(cx).settings.editor;
-            (self.finish, self.listen) = (editor.finish, usize::from(editor.listen_track));
+        // The app hands its saved choices in: reading it from here would panic when it is the one
+        // calling (it is being updated).
+        if let Some((finish, listen)) = prefs {
+            (self.finish, self.listen) = (finish, listen);
         }
         self.add_clip(path, cx);
     }
@@ -1316,7 +1319,7 @@ impl EditorView {
                                         )
                                     })
                                     .unwrap_or((None, None, this.bitrate_bps));
-                                this.open(path, false, ffmpeg, store, bitrate, cx);
+                                this.open(path, false, None, ffmpeg, store, bitrate, cx);
                             } else {
                                 this.add_clip(path, cx);
                             }
