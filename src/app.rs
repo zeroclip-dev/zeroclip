@@ -444,6 +444,30 @@ impl ZeroClipApp {
         ui::overlay::show(cx, kind);
     }
 
+    /// Rewrites a just-saved clip as a plain MP4 in the background, so any player can seek in it.
+    fn finish_clip(&self, path: PathBuf, cx: &mut Context<Self>) {
+        if path.extension().is_none_or(|e| !e.eq_ignore_ascii_case("mp4")) {
+            return;
+        }
+        let ffmpeg = self.settings.editor.ffmpeg_path.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { ui::clips::make_plain_in_place(ffmpeg.as_deref(), &path) })
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                match result {
+                    Ok(()) => app.clips.invalidate(),
+                    Err(e) => {
+                        tracing::warn!("couldn't make the clip seekable in other players: {e}")
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Records which game `clip` came from (the game in focus now) so Clips can group by game.
     fn tag_game(&self, clip: &Path) {
         if let Some(game) = &self.status.game {
@@ -467,6 +491,7 @@ impl ZeroClipApp {
                 EngineEvent::ClipSaving => self.show_toast(ToastKind::Saving, cx),
                 EngineEvent::ClipSaved { path, duration } => {
                     self.tag_game(&path);
+                    self.finish_clip(path.clone(), cx);
                     self.show_toast(ToastKind::ClipSaved { length: duration }, cx);
                     self.clips.invalidate();
                     self.notify(
@@ -492,6 +517,7 @@ impl ZeroClipApp {
                 }
                 EngineEvent::RecordingStopped { path, duration } => {
                     self.tag_game(&path);
+                    self.finish_clip(path.clone(), cx);
                     self.show_toast(ToastKind::RecordingStopped { length: duration }, cx);
                     self.clips.invalidate();
                     self.notify(
