@@ -5,6 +5,7 @@ pub mod clips;
 pub mod components;
 pub mod focus_prompt;
 pub mod home;
+pub mod overlay;
 pub mod profiles;
 pub mod rescue;
 pub mod settings;
