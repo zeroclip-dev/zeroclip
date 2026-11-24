@@ -704,7 +704,25 @@ impl Render for SettingsView {
                     .map(|p| div().text_sm().text_color(rgb(theme::DANGER)).child(p.clone())),
             );
 
-        let sections: [AnyElement; 8] = [
+        // Tray and startup (P4.15, P4.16)
+        let app_sec = section("App")
+            .child(labeled_toggle(
+                "close-tray",
+                "Close to the tray instead of quitting",
+                d.settings.app.close_to_tray,
+                true,
+                bind!(cx, |d, v: &bool| d.settings.app.close_to_tray = *v),
+            ))
+            .child(labeled_toggle(
+                "start-win",
+                "Start with Windows, in the tray",
+                d.settings.app.start_with_windows,
+                true,
+                bind!(cx, |d, v: &bool| d.settings.app.start_with_windows = *v),
+            ))
+            .child(hint("Quit from the tray menu to close ZeroClip while it runs in the tray."));
+
+        let sections: [AnyElement; 9] = [
             recording.into_any_element(),
             video_sec.into_any_element(),
             dvr_sec.into_any_element(),
@@ -712,6 +730,7 @@ impl Render for SettingsView {
             hotkeys.into_any_element(),
             storage.into_any_element(),
             uploads.into_any_element(),
+            app_sec.into_any_element(),
             div().h(px(8.)).into_any_element(),
         ];
         div()
