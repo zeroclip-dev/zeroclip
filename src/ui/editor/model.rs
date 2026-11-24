@@ -493,6 +493,10 @@ pub struct PiecePlan {
     pub source: usize,
     /// `(start, end)` when the piece is not the whole source clip.
     pub trim: Option<(Hns, Hns)>,
+    /// The piece's range in its clip, always (what a frame-exact export cuts).
+    pub range: (Hns, Hns),
+    /// The start is not on a keyframe, so the video must be re-encoded to begin exactly there.
+    pub reencode: bool,
     /// One entry per audio track of the source.
     pub tracks: Vec<AudioTrack>,
 }
@@ -514,14 +518,22 @@ pub fn plan_piece(
     keyframes: &[Hns],
     bitrate_bps: u32,
 ) -> Result<PiecePlan, String> {
-    let start = snapped_start(keyframes, piece.a);
+    // The start stays where the user put it. Off a keyframe it costs a re-encode, not accuracy.
+    let start = piece.a;
     if piece.b <= start {
         return Err("A piece is empty.".to_owned());
     }
+    let off_keyframe = (snapped_start(keyframes, start).ticks() - start.ticks()).abs() > 10_000;
     let whole = start == Hns::ZERO && piece.b >= duration;
     let tracks =
         piece.tracks.iter().map(|t| AudioTrack { edit: t.audio_edit(), bitrate_bps }).collect();
-    Ok(PiecePlan { source: piece.source, trim: (!whole).then_some((start, piece.b)), tracks })
+    Ok(PiecePlan {
+        source: piece.source,
+        trim: (!whole).then_some((start, piece.b)),
+        range: (start, piece.b),
+        reencode: off_keyframe,
+        tracks,
+    })
 }
 
 /// `<stem> (<tag>).mp4` in `dir`, or `(<tag> 2)`, `(<tag> 3)`... when `exists` says the name is
@@ -726,6 +738,17 @@ mod tests {
         assert_eq!(plan.tracks[0].edit, AudioEdit::Gain { db: 3.0 });
         assert_eq!(plan.tracks[1].edit, AudioEdit::Mute);
         assert!(plan.has_audio_edits());
+    }
+
+    #[test]
+    fn a_start_between_keyframes_is_kept_and_asks_for_a_re_encode() {
+        let t = one(20);
+        let piece = t.pieces[0].trimmed(Hns::from_millis(7_300), secs(20), secs(20));
+        let plan = plan_piece(&piece, secs(20), &keyframes(), 160_000).unwrap();
+        assert_eq!(plan.trim, Some((Hns::from_millis(7_300), secs(20))));
+        assert!(plan.reencode);
+        let on_key = t.pieces[0].trimmed(secs(6), secs(20), secs(20));
+        assert!(!plan_piece(&on_key, secs(20), &keyframes(), 160_000).unwrap().reencode);
     }
 
     #[test]

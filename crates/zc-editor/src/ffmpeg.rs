@@ -76,6 +76,22 @@ impl Ffmpeg {
         run(&self.exe, &trim_args(input, start, end, output)?).map(drop)
     }
 
+    /// Like [`trim`](Self::trim) but frame-exact: `start` may be anywhere, so the video is
+    /// re-encoded (visually lossless) as `codec`; audio and other streams are copied.
+    ///
+    /// # Errors
+    /// See [`FfmpegError`]; AV1 isn't supported here.
+    pub fn trim_exact(
+        &self,
+        input: &Path,
+        start: Hns,
+        end: Hns,
+        output: &Path,
+        codec: Codec,
+    ) -> Result<(), FfmpegError> {
+        run(&self.exe, &trim_exact_args(input, start, end, output, codec)?).map(drop)
+    }
+
     /// Joins clips with the concat demuxer (check `crate::concat::check_compatible` first).
     ///
     /// # Errors
@@ -477,6 +493,44 @@ pub fn trim_args(
     args.push(ffmpeg_time(end - start).into());
     args.extend(["-map", "0", "-c", "copy", "-avoid_negative_ts", "make_zero"].map(OsString::from));
     args.extend(["-movflags", "+faststart"].map(OsString::from));
+    args.push(os(output));
+    Ok(args)
+}
+
+/// Arguments for [`Ffmpeg::trim_exact`]: seek to `start` before the input (ffmpeg then decodes up
+/// to the exact frame), re-encode the video, copy everything else.
+///
+/// # Errors
+/// [`FfmpegError::Failed`] when `end <= start` or the codec can't be re-encoded here.
+pub fn trim_exact_args(
+    input: &Path,
+    start: Hns,
+    end: Hns,
+    output: &Path,
+    codec: Codec,
+) -> Result<Vec<OsString>, FfmpegError> {
+    if end <= start {
+        return Err(FfmpegError::Failed { stderr: "empty selection".into() });
+    }
+    let video: &[&str] = match codec {
+        Codec::Hevc => &["-c:v", "libx265", "-crf", "16", "-preset", "veryfast", "-tag:v", "hvc1"],
+        Codec::H264 => &["-c:v", "libx264", "-crf", "16", "-preset", "veryfast"],
+        Codec::Av1 => {
+            return Err(FfmpegError::Failed {
+                stderr: "AV1 clips can only be cut on a keyframe".into(),
+            });
+        }
+    };
+    let mut args = common_args();
+    args.push("-ss".into());
+    args.push(ffmpeg_time(start).into());
+    args.push("-i".into());
+    args.push(os(input));
+    args.push("-t".into());
+    args.push(ffmpeg_time(end - start).into());
+    args.extend(["-map", "0", "-c", "copy"].map(OsString::from));
+    args.extend(video.iter().map(OsString::from));
+    args.extend(["-avoid_negative_ts", "make_zero", "-movflags", "+faststart"].map(OsString::from));
     args.push(os(output));
     Ok(args)
 }
