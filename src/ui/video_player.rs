@@ -118,6 +118,10 @@ pub struct VideoPlayerView {
     bar: Rc<Cell<Bounds<gpui::Pixels>>>,
     /// The seek bar is being dragged.
     scrubbing: bool,
+    /// Playback was running when the scrub started; resumes from the final position on release.
+    scrub_resume: bool,
+    /// Latest scrub time waiting for the in-flight still decode to finish (older ones are dropped).
+    scrub_pending: Option<Hns>,
     /// Cursor position along the seek bar (`0.0..=1.0`) while hovering, for the preview tooltip.
     hover_frac: Option<f32>,
     /// Subscription pausing playback when the OS window loses focus or is minimised.
@@ -173,6 +177,8 @@ impl VideoPlayerView {
             focused_generation: None,
             bar: Rc::new(Cell::new(Bounds::default())),
             scrubbing: false,
+            scrub_resume: false,
+            scrub_pending: None,
             hover_frac: None,
             window_activation_sub: None,
             window_active: true,
@@ -429,7 +435,7 @@ impl VideoPlayerView {
         let (Some(ffmpeg), Some(path)) = (self.ffmpeg.clone(), self.path.clone()) else {
             return;
         };
-        let at = at.clamp(Hns::ZERO, self.duration);
+        let at = at.clamp(Hns::ZERO, self.duration.max(Hns::ZERO));
         self.paused_on_blur = false;
         self.stop_audio();
         let speed = self.effective_speed();
@@ -490,6 +496,8 @@ impl VideoPlayerView {
         self.hold = None;
         self.boosted = false;
         self.scrubbing = false;
+        self.scrub_resume = false;
+        self.scrub_pending = None;
         self.track_menu_open = false;
         self.paused_on_blur = false;
         self.stop_audio();
@@ -505,15 +513,55 @@ impl VideoPlayerView {
 
     /// Moves to `t`: keeps playing if it was, else shows that frame.
     fn seek(&mut self, t: Hns, cx: &mut Context<Self>) {
-        let t = t.clamp(Hns::ZERO, self.duration);
+        let t = t.clamp(Hns::ZERO, self.duration.max(Hns::ZERO));
         if self.player.playing {
             self.play_from(t, cx);
         } else if self.ffmpeg.is_some() && self.path.is_some() {
             self.stop_audio();
-            if let (Some(ffmpeg), Some(path)) = (self.ffmpeg.as_ref(), self.path.as_ref()) {
-                self.player.show_at(ffmpeg, path, t, t);
+            if self.scrubbing && self.player.busy() {
+                // A still is still decoding: keep only the latest time, the tick shows it next.
+                self.player.playhead = t;
+                self.scrub_pending = Some(t);
+            } else {
+                self.show_still(t);
             }
             self.ensure_ticking(cx);
+            cx.notify();
+        }
+    }
+
+    fn show_still(&mut self, t: Hns) {
+        if let (Some(ffmpeg), Some(path)) = (self.ffmpeg.as_ref(), self.path.as_ref()) {
+            self.player.show_at(ffmpeg, path, t, t);
+        }
+    }
+
+    /// Starts a seek-bar drag. Playback pauses so the drag shows stills, not a restart per move.
+    fn begin_scrub(&mut self) {
+        self.scrubbing = true;
+        self.scrub_resume = self.player.playing;
+        if self.scrub_resume {
+            self.hold = None;
+            self.boosted = false;
+            self.stop_audio();
+            self.player.pause();
+        }
+    }
+
+    /// Ends a seek-bar drag: shows the last still, or resumes playing from it.
+    fn end_scrub(&mut self, cx: &mut Context<Self>) {
+        if !self.scrubbing {
+            return;
+        }
+        self.scrubbing = false;
+        let pending = self.scrub_pending.take();
+        if std::mem::take(&mut self.scrub_resume) {
+            self.play_from(self.player.playhead, cx);
+        } else {
+            if let Some(t) = pending {
+                self.show_still(t);
+                self.ensure_ticking(cx);
+            }
             cx.notify();
         }
     }
@@ -570,7 +618,11 @@ impl VideoPlayerView {
                             this.boosted = true;
                             this.restart(cx);
                         }
-                        let busy = this.player.tick();
+                        let mut busy = this.player.tick();
+                        if !busy && let Some(t) = this.scrub_pending.take() {
+                            this.show_still(t);
+                            busy = this.player.busy();
+                        }
                         if !this.player.playing {
                             this.stop_audio();
                         } else if let Some(audio) = this.audio.as_mut()
@@ -1051,6 +1103,8 @@ fn disabled_transport(
 impl Render for VideoPlayerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.load_audio_prefs(cx);
+        // F11 toggles the OS window directly, so follow it for the Esc handling and header.
+        self.fullscreen = window.is_fullscreen();
         if self.window_activation_sub.is_none() {
             self.window_activation_sub =
                 Some(cx.observe_window_activation(window, |this, window, cx| {
@@ -1499,7 +1553,7 @@ impl Render for VideoPlayerView {
                     if !ready {
                         return;
                     }
-                    this.scrubbing = true;
+                    this.begin_scrub();
                     this.hover_frac = this.hover_frac_at(ev.position);
                     this.seek_to_x(ev.position.x, cx);
                 }),
@@ -1513,7 +1567,7 @@ impl Render for VideoPlayerView {
                 } else {
                     let next_hover = this.hover_frac_at(ev.position);
                     let was_scrubbing = this.scrubbing;
-                    this.scrubbing = false;
+                    this.end_scrub(cx);
                     let moved = match (this.hover_frac, next_hover) {
                         (Some(a), Some(b)) => (a - b).abs() > 0.002,
                         (None, None) => false,
@@ -1528,19 +1582,13 @@ impl Render for VideoPlayerView {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                    if this.scrubbing {
-                        this.scrubbing = false;
-                        cx.notify();
-                    }
+                    this.end_scrub(cx);
                 }),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                    if this.scrubbing {
-                        this.scrubbing = false;
-                        cx.notify();
-                    }
+                    this.end_scrub(cx);
                 }),
             );
 
