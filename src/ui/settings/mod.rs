@@ -391,6 +391,17 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// Whether a hotkey field is listening (and so global hotkeys are suspended).
+    pub fn is_listening(&self) -> bool {
+        self.listening.is_some()
+    }
+
+    /// Ends a listening session at once because the screen was left. Without this, switching tabs
+    /// by any route other than a click on the field's own blur would leave hotkeys suspended.
+    pub fn leave(&mut self, cx: &mut Context<Self>) {
+        self.stop_listening(false, cx);
+    }
+
     fn stop_listening(&mut self, with_grace: bool, cx: &mut Context<Self>) {
         if self.listening.is_none() {
             return;
