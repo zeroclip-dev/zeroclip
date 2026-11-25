@@ -418,6 +418,8 @@ pub(crate) struct Fmp4Writer {
     origin: Option<Hns>,
     /// The last video PTS accepted. A step backwards is an error, since B-frames are off.
     last_video_pts: Option<Hns>,
+    /// The last PTS accepted per track position, for audio. A step backwards drops the packet.
+    last_audio_pts: Vec<Option<Hns>>,
     /// Fragments written so far, so the next one has `sequence + 1` in its `mfhd`.
     sequence: u32,
     /// Samples waiting for the next fragment, per track position.
@@ -488,6 +490,7 @@ impl Fmp4Writer {
             init_written: false,
             origin: None,
             last_video_pts: None,
+            last_audio_pts: vec![None; count],
             sequence: 0,
             samples: (0..count).map(|_| Vec::new()).collect(),
             data: (0..count).map(|_| Vec::new()).collect(),
@@ -605,6 +608,15 @@ impl ContainerWriter for Fmp4Writer {
                 self.flush_fragment()?;
             }
             self.last_video_pts = Some(meta.pts);
+        } else {
+            // Audio that steps back would get a zero duration and shift the track. Drop it
+            // rather than fail the whole file.
+            let last = &mut self.last_audio_pts[position];
+            if last.is_some_and(|last| meta.pts < last) {
+                warn!(track = ?meta.track, pts = ?meta.pts, "audio PTS went backwards; packet dropped");
+                return Ok(());
+            }
+            *last = Some(meta.pts);
         }
         let size =
             append_sample(&mut self.data[position], packet.data, &self.tracks[position].kind)?;
@@ -1218,6 +1230,32 @@ mod tests {
         assert!(samples.iter().all(|sample| sample.1 == 8), "4-byte NAL behind a 4-byte length");
         // The second fragment starts at its keyframe's own PTS, one second in.
         assert_eq!(tfdt_base(trafs(fragments[1].0)[0]), 10_000_000);
+    }
+
+    #[test]
+    fn an_audio_packet_that_steps_back_is_dropped() {
+        let tracks = [video(), audio(TrackId::GameAudio, "Game")];
+        let audio_packet = |ms: i64| Packet {
+            meta: PacketMeta {
+                track: TrackId::GameAudio,
+                pts: Hns::from_millis(ms),
+                duration: Hns::from_millis(20),
+                keyframe: true,
+            },
+            data: vec![1, 2, 3],
+        };
+        let packets = [
+            video_packet(0, true),
+            audio_packet(0),
+            audio_packet(20),
+            audio_packet(10),
+            audio_packet(40),
+            video_packet(1000, true),
+        ];
+        let file = mux(&tracks, &packets);
+        let (moof, _) = fragments(&file)[0];
+        let samples = trun_samples(child(trafs(moof)[1], b"trun"));
+        assert_eq!(samples.len(), 3, "the packet at 10 ms is dropped");
     }
 
     #[test]
