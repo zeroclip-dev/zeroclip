@@ -66,6 +66,26 @@ jobs:
             -C link-arg=/PDBALTPATH:%_PDB%
         run: cargo build --release --locked -p zeroclip
 
+      # ffmpeg ships with the zip and as its own asset (the app downloads that one beside the exe
+      # when ffmpeg is missing). Pinned gyan.dev "essentials" build: GPL, has libx264/libx265,
+      # which the editor's exact cuts use. Bump URL and hash together.
+      - name: Fetch ffmpeg (pinned, hash-checked)
+        shell: pwsh
+        env:
+          FFMPEG_URL: https://github.com/GyanD/codexffmpeg/releases/download/9.1/ffmpeg-9.1-essentials_build.zip
+          FFMPEG_SHA256: b9bbbb3acece000cbeec994f856649354e52c773807841e78908374b24d658fd
+        run: |
+          Invoke-WebRequest $env:FFMPEG_URL -OutFile ffmpeg-src.zip
+          $hash = (Get-FileHash ffmpeg-src.zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:FFMPEG_SHA256) { throw "ffmpeg download hash $hash does not match the pinned one" }
+          Expand-Archive ffmpeg-src.zip ffmpeg-src
+          $bin = (Get-ChildItem ffmpeg-src -Recurse -Filter ffmpeg.exe | Select-Object -First 1).DirectoryName
+          $license = Get-ChildItem ffmpeg-src -Recurse -Filter LICENSE | Select-Object -First 1
+          New-Item -ItemType Directory -Force ffmpeg | Out-Null
+          Copy-Item "$bin/ffmpeg.exe", "$bin/ffprobe.exe" ffmpeg/
+          $source = "ffmpeg 9.1 essentials build by gyan.dev, licensed GPL v3.`nBuild: $env:FFMPEG_URL`nSource: https://ffmpeg.org/releases/ffmpeg-9.1.tar.xz and https://www.gyan.dev/ffmpeg/builds/`n`n"
+          [IO.File]::WriteAllText("$PWD/ffmpeg/LICENSE-ffmpeg.txt", $source + (Get-Content $license.FullName -Raw))
+
       - name: Package and hash
         shell: pwsh
         env:
@@ -74,8 +94,10 @@ jobs:
           $base = "ZeroClip-v$env:VERSION-windows-x64"
           New-Item -ItemType Directory -Force dist, stage | Out-Null
           Copy-Item target/release/zeroclip.exe "dist/$base.exe"
-          Copy-Item target/release/zeroclip.exe, LICENSE, README.md stage/
+          Copy-Item target/release/zeroclip.exe, LICENSE, README.md, ffmpeg/* stage/
           Compress-Archive -Path stage/* -DestinationPath "dist/$base.zip"
+          # The app's installer expects exactly these names at the zip's root (update::FFMPEG_ASSET).
+          Compress-Archive -Path ffmpeg/* -DestinationPath dist/ffmpeg-windows-x64.zip
           # sha256sum format: "<lowercase hex>  <file name>", LF line endings, no BOM.
           $lines = Get-ChildItem dist -File | Where-Object Name -ne 'SHA256SUMS.txt' | Sort-Object Name |
             ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" }
