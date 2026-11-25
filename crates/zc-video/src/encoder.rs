@@ -372,21 +372,26 @@ impl HwEncoder {
     pub fn take_output(&mut self, sink: &dyn PacketSink) -> Result<(), SourceError> {
         let mut out = [MFT_OUTPUT_DATA_BUFFER { dwStreamID: 0, ..Default::default() }];
         let mut status = 0u32;
-        // SAFETY: valid output array and status for the call.
-        match unsafe { self.transform.ProcessOutput(0, &mut out, &mut status) } {
-            Ok(()) => {}
-            Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                // The encoder settled its output format (e.g. after the first frame).
-                // SAFETY: plain COM calls on a live transform.
-                return unsafe {
-                    self.transform
-                        .GetOutputAvailableType(0, 0)
-                        .and_then(|t| self.transform.SetOutputType(0, &t, 0))
+        // After a stream change the call must be repeated for the pending output
+        // (https://learn.microsoft.com/windows/win32/medfound/handling-stream-changes),
+        // or the packet it announced is never taken. One repeat is enough.
+        for attempt in 0..2 {
+            // SAFETY: valid output array and status for the call.
+            match unsafe { self.transform.ProcessOutput(0, &mut out, &mut status) } {
+                Ok(()) => break,
+                Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE && attempt == 0 => {
+                    // The encoder settled its output format (e.g. after the first frame).
+                    // SAFETY: plain COM calls on a live transform.
+                    unsafe {
+                        self.transform
+                            .GetOutputAvailableType(0, 0)
+                            .and_then(|t| self.transform.SetOutputType(0, &t, 0))
+                    }
+                    .context("output stream change")?;
                 }
-                .context("output stream change");
+                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
+                Err(e) => return Err(e).context("ProcessOutput"),
             }
-            Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
-            Err(e) => return Err(e).context("ProcessOutput"),
         }
         // SAFETY: both fields are `ManuallyDrop`; each is taken or dropped exactly
         // once. Skipping this leaks a sample every frame.
