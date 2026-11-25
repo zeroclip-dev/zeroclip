@@ -68,6 +68,9 @@ pub struct AppAudioSource {
     worker: Option<Worker>,
     /// When the app was last audible (clock ticks), or `i64::MIN` for never.
     last_audible: Arc<AtomicI64>,
+    /// When the source stopped (clock ticks), while it is stopped. A pause is not part of the
+    /// buffered timeline, so it must not age `last_audible`.
+    stopped_at: Option<i64>,
 }
 
 /// A sample louder than this (about -50 dBFS) counts as sound; anything quieter is idle noise.
@@ -85,6 +88,7 @@ impl AppAudioSource {
             mix: None,
             worker: None,
             last_audible: Arc::new(AtomicI64::new(i64::MIN)),
+            stopped_at: None,
         }
     }
 
@@ -115,6 +119,13 @@ impl AudioSource for AppAudioSource {
         _health: Emit<HealthEvent>,
     ) -> Result<(), SourceError> {
         self.stop();
+        if let Some(at) = self.stopped_at.take() {
+            // Slide the last sound forward over the pause (alt-tab, Game mode).
+            let gap = zc_win::clock::now().ticks() - at;
+            let _ = self.last_audible.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |h| {
+                (h != i64::MIN).then(|| h.saturating_add(gap))
+            });
+        }
         let (config, track, exe, resolve, mix) =
             (*config, self.track, self.exe.clone(), Arc::clone(&self.resolve), self.mix.clone());
         let heard = Arc::clone(&self.last_audible);
@@ -191,12 +202,15 @@ impl AudioSource for AppAudioSource {
     fn stop(&mut self) {
         if let Some(mut worker) = self.worker.take() {
             worker.stop();
+            self.stopped_at.get_or_insert_with(|| zc_win::clock::now().ticks());
         }
     }
 
     fn audible_within(&self, window: Hns) -> bool {
         let heard = self.last_audible.load(Ordering::Relaxed);
-        heard != i64::MIN && zc_win::clock::now().ticks() - heard <= window.ticks()
+        // While stopped, time stands still at the moment it stopped.
+        let now = self.stopped_at.unwrap_or_else(|| zc_win::clock::now().ticks());
+        heard != i64::MIN && now - heard <= window.ticks()
     }
 }
 
