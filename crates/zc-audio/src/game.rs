@@ -104,7 +104,7 @@ impl AudioSource for GameAudioSource {
             let (mut current, mut stream) = (0u32, None::<Stream>);
             // Set once process loopback turns out to be unsupported (pre-20348).
             let mut endpoint = false;
-            // Endpoint mode retries the playback device once a second, not on every loop.
+            // Endpoint mode, and a failed process activation, retry once a second, not on every loop.
             let mut retry_at = Hns::ZERO;
             while !stop.load(Ordering::Acquire) {
                 let want = target.load(Ordering::Relaxed);
@@ -117,23 +117,27 @@ impl AudioSource for GameAudioSource {
                             .ok();
                         retry_at = now + Hns::from_secs(1);
                     }
-                } else if want != current {
+                } else if want != current && (want == 0 || zc_win::clock::now() >= retry_at) {
                     // A retarget leaves a gap, which the silence below fills.
                     stream = None;
-                    current = want;
+                    // `current` is the pid only once its stream runs; a failure leaves it at 0
+                    // so the next try (after `retry_at`) goes again, as the app track does.
+                    current = 0;
                     if want != 0 {
                         match loopback::activate(want).and_then(|c| Stream::start(c, true, &format))
                         {
                             Ok(s) => {
                                 tracing::info!(pid = want, "capturing game audio");
                                 stream = Some(s);
+                                current = want;
                             }
                             Err(SourceError::Unsupported(e)) => {
                                 tracing::info!(%e, "falling back to whole-system loopback");
                                 endpoint = true;
                             }
                             Err(e) => {
-                                tracing::warn!(pid = want, %e, "can't capture this process's audio")
+                                tracing::warn!(pid = want, %e, "can't capture this process's audio");
+                                retry_at = zc_win::clock::now() + Hns::from_secs(1);
                             }
                         }
                     }
@@ -148,8 +152,11 @@ impl AudioSource for GameAudioSource {
                         if let Err(e) =
                             s.read(|pcm, frames, qpc| encode.push(pcm, frames, qpc, &*sink))
                         {
+                            // Device unplugged or switched: drop the stream and re-activate.
                             tracing::warn!(%e, "game audio capture stopped");
                             stream = None;
+                            current = 0;
+                            retry_at = zc_win::clock::now() + Hns::from_secs(1);
                         }
                     }
                     None => std::thread::sleep(Duration::from_millis(100)),
