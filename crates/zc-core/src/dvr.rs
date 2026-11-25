@@ -603,6 +603,12 @@ impl SnapshotCopy {
                     .iter()
                     .find(|p| {
                         p.meta.track == TrackId::Video && p.meta.keyframe && p.meta.pts > lost_pts
+                // A lost audio packet costs that packet only: the video is still whole, and a
+                // gap at the start of one audio track beats losing a GOP or the whole clip.
+                if self.plan.packets[lost].meta.track != TrackId::Video {
+                    self.next = lost + 1;
+                    return Ok(());
+                }
                     })
                     .ok_or(DvrError::Empty)?;
                 self.floor = self.floor.max(key.meta.pts);
@@ -706,6 +712,24 @@ mod tests {
         let video: Vec<Packet> = (0..120).map(|_| s.next_video()).collect();
         // Start listening mid-GOP, at frame 10: nothing is decodable until frame 60.
         for p in &video[10..60] {
+    #[test]
+    fn a_lapped_audio_packet_costs_only_audio_not_video() {
+        // Small audio rings, so the audio the plan names is gone after a little more audio.
+        let mut dvr = DvrBuffer::new(DvrConfig { video_bytes: 10_000_000, audio_bytes: 20_000 });
+        let mut s = SyntheticStream::new();
+        push_all(&mut dvr, &s.take_secs(3));
+        let plan = dvr.plan_snapshot(Hns::from_secs(3)).unwrap();
+        let planned_video = plan.packets.iter().filter(|p| p.meta.track == TrackId::Video).count();
+        push_all(&mut dvr, &s.take_secs(1));
+
+        let mut copy = SnapshotCopy::new(plan);
+        while !copy.is_done() {
+            copy.copy_chunk(&dvr, 1_000_000).expect("an audio loss is not fatal");
+        }
+        let clip = copy.finish();
+        assert_eq!(clip.video().count(), planned_video, "no video was dropped for audio loss");
+    }
+
             assert_eq!(dvr.push(p.view()), Ok(PushOutcome::Discarded));
         }
         assert_eq!(dvr.push(video[60].view()), Ok(PushOutcome::Stored));
