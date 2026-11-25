@@ -15,6 +15,7 @@ mod paths;
 mod settings_store;
 mod tray;
 mod ui;
+mod update;
 mod wiring;
 
 use gpui::{AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
@@ -26,8 +27,18 @@ fn main() -> anyhow::Result<()> {
 
     // Two copies would share the disk-ring DVR file and one would truncate the other's buffer.
     // Held until `main` returns. A failing guard must not block startup.
-    let _instance = match zc_win::single_instance::acquire(zc_win::single_instance::INSTANCE_MUTEX)
-    {
+    let mut instance = zc_win::single_instance::acquire(zc_win::single_instance::INSTANCE_MUTEX);
+    // After an update the old copy is still exiting: retry the guard for a few seconds.
+    if std::env::args().any(|arg| arg == update::AFTER_UPDATE_FLAG) {
+        for _ in 0..20 {
+            if !matches!(instance, Ok(None)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            instance = zc_win::single_instance::acquire(zc_win::single_instance::INSTANCE_MUTEX);
+        }
+    }
+    let _instance = match instance {
         Ok(Some(guard)) => Some(guard),
         Ok(None) => {
             tracing::warn!("ZeroClip is already running; exiting this copy");
@@ -39,6 +50,9 @@ fn main() -> anyhow::Result<()> {
             None
         }
     };
+
+    // Only the copy holding the guard may delete the previous exe.
+    update::cleanup_leftovers();
 
     let settings = settings_store::load(&paths.settings_file);
     // Windows starts ZeroClip with `--tray` at sign-in (P4.16): the window stays hidden.
