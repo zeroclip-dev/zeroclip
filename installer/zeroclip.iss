@@ -56,8 +56,9 @@ Name: "{autodesktop}\ZeroClip"; Filename: "{app}\zeroclip.exe"; Tasks: desktopic
 Filename: "{app}\zeroclip.exe"; Description: "Start ZeroClip"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-; The app's tray keeps it running; stop it so its files can be removed.
-Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM zeroclip.exe"; Flags: runhidden; RunOnceId: "StopZeroClip"
+; The app's tray keeps it running; stop this install's copy (only that path, not other builds)
+; so its files can be removed.
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -Command ""Get-Process zeroclip -ErrorAction SilentlyContinue | Where-Object Path -eq '{app}\zeroclip.exe' | Stop-Process -Force"""; Flags: runhidden; RunOnceId: "StopZeroClip"
 
 [UninstallDelete]
 ; Written beside the exe after install: ffmpeg fetched on first start, and updater leftovers.
