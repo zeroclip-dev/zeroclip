@@ -15,6 +15,7 @@ pub mod profiles;
 pub mod rescue;
 pub mod settings;
 pub mod theme;
+pub mod update_banner;
 pub mod video_player;
 
 use gpui::{
@@ -47,6 +48,7 @@ pub fn shell(
         .child(top_bar(app, cx))
         .children(focus_prompt::banner(app, cx))
         .children(rescue::banner(app, cx))
+        .children(update_banner::banner(app, cx))
         .child(div().flex_1().min_h_0().overflow_hidden().child(app.screens.view(app.tab)))
         .child(status_bar(app))
         .children(clip_menu::layer(app, window, cx))
