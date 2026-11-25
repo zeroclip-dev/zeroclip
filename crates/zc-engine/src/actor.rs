@@ -1068,6 +1068,17 @@ impl Actor {
         if let Some(audio) = self.ports.game_audio.as_mut() {
             audio.set_target_process(None);
         }
+        // Game mode captures the game's window, which is gone now: stop instead of leaving the
+        // encoder running on a dead target. The buffer stays for clips.
+        let gone = self.tracked.as_ref().map(|t| t.exe.as_str());
+        if self
+            .game_capture
+            .as_ref()
+            .is_some_and(|c| gone.is_some_and(|g| g.eq_ignore_ascii_case(&c.exe)))
+        {
+            self.game_capture = None;
+            self.stop_capture();
+        }
         self.tracked = None;
         // A prompt about the game that just exited has nothing left to switch away from (D35).
         self.focus_pending = None;
