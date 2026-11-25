@@ -62,7 +62,9 @@ impl DvrConfig {
     pub fn ring_file_bytes(&self) -> u64 {
         const AUDIO_SLOTS: u64 = TrackId::COUNT as u64 - 1;
         const SLACK: u64 = 1 << 20;
-        self.video_bytes as u64 + self.audio_bytes as u64 * AUDIO_SLOTS + SLACK
+        (self.video_bytes as u64)
+            .saturating_add((self.audio_bytes as u64).saturating_mul(AUDIO_SLOTS))
+            .saturating_add(SLACK)
     }
 }
 
@@ -677,6 +679,12 @@ mod tests {
         assert_eq!(
             check,
             SimpleCheck::TooLittleSpace { needed_bytes: 165_000_000, free_bytes: 100_000_000 }
+    #[test]
+    fn ring_file_bytes_saturates_instead_of_overflowing() {
+        let huge = DvrConfig { video_bytes: usize::MAX, audio_bytes: usize::MAX };
+        assert_eq!(huge.ring_file_bytes(), u64::MAX);
+    }
+
         );
     }
 

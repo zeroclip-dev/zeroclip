@@ -21,7 +21,10 @@ pub fn load(path: &Path) -> Settings {
         }
     };
     match toml::from_str(&text) {
-        Ok(settings) => settings,
+        Ok(mut settings) => {
+            Settings::sanitize_loaded(&mut settings);
+            settings
+        }
         Err(e) => {
             let backup = path.with_extension("toml.bak");
             tracing::warn!(error = %e, backup = %backup.display(), "settings file is invalid; using defaults");
