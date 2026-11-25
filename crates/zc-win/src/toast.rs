@@ -159,7 +159,8 @@ fn message_loop() {
     let mut msg = MSG::default();
     // SAFETY: the standard message loop, on the thread that made the window.
     unsafe {
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        // -1 is an error, and `as_bool()` would treat it as true and spin.
+        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -437,7 +438,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let toast = PENDING.lock().ok().and_then(|mut p| p.take());
             let Some(toast) = toast else { return LRESULT(0) };
             // SAFETY: reads the system DPI; no arguments.
-            let scale = unsafe { GetDpiForSystem() } as f32 / 96.0;
+            let scale = (unsafe { GetDpiForSystem() } as f32 / 96.0).max(1.0);
             // A plain card never knocks an alert off the screen.
             let alert_up =
                 LIVE.with_borrow(|l| l.as_ref().is_some_and(|l| l.alert && l.alpha().is_some()));

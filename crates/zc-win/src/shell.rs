@@ -30,8 +30,13 @@ pub fn reveal(path: &Path) -> io::Result<()> {
 /// with `FOF_ALLOWUNDO` is what Explorer itself uses.
 ///
 /// # Errors
-/// The shell refused (the file is open elsewhere, or is gone).
+/// The path isn't absolute, or the shell refused (the file is open elsewhere, or is gone).
 pub fn recycle(path: &Path) -> io::Result<()> {
+    // The shell resolves a relative path against its own current folder and, without a full
+    // path, can delete outright instead of recycling.
+    if !path.is_absolute() {
+        return Err(io::Error::other("only a full path can go to the Recycle Bin"));
+    }
     // `pFrom` is a list of paths, each ending in a NUL, with one more NUL after the last.
     let mut from: Vec<u16> = path.as_os_str().encode_wide().collect();
     from.extend([0, 0]);
