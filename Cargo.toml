@@ -19,6 +19,8 @@ license = "PolyForm-Noncommercial-1.0.0"
 publish = false
 
 [workspace.dependencies]
+# Build-time only: embeds the app icon (resource id 1, which GPUI loads for the window).
+embed-resource = "3.0.12"
 # Internal crates
 zc-core = { path = "crates/zc-core" }
 zc-engine = { path = "crates/zc-engine" }
@@ -34,25 +36,25 @@ zc-destinations = { path = "crates/zc-destinations" }
 # External crates. Add new ones here and reference them with `{ workspace = true }`
 # so every crate agrees on one version.
 anyhow = "1.0.104"
+async-channel = "2.5.0"
 directories = "6.0.0"
-# glow (OpenGL) renderer: much lighter to build than the default wgpu stack, and the
-# UI is idle while a game runs anyway. Swap "glow" for "wgpu" if OpenGL misbehaves.
-eframe = { version = "0.36.2", default-features = false, features = [
-    "accesskit",
-    "default_fonts",
-    "glow",
-    "links",
-] }
-# PNG screenshots. Already in the tree through eframe.
+gpui = { git = "https://github.com/sonorahq/gpui", rev = "e5766e772ee939b741456eeec22dbe6764fafcdd" }
+gpui_platform = { git = "https://github.com/sonorahq/gpui", rev = "e5766e772ee939b741456eeec22dbe6764fafcdd" }
+# PNG screenshots.
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 # `bundled` compiles SQLite into the binary, so there is no sqlite3.dll to ship. It needs
 # the MSVC C compiler, which the README already requires.
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.10.9"
 thiserror = "2.0.20"
 # Already in the tree through tracing-appender; used for local-time file names.
 time = { version = "0.3.55", features = ["formatting", "local-offset", "macros"] }
 toml = "1.1.6"
+# Notification-area icon and right-click menu (P4.15). Shell_NotifyIconW underneath.
+tray-icon = "0.26.1"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
@@ -73,7 +75,7 @@ dbg_macro = "warn"
 print_stdout = "warn"
 
 [profile.dev.package."*"]
-# Optimise dependencies even in debug builds: egui and image decoding are
+# Optimise dependencies even in debug builds: image decoding are
 # painfully slow at opt-level 0, and dependencies are compiled only once.
 opt-level = 2
 
@@ -95,6 +97,9 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[build-dependencies]
+embed-resource.workspace = true
+
 [dependencies]
 zc-core.workspace = true
 zc-engine.workspace = true
@@ -103,10 +108,19 @@ zc-video.workspace = true
 zc-input.workspace = true
 zc-audio.workspace = true
 zc-win.workspace = true
+image.workspace = true
+zc-store.workspace = true
+zc-editor.workspace = true
 anyhow.workspace = true
 directories.workspace = true
-eframe.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+async-channel.workspace = true
+semver.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 toml.workspace = true
+tray-icon.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true

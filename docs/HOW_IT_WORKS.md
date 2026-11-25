@@ -106,8 +106,8 @@ and dump duration is
 
 The watchdog is a state machine, not a retry loop. It drains, flushes, re-inits and resumes,
 and it steps down the codec ladder (AV1, then HEVC, then H.264) when a GPU cannot keep up
-([DESIGN §8](DESIGN.md#8-reliability--watchdogs)). It is not built yet. Per-game profiles, a
-tray and the watchdog wiring come in the next phase.
+([DESIGN §8](DESIGN.md#8-reliability--watchdogs)). It is built and wired in. Next are the
+crash recovery prompt (P4.12) and the system tray (P4.15).
 
 After that comes the editor. Trim and stitch work by stream copy through the ffmpeg CLI,
 with no re-encode, and clips go to Discord and YouTube with one drop. The full design and

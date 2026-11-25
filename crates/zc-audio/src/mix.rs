@@ -64,8 +64,11 @@ impl AudioSource for MasterMix {
         self.stop();
         // The mix starts `MIX_LAG` behind now, and before any block a source writes. Sources
         // start first, so their first real blocks come after this point, and the track has
-        // no hole at its start.
-        lock_bus(&self.bus).anchor(sample_index(zc_win::clock::now() - MIX_LAG));
+        // no hole at its start. A bus the engine reuses after a stop is already anchored where
+        // the last run ended, so `skip_to` also drops the dead time in between (otherwise it is
+        // mixed as silence on Track 1 and the sources' writes land beyond the ring).
+        let mut scratch = vec![0i16; CHUNK_FRAMES * usize::from(config.channels)];
+        skip_to(&self.bus, sample_index(zc_win::clock::now() - MIX_LAG), &mut scratch);
         let (config, bus) = (*config, Arc::clone(&self.bus));
         self.worker = Some(Worker::spawn("zc-master-mix", move |stop, ready| {
             let setup = (|| {
@@ -103,6 +106,15 @@ impl AudioSource for MasterMix {
             worker.stop();
         }
     }
+}
+
+/// Anchors a fresh bus at sample `to`, or moves a bus that ran before up to it, discarding
+/// what the mix would have produced on the way. Runs on `start`, not the hot path.
+// ponytail: costs a little CPU per second of gap (hours of gap = seconds here); add a
+// `MixBus::reanchor` in zc-core if long idle restarts matter.
+fn skip_to(bus: &Mutex<MixBus>, to: i64, scratch: &mut [i16]) {
+    lock_bus(bus).anchor(to);
+    while lock_bus(bus).mix_until(to, scratch) > 0 {}
 }
 
 /// Mixes everything up to `end` (a QPC time) and encodes it as the Master track. The mix is
@@ -159,6 +171,18 @@ mod tests {
         fn push(&self, packet: PacketRef<'_>) {
             self.0.lock().unwrap().push(packet.to_packet());
         }
+    }
+
+    #[test]
+    fn a_restarted_mix_skips_the_gap() {
+        let bus = Mutex::new(MixBus::new(1, 2));
+        let mut scratch = vec![0i16; 8];
+        skip_to(&bus, 100, &mut scratch);
+        assert_eq!(lock_bus(&bus).mixed_until(), Some(100), "a fresh bus anchors");
+        skip_to(&bus, 5_000, &mut scratch);
+        assert_eq!(lock_bus(&bus).mixed_until(), Some(5_000), "a used bus moves up");
+        skip_to(&bus, 10, &mut scratch);
+        assert_eq!(lock_bus(&bus).mixed_until(), Some(5_000), "never backwards");
     }
 
     #[test]

@@ -415,14 +415,17 @@ fn traf_times(traf: &[u8]) -> Option<TrafTimes> {
     }
     // Each sample is 12 bytes, after the count and the data offset.
     let entries = trun.get(12..)?;
-    if entries.len() != 12 * usize::try_from(samples).ok()? {
+    if entries.len() != usize::try_from(samples).ok()?.checked_mul(12)? {
         return None;
     }
+    // The length check above means there is no partial entry left over, so `.0` is every entry.
     let duration: u64 = entries
-        .chunks_exact(12)
+        .as_chunks::<12>()
+        .0
+        .iter()
         .map(|entry| u64::from(u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]])))
         .sum();
-    Some(TrafTimes { track_id, base, end: base + duration })
+    Some(TrafTimes { track_id, base, end: base.saturating_add(duration) })
 }
 
 /// The final name of a `.partial` file: its name without the `.partial` suffix.
@@ -592,7 +595,7 @@ mod tests {
                 // The tfra's body is after its 8-byte header: a version, flags, track ID, the
                 // length word, the entry count, then 19-byte entries.
                 let tfra = &body[start as usize + 8..end as usize];
-                for entry in tfra[16..].chunks_exact(19) {
+                for entry in tfra[16..].as_chunks::<19>().0.iter() {
                     let moof = u64_at(entry, 8) as usize;
                     assert_eq!(&file[moof + 4..moof + 8], b"moof", "an entry points at a moof");
                 }

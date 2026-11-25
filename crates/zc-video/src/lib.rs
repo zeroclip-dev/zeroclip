@@ -30,5 +30,6 @@ pub mod device;
 pub mod encoder;
 pub mod screenshot;
 mod source;
+pub mod tonemap;
 
 pub use source::GpuVideoSource;

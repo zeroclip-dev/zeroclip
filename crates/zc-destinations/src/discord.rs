@@ -20,10 +20,19 @@ use crate::{
 pub const ASSUMED_LIMIT_BYTES: u64 = 20 * 1024 * 1024;
 
 /// A Discord channel webhook.
-#[derive(Debug)]
 pub struct DiscordWebhook {
     url: String,
     learned_limit: Mutex<Option<u64>>,
+}
+
+/// The URL carries the token, so `Debug` never prints it.
+impl std::fmt::Debug for DiscordWebhook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscordWebhook")
+            .field("url", &"<redacted>")
+            .field("learned_limit", &self.learned_limit)
+            .finish()
+    }
 }
 
 impl DiscordWebhook {
@@ -69,5 +78,16 @@ impl Destination for DiscordWebhook {
             "Phase 6: reqwest multipart POST (payload_json + files[0]) with ?wait=true; \
              on 413 lower `learned_limit`; return the attachment URL from the response"
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_does_not_leak_the_token() {
+        let hook = DiscordWebhook::new("https://discord.com/api/webhooks/1/SECRETTOKEN");
+        assert!(!format!("{hook:?}").contains("SECRETTOKEN"));
     }
 }

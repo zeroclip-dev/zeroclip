@@ -16,7 +16,7 @@ Six non-negotiables. Every decision below traces back to one of these.
 
 **Crash-survivable containers.** Standard MP4 writes its index at the end of the file, so a crash mid-session leaves an unplayable file. Since crash recovery is a headline feature, all direct-to-disk recording uses fragmented MP4 or MKV, both of which stay playable at any truncation point. Remux to plain MP4 at export — still a stream copy, still instant.
 
-**Automated cloud storage.** Local files are temporary; output syncs to YouTube to conserve disk. Deletion is gated on verified upload, and off by default.
+**Sharing is optional.** Local files are kept, and nothing is deleted until an upload is verified (D15). Uploads (Discord first, §10) are opt-in.
 
 **Lightning-fast editing.** A built-in zero-encode editor for trimming and stitching via FFmpeg stream-copy, accepting keyframe-snap granularity in exchange for instant processing.
 
@@ -27,20 +27,20 @@ The significant change from v1: **the encode path is decided.** v1 left it as "M
 | Layer | Choice | Why |
 |---|---|---|
 | Language | Rust | Memory safety, speed, fearless concurrency across capture/encode/IO threads |
-| UI | egui | Immediate-mode, fully asleep when backgrounded |
+| UI | GPUI | Sleeps when nothing changes, fully asleep when backgrounded |
 | Capture | Direct3D 11 + Windows.Graphics.Capture | Native, external, no injection |
 | Encode | Media Foundation (`mfplat`) | Takes D3D11 textures directly; true zero-copy |
-| Remux / concat | `ffmpeg` (CLI or `ffmpeg-next`) | Stream-copy only — never touches the live capture path |
-| Audio | `wasapi` | Process-scoped loopback capture |
+| Remux / concat | `ffmpeg` CLI, run as a process (not `ffmpeg-next`, D3) | Stream-copy only — never touches the live capture path |
+| Audio | WASAPI through `windows` (windows-rs), not the `wasapi` crate (D25) | Process-scoped loopback capture |
 | Input | Raw Input API (`WM_INPUT`) | Invisible to anti-cheat, handles chords without hook latency |
 | Screenshots | `image` | Fast PNG/JPEG encode |
 | Metadata | `rusqlite` | Embedded, zero-config |
-| Foreground detection | `SetWinEventHook` | Event-driven; replaces `sysinfo` polling |
-| Process enumeration | `sysinfo` | Still useful for PID lookup, just not for the hot path |
-| Playback | `egui_video` or `libmpv` | See note below |
-| Async runtime | `tokio` | Uploads, waveform extraction, background IO |
+| Foreground detection | `SetWinEventHook` | Event-driven; nothing is polled |
+| Process enumeration | Toolhelp snapshot through `windows` (`zc-win`) | PID and executable lookup, off the hot path |
+| Playback | External `ffplay` for preview; keyframe thumbnails from `ffmpeg.exe` | No libmpv or egui_video (D22) |
+| Async runtime | `tokio` (Phase 6) | Uploads; waveforms and ffmpeg jobs use std threads (P5) |
 
-**Playback decision, flagged early:** `libmpv` is a much heavier Windows runtime dependency than anything else here, and it affects packaging and installer size. Decide this before Phase 5 rather than during it. `egui_video` is lighter but less mature; if scrubbing performance disappoints, the fallback is spawning an external player for preview rather than pulling in libmpv.
+**Playback decision (settled, D22):** keyframe thumbnails come from `ffmpeg.exe`, and "Preview" runs `ffplay` from the same folder. libmpv is a heavy runtime DLL and egui_video links FFmpeg as a library, which breaks D3. The cost is no frame-accurate in-app scrubbing.
 
 ## 3. Video Pipeline
 
@@ -109,7 +109,7 @@ All modes share one zero-allocation encode loop. Memory is pre-allocated at laun
 
 **Retrospective DVR (clip last X minutes).** Encoded NAL units and both audio tracks flow into their respective ring buffers (§4, §6). The hotkey walks back to the covering GOP boundary and dumps video plus time-aligned audio to disk. This is the only mode where GOP-awareness matters.
 
-**Manual record (start/stop).** Bypasses the ring buffer entirely. The hotkey opens a direct fMP4/MKV stream and writes until toggled off.
+**Manual record (start/stop).** Runs together with the DVR, not instead of it: one encode feeds both, and only one recording runs at a time (D20). The hotkey opens a direct fMP4/MKV stream and writes until toggled off.
 
 **Session recording.** Triggered by the Game Profiles engine (§7) on game launch. Streams direct-to-disk for the life of the process. Because the container is fragmented, an abrupt game crash leaves a playable file rather than a corrupt one.
 
@@ -155,9 +155,9 @@ Bound to a push-to-talk key via Raw Input. Writes silence when released so track
 
 ## 7. Game Profiles Engine
 
-**Event-driven, not polled.** v1 tied this to `sysinfo` scanning the foreground window. Replace that with `SetWinEventHook` on `EVENT_SYSTEM_FOREGROUND` — the OS notifies on focus change, costing nothing between events instead of burning a timer forever. `sysinfo` stays around for PID and executable-path lookup once a change fires.
+**Event-driven, not polled.** v1 tied this to `sysinfo` scanning the foreground window. Replace that with `SetWinEventHook` on `EVENT_SYSTEM_FOREGROUND` — the OS notifies on focus change, costing nothing between events instead of burning a timer forever. A Toolhelp snapshot in `zc-win` does the PID and executable-path lookup once a change fires.
 
-On a foreground change the engine resolves the executable, looks up a profile in SQLite, and applies it:
+On a foreground change the engine resolves the executable, looks up a profile in `settings.toml`, and applies it:
 
 | Executable | Buffer | Session recording |
 |---|---|---|
@@ -204,19 +204,19 @@ Watch encoder `HRESULT` returns, frame delta times against expected frame interv
 
 ### Raw Input needs a message pump
 
-A detail that bites people: `WM_INPUT` requires a window with a running message loop. Don't rely on the sleeping egui window — give the input system a dedicated `HWND_MESSAGE` window on its own thread so hotkeys work reliably regardless of UI state.
+A detail that bites people: `WM_INPUT` requires a window with a running message loop. Don't rely on the sleeping GPUI window — give the input system a dedicated `HWND_MESSAGE` window on its own thread so hotkeys work reliably regardless of UI state.
 
 ## 9. The Lightning Editor
 
 Speed comes from never re-encoding. FFmpeg stream-copy slices and joins files essentially instantly.
 
-**Playback.** `egui_video` scrubs the clip inside the Rust UI. See the packaging note in §2 before committing to libmpv as the alternative.
+**Playback.** Keyframe thumbnails from `ffmpeg.exe`; "Preview" runs `ffplay` from the same folder (D22). No in-app scrubbing.
 
 **Instant trimming.** The user sets in/out points; the backend cuts at the nearest IDR. Because §3 pins the keyframe interval to 1–2s, snap granularity is known and consistent rather than variable. **Show the snap points in the scrub bar** — users accept the limitation readily when they can see where cuts will land, and find it maddening when they can't.
 
 **Stitching.** FFmpeg concat demuxer joins clips instantly, provided codec and resolution match. Clips recorded under different profiles or after a codec-ladder fallback won't concat cleanly — detect the mismatch up front and either refuse with a clear reason or offer a one-time re-encode, rather than producing a broken file.
 
-**Waveform.** A background `tokio` task computes RMS peaks and hands an array to egui to draw. Cache the result in SQLite keyed by file hash so reopening a clip is instant.
+**Waveform.** A short-lived std thread computes RMS peaks (P5) and hands an array to GPUI to draw. Cache the result in SQLite keyed by file hash so reopening a clip is instant.
 
 **Worth adding:** keep the original file until the trimmed export is verified, and make trimming non-destructive by default. "Instant" editing that silently overwrites the source is how people lose the clip they were trying to save.
 
@@ -306,7 +306,7 @@ The phase order is a genuine dependency chain — each phase is unblocked by the
 
 **Phase 3 — Buffers, modes, muxing.** GOP-indexed video ring buffer, parallel audio ring buffers, the encoder-output tee, direct-to-disk fMP4 writer, interleaved muxing. *Done when:* a DVR dump taken at any arbitrary moment decodes from the first frame and has audio.
 
-**Phase 4 — UI, profiles, watchdogs.** egui frontend, SQLite metadata, `SetWinEventHook` profile engine with safe buffer resizing, the watchdog state machine, crash rescue. *Done when:* killing the game process via Task Manager reliably produces a recovery prompt with intact video.
+**Phase 4 — UI, profiles, watchdogs.** GPUI frontend (D36; was egui, D13), SQLite metadata, `SetWinEventHook` profile engine with safe buffer resizing, the watchdog state machine, crash rescue. *Done when:* killing the game process via Task Manager reliably produces a recovery prompt with intact video.
 
 **Phase 5 — Editor.** Playback, waveform extraction and caching, stream-copy trim with visible snap points, concat with codec-mismatch detection. *Done when:* trimming a 5-minute clip completes in under a second and the result plays in VLC and a browser.
 
@@ -321,10 +321,10 @@ Write the disk writer and muxer against synthetic frames before wiring real capt
 Things to verify against documentation before designing around them. Several of these shape the UI, so resolving them early avoids rework.
 
 - ~~**WASAPI process loopback mode.**~~ Resolved: include mode, one client per app, each its own track (D27).
-- **HDCP resume signalling.** Does WGC surface any usable event on protected-content transitions, or is polling with backoff genuinely the only option? (§3)
-- **libmpv vs egui_video.** Affects installer size and packaging. Decide before Phase 5. (§2, §9)
-- **Buffer resize under load.** Is a brief writer pause acceptable, or is double-buffering the allocation worth the complexity? (§7)
-- **fMP4 vs MKV.** Both survive truncation. MKV tooling is more forgiving; fMP4 needs no remux for browser playback. Pick one and be consistent.
+- **HDCP resume signalling.** Does WGC surface any usable event on protected-content transitions, or is polling with backoff genuinely the only option? (§3) **Settled: D23.**
+- **libmpv vs egui_video.** Affects installer size and packaging. Decide before Phase 5. (§2, §9) **Settled: D22.**
+- **Buffer resize under load.** Is a brief writer pause acceptable, or is double-buffering the allocation worth the complexity? (§7) **Settled: D21.**
+- **fMP4 vs MKV.** Both survive truncation. MKV tooling is more forgiving; fMP4 needs no remux for browser playback. Pick one and be consistent. **Settled: D18.**
 - **Multi-monitor and HDR.** Not addressed in v1 at all. Which display gets captured when the game moves, and what happens to HDR content on an SDR encode path? Tone mapping is not free and will need a decision.
 - **Will the YouTube compliance audit pass?** Unknown and outside your control, which is why BYO-credentials ships first. Submit early, treat approval as a bonus. (§10)
 

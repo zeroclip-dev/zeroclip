@@ -14,7 +14,7 @@ use crate::profile::ProfileSet;
 use crate::time::Hns;
 
 /// Everything the user can configure.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Where files go and in what container.
@@ -33,9 +33,109 @@ pub struct Settings {
     pub uploads: UploadSettings,
     /// Per-game profiles.
     pub profiles: ProfileSet,
+    /// The lightning editor's external tools (P5.5).
+    #[serde(default)]
+    pub editor: EditorSettings,
+    /// Tray and startup behaviour (P4.15, P4.16).
+    #[serde(default)]
+    pub app: AppSettings,
+    /// Simple mode ("clip the last N minutes") or the full settings.
+    #[serde(default)]
+    pub ui_mode: UiMode,
+    /// Small click-through cards for "clip saved", recording and screenshot events. They are
+    /// excluded from capture, so they never end up in a recording.
+    #[serde(default = "default_overlay_toasts")]
+    pub overlay_toasts: bool,
+    /// Video player playback preferences (volume and mute).
+    #[serde(default)]
+    pub player: PlayerSettings,
+    /// The editor preview's volume and mute, kept apart from the clip player's.
+    #[serde(default)]
+    pub editor_volume: PlayerSettings,
+    /// Update checks.
+    #[serde(default)]
+    pub updates: UpdateSettings,
+}
+
+/// Update checks. Installing is always a click, never automatic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateSettings {
+    /// Look for a newer release at startup and once a day.
+    pub check: bool,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self { check: true }
+    }
+}
+
+fn default_overlay_toasts() -> bool {
+    true
+}
+
+// Hand-written so `overlay_toasts` defaults to on, not to `bool::default()`.
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            recording: RecordingSettings::default(),
+            dvr: DvrSettings::default(),
+            video: VideoSettings::default(),
+            audio: AudioSettings::default(),
+            hotkeys: HotkeySettings::default(),
+            storage: StorageSettings::default(),
+            uploads: UploadSettings::default(),
+            profiles: ProfileSet::default(),
+            editor: EditorSettings::default(),
+            app: AppSettings::default(),
+            ui_mode: UiMode::default(),
+            overlay_toasts: default_overlay_toasts(),
+            player: PlayerSettings::default(),
+            editor_volume: PlayerSettings::default(),
+            updates: UpdateSettings::default(),
+        }
+    }
+}
+
+/// How the app presents itself. Old settings files have no `ui_mode`, so they load as
+/// [`Advanced`](UiMode::Advanced), the full settings they already had.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UiMode {
+    /// Just "clip the last N minutes"; the app only checks that storage is enough.
+    Simple,
+    /// The full settings.
+    #[default]
+    Advanced,
 }
 
 impl Settings {
+    /// Highest video bitrate a loaded file may ask for, kbit/s. Sizes the DVR buffer, so an
+    /// absurd value would otherwise ask for terabytes.
+    const MAX_LOADED_BITRATE_KBPS: u32 = 500_000;
+
+    /// Pulls numbers read from a hand-edited or damaged settings file into the ranges
+    /// [`problems`](Self::problems) enforces, so a bad value can't size a buffer from nonsense
+    /// or poison the mix with NaN. The UI never writes such values; the file can.
+    pub fn sanitize_loaded(&mut self) {
+        let video = &mut self.video;
+        video.fps = video.fps.clamp(1, 240);
+        video.max_bitrate_kbps = video.max_bitrate_kbps.clamp(1, Self::MAX_LOADED_BITRATE_KBPS);
+        video.min_bitrate_kbps = video.min_bitrate_kbps.min(video.max_bitrate_kbps);
+        video.keyframe_interval_ms = video.keyframe_interval_ms.clamp(500, 4_000);
+        self.dvr.ram_ceiling_mib = self.dvr.ram_ceiling_mib.max(64);
+        self.storage.write_chunk_mib = self.storage.write_chunk_mib.clamp(1, 64);
+        for gain in [&mut self.audio.mix_gain_db.game, &mut self.audio.mix_gain_db.mic] {
+            // `clamp` passes NaN through, so catch it first.
+            *gain = if gain.is_nan() {
+                0.0
+            } else {
+                gain.clamp(*MIX_GAIN_DB.start(), *MIX_GAIN_DB.end())
+            };
+        }
+    }
+
     /// Problems that should block saving, as sentences for the UI. Empty when the
     /// settings are usable.
     #[must_use]
@@ -86,6 +186,7 @@ impl Settings {
             ("Save clip", Some(&hotkeys.save_clip)),
             ("Start/stop recording", Some(&hotkeys.toggle_recording)),
             ("Screenshot", Some(&hotkeys.screenshot)),
+            ("Bookmark", Some(&hotkeys.bookmark)),
             ("Push-to-talk", hotkeys.push_to_talk.as_ref()),
         ];
         for (i, (name_a, chord_a)) in bound.iter().enumerate() {
@@ -101,6 +202,64 @@ impl Settings {
     }
 }
 
+/// Tray and startup behaviour (P4.15, P4.16).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppSettings {
+    /// Closing the window hides it to the tray instead of quitting. The tray's Quit still quits.
+    pub close_to_tray: bool,
+    /// Start ZeroClip with Windows, hidden in the tray (the HKCU Run key).
+    pub start_with_windows: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self { close_to_tray: true, start_with_windows: false }
+    }
+}
+
+/// The editor's external tools (P5.5).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorSettings {
+    /// Full path to `ffmpeg.exe`. `None` looks next to ZeroClip, then on `PATH`. A path that
+    /// doesn't exist is an error, not a silent fallback. `ffprobe` is expected beside it.
+    pub ffmpeg_path: Option<PathBuf>,
+    /// What "Done" does. `Ask` shows the choice each time; the other two remember it.
+    pub finish: FinishChoice,
+    /// The audio track the preview plays (0 is Master). Remembered between sessions.
+    pub listen_track: u8,
+}
+
+/// Video player playback preferences, remembered across clips and restarts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlayerSettings {
+    /// Output volume percentage (`0..=100`).
+    pub volume: u8,
+    /// Whether playback audio is muted.
+    pub muted: bool,
+}
+
+impl Default for PlayerSettings {
+    fn default() -> Self {
+        Self { volume: 100, muted: false }
+    }
+}
+
+/// What the editor does when you press Done.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FinishChoice {
+    /// Ask every time.
+    #[default]
+    Ask,
+    /// Join the pieces into one new file.
+    SaveAs,
+    /// Save each piece as its own file and keep editing.
+    Extract,
+}
+
 /// Output location and container.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -109,6 +268,19 @@ pub struct RecordingSettings {
     pub output_dir: Option<PathBuf>,
     /// Container for recordings. Only fragmented MP4 is written (D18).
     pub container: ContainerFormat,
+    /// How files are laid out inside the output folder.
+    pub layout: StorageLayout,
+}
+
+/// How clips, recordings and screenshots are arranged in the output folder.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageLayout {
+    /// Everything in the output folder itself.
+    #[default]
+    Single,
+    /// `<folder>\<Game>\Clips`, `Recordings` and `Screenshots`. Without a game: the folder itself.
+    PerGame,
 }
 
 /// DVR buffer settings.
@@ -119,12 +291,32 @@ pub struct DvrSettings {
     pub enabled: bool,
     /// Upper bound on the buffer's RAM, in MiB. Profiles asking for more are clamped.
     pub ram_ceiling_mib: u32,
+    /// Where the buffer lives (D32). Applies when the engine starts.
+    pub storage: DvrStorage,
+    /// Folder of the ring file in [`DvrStorage::Disk`] mode. `None` is the recordings folder.
+    pub ring_dir: Option<PathBuf>,
 }
 
 impl Default for DvrSettings {
     fn default() -> Self {
-        Self { enabled: true, ram_ceiling_mib: 1_024 }
+        Self {
+            enabled: true,
+            ram_ceiling_mib: 1_024,
+            storage: DvrStorage::default(),
+            ring_dir: None,
+        }
     }
+}
+
+/// Where the DVR buffer is kept (D32). Hybrid (P4.22) is not built yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DvrStorage {
+    /// Pre-allocated, page-locked RAM (D4).
+    #[default]
+    Ram,
+    /// A fixed-size ring file on disk; only a small staging area stays in RAM (P4.21).
+    Disk,
 }
 
 /// Capture and encoder settings.
@@ -321,6 +513,8 @@ pub struct HotkeySettings {
     pub toggle_recording: Chord,
     /// Screenshot.
     pub screenshot: Chord,
+    /// Mark a moment of the running recording.
+    pub bookmark: Chord,
     /// Push-to-talk (only used when the mic is in push-to-talk mode).
     pub push_to_talk: Option<Chord>,
 }
@@ -333,6 +527,7 @@ impl Default for HotkeySettings {
             save_clip: chord(Key::f(10)),
             toggle_recording: chord(Key::f(9)),
             screenshot: chord(Key::f(1)),
+            bookmark: chord(Key::f(8)),
             push_to_talk: None,
         }
     }
@@ -368,6 +563,20 @@ pub struct UploadSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loaded_nonsense_is_pulled_into_range() {
+        let mut s = Settings::default();
+        s.audio.mix_gain_db.game = f32::NAN;
+        s.audio.mix_gain_db.mic = 1e9;
+        s.video.max_bitrate_kbps = u32::MAX;
+        s.video.min_bitrate_kbps = u32::MAX;
+        s.video.fps = 0;
+        s.sanitize_loaded();
+        assert!(s.problems().is_empty(), "{:?}", s.problems());
+        assert_eq!(s.audio.mix_gain_db.game, 0.0);
+        assert_eq!(s.audio.mix_gain_db.mic, 12.0);
+    }
 
     #[test]
     fn defaults_follow_the_design_doc() {
@@ -438,12 +647,22 @@ mod tests {
     }
 
     #[test]
+    fn overlay_toasts_default_on_for_new_and_old_files() {
+        assert!(Settings::default().overlay_toasts);
+        let older: Settings = toml::from_str("[video]\nfps = 60\n").unwrap();
+        assert!(older.overlay_toasts);
+        let off: Settings = toml::from_str("overlay_toasts = false\n").unwrap();
+        assert!(!off.overlay_toasts);
+    }
+
+    #[test]
     fn missing_fields_fall_back_to_defaults() {
         // An older settings file that only knows about one option.
         let s: Settings = toml::from_str("[video]\nfps = 144\n").unwrap();
         assert_eq!(s.video.fps, 144);
         assert_eq!(s.video.max_bitrate_kbps, 20_000);
         assert_eq!(s.hotkeys, HotkeySettings::default());
+        assert!(s.app.close_to_tray);
     }
 
     #[test]
@@ -456,12 +675,42 @@ mod tests {
     }
 
     #[test]
+    fn old_settings_without_ui_mode_load_as_advanced() {
+        let older: Settings = toml::from_str("[video]\nfps = 60\n").unwrap();
+        assert_eq!(older.ui_mode, UiMode::Advanced);
+        assert_eq!(Settings::default().ui_mode, UiMode::Advanced);
+        let simple: Settings = toml::from_str("ui_mode = \"simple\"\n").unwrap();
+        assert_eq!(simple.ui_mode, UiMode::Simple);
+    }
+
+    #[test]
     fn capture_mode_defaults_to_game_and_loads_from_older_files() {
         assert_eq!(Settings::default().video.capture_mode, CaptureMode::Game);
         let older: Settings = toml::from_str("[video]\nfps = 60\n").unwrap();
         assert_eq!(older.video.capture_mode, CaptureMode::Game);
         let screen: Settings = toml::from_str("[video]\ncapture_mode = \"screen\"\n").unwrap();
         assert_eq!(screen.video.capture_mode, CaptureMode::Screen);
+    }
+
+    #[test]
+    fn dvr_storage_defaults_to_ram_and_loads_from_older_files() {
+        assert_eq!(Settings::default().dvr.storage, DvrStorage::Ram);
+        let older: Settings = toml::from_str(
+            "[dvr]
+enabled = true
+ram_ceiling_mib = 512
+",
+        )
+        .unwrap();
+        assert_eq!(older.dvr.storage, DvrStorage::Ram);
+        assert_eq!(older.dvr.ring_dir, None);
+        let disk: Settings = toml::from_str(
+            "[dvr]
+storage = \"disk\"
+",
+        )
+        .unwrap();
+        assert_eq!(disk.dvr.storage, DvrStorage::Disk);
     }
 
     fn track(label: &str, exe: &str) -> AppTrack {
@@ -510,5 +759,14 @@ mod tests {
         assert!(problems.iter().any(|p| p == "Every app track needs a label."));
         assert!(problems.iter().any(|p| p.contains("\"Spotify\" needs an executable name")));
         assert_eq!(problems.len(), 2, "{problems:#?}");
+    }
+
+    #[test]
+    fn player_settings_default_and_round_trip() {
+        assert_eq!(Settings::default().player, PlayerSettings { volume: 100, muted: false });
+        let older: Settings = toml::from_str("[video]\nfps = 60\n").unwrap();
+        assert_eq!(older.player, PlayerSettings { volume: 100, muted: false });
+        let saved: Settings = toml::from_str("[player]\nvolume = 65\nmuted = true\n").unwrap();
+        assert_eq!(saved.player, PlayerSettings { volume: 65, muted: true });
     }
 }

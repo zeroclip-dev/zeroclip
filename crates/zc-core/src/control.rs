@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use crate::hotkey::Key;
 use crate::media::Codec;
 use crate::settings::Settings;
 use crate::time::Hns;
@@ -17,6 +18,8 @@ pub enum Command {
     SaveClip,
     /// Start or stop a manual recording.
     ToggleRecording,
+    /// Mark this moment of the running recording.
+    Bookmark,
     /// Save a PNG of the current frame.
     Screenshot,
     /// The push-to-talk key went down (`true`) or up (`false`).
@@ -26,6 +29,8 @@ pub enum Command {
     /// The user answered the focus prompt (D35). Clip desktop is not a choice here: the UI
     /// sends `ApplySettings` with capture mode Screen.
     FocusChoice(FocusChoice),
+    /// Suspend global hotkey dispatch while the UI is capturing a new hotkey binding.
+    SetHotkeysSuspended(bool),
     /// Stop all sources and exit the engine thread.
     Shutdown,
 }
@@ -44,12 +49,20 @@ pub enum FocusChoice {
 pub enum EngineEvent {
     /// A fresh status snapshot.
     Status(EngineStatus),
+    /// The save hotkey was accepted and a clip is being written. Sent at once, so the overlay can
+    /// show before the (slow) write finishes.
+    ClipSaving,
     /// A DVR clip was written.
     ClipSaved {
         /// Where.
         path: PathBuf,
         /// How long.
         duration: Hns,
+    },
+    /// A bookmark was added to the running recording, `at` into it.
+    BookmarkAdded {
+        /// How far into the recording.
+        at: Hns,
     },
     /// A screenshot was written.
     ScreenshotSaved {
@@ -94,6 +107,15 @@ pub enum EngineEvent {
         current: String,
         /// The app that has focus and kept it for the debounce.
         candidate: String,
+    },
+    /// A raw key or mouse-button transition, sent only while hotkeys are suspended
+    /// ([`Command::SetHotkeysSuspended`]) so a hotkey field can bind the true virtual-key code
+    /// (Numpad1 vs 1) instead of what the UI toolkit makes of it. Never sent during gameplay.
+    CaptureKey {
+        /// The key as Raw Input reports it (may be a left/right modifier variant).
+        key: Key,
+        /// Pressed (`true`) or released.
+        down: bool,
     },
     /// Something the user should know about, but not an error.
     Warning(String),

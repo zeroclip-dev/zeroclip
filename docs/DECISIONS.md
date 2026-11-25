@@ -62,7 +62,7 @@ The engine talks to `VideoSource` / `AudioSource` / `InputSource` traits in `zc-
 Windows crates implement them; the app wires them in. Keeps the engine testable on any
 OS and the Windows code at the edges.
 
-### D13 · egui via eframe, glow renderer
+### D13 · egui via eframe, glow renderer (superseded by D36)
 Immediate-mode UI that sleeps when nothing changes. The glow (OpenGL) backend builds far
 faster than wgpu; switch the eframe feature to `wgpu` if OpenGL misbehaves on a target
 machine.
@@ -236,7 +236,7 @@ the game-audio fallback is whole-system loopback (D9), so the desktop's sound ca
 The DVR ring is still sized at startup from the default profile, so a profile window longer than that is
 capped by the ring until P4.6 adds Recorder::resize.
 
-### D32 · DVR buffer storage: RAM, disk or hybrid, sized to free memory (amends D4, D21)
+### D32 · DVR buffer storage: RAM, disk or hybrid, sized to free memory (amends D4, D21) (amended by D37)
 `dvr.storage` is `ram`, `disk` or `hybrid`. **RAM** is D4 as built: pre-allocated, page-locked.
 **Disk** writes each finished GOP to a fixed-size ring file on a drive the user picks (default: a
 non-system drive if present); only the in-flight GOP stays in RAM. **Hybrid** keeps the newest
@@ -251,6 +251,7 @@ contend with game asset streaming (pacing from P3.23-25 applies); a ring file is
 never grown; a crash leaves the ring on disk, which P4.11 rescue can read; clips older than the RAM
 part are slower to dump than RAM-only.
 The ring defaults to a different drive than the recordings folder when one exists, so session writes and ring writes don't compete.
+Built so far (P4.21): `ram` and `disk` only; with hybrid not built, the default is `ram`, not hybrid, and `dvr.ring_dir` defaults to the recordings folder.
 
 ### D33 · Game profiles are sticky: only a profiled game changes the profile (builds on D21, D27, D31; first sentence amended by D35)
 A profiled game becomes the tracked game when it takes focus. Its profile stays in effect until
@@ -299,3 +300,22 @@ picks it or picks Clip desktop, so the engine never retargets audio on its own.
 Costs: while a game is tracked, a game the user didn't pick keeps no buffer and no audio until they
 answer. "Clip both in one buffer" needs one ring per game and a two-track dump, a new output format; deferred.
 A workaround is saving both clips at once on a hotkey, which covers most of the need.
+
+### D36 · UI moves from egui to GPUI (supersedes D13)
+Why: the owner decided to switch the UI to GPUI. D13 chose egui for its fast glow build and its
+idle sleep; those reasons belonged to the egui UI. The zc-* crates and the engine never depended on the UI toolkit.
+Consequence: egui/eframe come out of the root crate when the GPUI migration (ROADMAP) finishes;
+zc-* crates are unaffected; screens are ported one per task.
+
+### D37 · DVR storage default is RAM; the disk ring is not crash-readable yet (amends D32)
+The default `dvr.storage` is `ram`. Hybrid is not built. The RAM cap is 5% of total physical RAM
+(`effective_ram_ceiling`, zc-core `profile.rs`), not a share of available memory. A crash leaves no
+readable ring: `DiskRing::create` truncates an existing ring file at start, and P4.11 rescue does not
+read it. Reading the ring after a crash is future work.
+### D38 · The editor may re-encode audio only; video stays stream-copy (D26 supersedes D3 for audio)
+Why: the owner decided per-track volume, muting and cutting part of an audio track are wanted in the
+editor (D26, P5.14). A volume change cannot be done by copying packets. D3 said FFmpeg is used only
+for stream-copy editing; that stays true for video.
+Consequence: export jobs use `-c:v copy`; only the audio tracks the user changed are re-encoded
+(AAC, bitrate matching the source track), untouched tracks stay stream-copied. FFmpeg is still a
+separate `ffmpeg.exe` process (D3), so its LGPL/GPL build never mixes with the app.

@@ -60,6 +60,12 @@ impl AacEncoder {
         channels: u16,
         bitrate_bps: u32,
     ) -> Result<Self, SourceError> {
+        // `encode` and the mic loop divide by the channel count.
+        if channels == 0 || sample_rate == 0 {
+            return Err(SourceError::Other(format!(
+                "AAC needs at least one channel and a sample rate (got {channels} ch, {sample_rate} Hz)"
+            )));
+        }
         let block = u32::from(channels) * 2;
         // SAFETY: plain COM calls on objects created here.
         unsafe {
@@ -228,7 +234,12 @@ impl AacEncoder {
                 let mut data = std::ptr::null_mut();
                 let mut len = 0u32;
                 self.output_buffer.Lock(&mut data, None, Some(&mut len)).context("Lock (AAC)")?;
-                let bytes = std::slice::from_raw_parts(data, len as usize);
+                // A null pointer or zero length would make the slice undefined behaviour.
+                let bytes: &[u8] = if data.is_null() || len == 0 {
+                    &[]
+                } else {
+                    std::slice::from_raw_parts(data, len as usize)
+                };
                 if !bytes.is_empty() {
                     sink.push(PacketRef {
                         meta: PacketMeta { track: self.track, pts, duration, keyframe: true },

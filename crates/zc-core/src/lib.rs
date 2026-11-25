@@ -27,10 +27,13 @@
 //! left; see `CONTRIBUTING.md` for the workflow.
 
 pub mod backoff;
+pub mod bookmarks;
 pub mod control;
 pub mod dsp;
 pub mod dvr;
 pub mod focus_prompt;
+pub mod fs_name;
+pub mod game_tag;
 pub mod hotkey;
 pub mod media;
 pub mod mix;

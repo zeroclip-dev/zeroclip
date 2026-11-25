@@ -11,14 +11,26 @@
 //! - [`drive`]: "is this path on a spinning disk?" (DESIGN §4).
 //! - [`memory`]: page-locking the DVR buffer, so Windows can't page it out (DESIGN §4).
 //! - [`process`]: open windows and process trees, for per-app audio (DESIGN §6).
+//! - [`single_instance`]: a named mutex, so two copies can't share the DVR file.
+//! - [`overlay`]: click-through, capture-excluded toast windows.
 //!
 //! Every `unsafe` block must carry a `// SAFETY:` comment.
 
+pub mod autostart;
+pub mod chime;
 pub mod clock;
 pub mod com;
+pub mod drag;
 pub mod drive;
 pub mod error;
+pub mod icon;
+pub mod main_window;
 pub mod memory;
 pub mod message_thread;
 pub mod mf;
+pub mod notify;
+pub mod overlay;
 pub mod process;
+pub mod shell;
+pub mod single_instance;
+pub mod toast;

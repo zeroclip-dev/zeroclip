@@ -22,6 +22,7 @@
 //! modes get tested deterministically (DESIGN §12, "synthetic-load test harness").
 
 mod actor;
+pub mod disk_dvr;
 mod output;
 pub mod recorder;
 pub mod spool;

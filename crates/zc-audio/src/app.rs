@@ -5,7 +5,7 @@
 //! and `loopback::setup` joins the MTA and starts Media Foundation for the track's encoder.
 //! The exe-to-pid lookup is the injected resolver, so this module does no process queries itself.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use zc_core::Hns;
@@ -66,14 +66,26 @@ pub struct AppAudioSource {
     /// This source's input in the Master mix (D30), if it has one.
     mix: Option<MixInput>,
     worker: Option<Worker>,
+    /// When the app was last audible (clock ticks), or `i64::MIN` for never.
+    last_audible: Arc<AtomicI64>,
 }
+
+/// A sample louder than this (about -50 dBFS) counts as sound; anything quieter is idle noise.
+const AUDIBLE: i16 = 100;
 
 impl AppAudioSource {
     /// A stopped source for `exe` on `track`. `resolve` maps the exe name to the root pid of
     /// its process tree, or `None` when the app isn't running.
     #[must_use]
     pub fn new(track: TrackId, exe: String, resolve: PidResolver) -> Self {
-        Self { track, exe, resolve: Arc::new(Mutex::new(resolve)), mix: None, worker: None }
+        Self {
+            track,
+            exe,
+            resolve: Arc::new(Mutex::new(resolve)),
+            mix: None,
+            worker: None,
+            last_audible: Arc::new(AtomicI64::new(i64::MIN)),
+        }
     }
 
     /// Puts this source in the Master mix as `mix`. Set it before `start`. `None` keeps the
@@ -105,6 +117,7 @@ impl AudioSource for AppAudioSource {
         self.stop();
         let (config, track, exe, resolve, mix) =
             (*config, self.track, self.exe.clone(), Arc::clone(&self.resolve), self.mix.clone());
+        let heard = Arc::clone(&self.last_audible);
         self.worker = Some(Worker::spawn("zc-app-audio", move |stop, ready| {
             let (_apartment, _mf, mut encode) = match loopback::setup(track, &config, mix) {
                 Ok(parts) => {
@@ -153,9 +166,14 @@ impl AudioSource for AppAudioSource {
                 }
                 match &stream {
                     Some(s) => {
-                        if let Err(e) =
-                            s.read(|pcm, frames, qpc| encode.push(pcm, frames, qpc, &*sink))
-                        {
+                        if let Err(e) = s.read(|pcm, frames, qpc| {
+                            if pcm.is_some_and(|p| {
+                                p.iter().any(|v| v.unsigned_abs() > AUDIBLE as u16)
+                            }) {
+                                heard.store(zc_win::clock::now().ticks(), Ordering::Relaxed);
+                            }
+                            encode.push(pcm, frames, qpc, &*sink)
+                        }) {
                             // Drop the stream and retry on the next tick.
                             tracing::warn!(%exe, %e, "app audio capture stopped");
                             stream = None;
@@ -174,6 +192,11 @@ impl AudioSource for AppAudioSource {
         if let Some(mut worker) = self.worker.take() {
             worker.stop();
         }
+    }
+
+    fn audible_within(&self, window: Hns) -> bool {
+        let heard = self.last_audible.load(Ordering::Relaxed);
+        heard != i64::MIN && zc_win::clock::now().ticks() - heard <= window.ticks()
     }
 }
 

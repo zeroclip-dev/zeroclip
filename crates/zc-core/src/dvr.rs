@@ -55,6 +55,55 @@ impl DvrConfig {
         };
         Self { video_bytes: bytes(max_video_bitrate_bps), audio_bytes: bytes(audio_bitrate_bps) }
     }
+
+    /// Size of the ring file in disk mode (P4.21): the video ring plus every audio slot, as a
+    /// record holds a GOP's video and the audio that goes with it. The slack covers record headers.
+    #[must_use]
+    pub fn ring_file_bytes(&self) -> u64 {
+        const AUDIO_SLOTS: u64 = TrackId::COUNT as u64 - 1;
+        const SLACK: u64 = 1 << 20;
+        (self.video_bytes as u64)
+            .saturating_add((self.audio_bytes as u64).saturating_mul(AUDIO_SLOTS))
+            .saturating_add(SLACK)
+    }
+}
+
+/// The answer from [`simple_mode_check`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimpleCheck {
+    /// The drive has room. `needed_bytes` includes the 10% margin.
+    Ok {
+        /// Bytes the window needs, margin included.
+        needed_bytes: u64,
+    },
+    /// The drive is too small for the requested window.
+    TooLittleSpace {
+        /// Bytes the window needs, margin included.
+        needed_bytes: u64,
+        /// Bytes free on the drive.
+        free_bytes: u64,
+    },
+    /// Zero minutes is not a window.
+    InvalidMinutes,
+}
+
+/// Simple mode's storage check: can `free_bytes` hold `minutes` of footage at `bitrate_bps`?
+/// The need is `minutes * 60 * bitrate / 8` bytes plus a 10% margin. Saturating math, so
+/// huge inputs saturate rather than panic.
+#[must_use]
+pub fn simple_mode_check(minutes: u32, bitrate_bps: u64, free_bytes: u64) -> SimpleCheck {
+    if minutes == 0 {
+        return SimpleCheck::InvalidMinutes;
+    }
+    // u128 holds u32::MAX * 60 * u64::MAX, so the product can't overflow. Only the final
+    // narrowing back to u64 can saturate.
+    let bytes = u128::from(minutes) * 60 * u128::from(bitrate_bps) / 8;
+    let needed_bytes = u64::try_from(bytes * 11 / 10).unwrap_or(u64::MAX);
+    if free_bytes >= needed_bytes {
+        SimpleCheck::Ok { needed_bytes }
+    } else {
+        SimpleCheck::TooLittleSpace { needed_bytes, free_bytes }
+    }
 }
 
 /// What [`DvrBuffer::push`] did with a packet.
@@ -85,6 +134,9 @@ pub enum DvrError {
     /// The buffer was cleared or resized while a snapshot was being copied.
     #[error("the buffer changed while saving; try again")]
     Changed,
+    /// The ring file (disk mode, P4.21) couldn't be read.
+    #[error("the DVR ring file couldn't be read: {0}")]
+    Disk(String),
 }
 
 /// Index of the video ring in [`DvrBuffer::rings`]. Audio rings follow it.
@@ -177,6 +229,14 @@ impl DvrBuffer {
         self.rings[VIDEO_RING].front().map(|meta| meta.pts)
     }
 
+    /// Start PTS of every GOP held, oldest first. The newest is the one being written.
+    pub fn gop_starts(&self) -> impl DoubleEndedIterator<Item = Hns> + '_ {
+        self.rings[VIDEO_RING]
+            .positions()
+            .filter(|(meta, _, _)| meta.keyframe)
+            .map(|(m, _, _)| m.pts)
+    }
+
     /// Span of video currently held: from the oldest GOP's start to the end of the newest frame.
     #[must_use]
     pub fn buffered(&self) -> Hns {
@@ -256,12 +316,19 @@ impl DvrBuffer {
             .map_or(oldest, |(meta, _, _)| meta.pts);
 
         let mut packets = Vec::with_capacity(self.rings.iter().map(PacketRing::len).sum());
-        for ring in &self.rings {
+        let mut video_packets = 0;
+        for (index, ring) in self.rings.iter().enumerate() {
             for (meta, abs, len) in ring.positions() {
                 if meta.pts >= start && until.is_none_or(|end| meta.pts < end) {
                     packets.push(PlannedPacket { meta, abs, len });
+                    video_packets += usize::from(index == VIDEO_RING);
                 }
             }
+        }
+        // `until` at or before the oldest frame cuts everything: a clip with no video is
+        // not a clip.
+        if video_packets == 0 {
+            return Err(DvrError::Empty);
         }
         Ok(SnapshotPlan { generation: self.generation, packets })
     }
@@ -536,6 +603,12 @@ impl SnapshotCopy {
                 // The lost packet and everything before the next keyframe after it go: that GOP
                 // is broken, and audio must not outlive the video it plays against.
                 let lost = self.next + index;
+                // A lost audio packet costs that packet only: the video is still whole, and a
+                // gap at the start of one audio track beats losing a GOP or the whole clip.
+                if self.plan.packets[lost].meta.track != TrackId::Video {
+                    self.next = lost + 1;
+                    return Ok(());
+                }
                 let lost_pts = self.plan.packets[lost].meta.pts;
                 let key = self
                     .plan
@@ -604,6 +677,68 @@ mod tests {
         assert!((150_000_000..=155_000_000).contains(&cfg.video_bytes), "{cfg:?}");
         // 192 kbps = 24 KB/s → 1.44 MB per track, plus ≤ 2 s headroom.
         assert!((1_440_000..=1_488_000).contains(&cfg.audio_bytes), "{cfg:?}");
+    }
+
+    #[test]
+    fn ring_file_bytes_saturates_instead_of_overflowing() {
+        let huge = DvrConfig { video_bytes: usize::MAX, audio_bytes: usize::MAX };
+        assert_eq!(huge.ring_file_bytes(), u64::MAX);
+    }
+
+    #[test]
+    fn simple_mode_check_passes_when_the_drive_has_room() {
+        // 1 min at 20 Mbps = 150 MB; with the 10% margin, 165 MB.
+        let check = simple_mode_check(1, 20_000_000, 200_000_000);
+        assert_eq!(check, SimpleCheck::Ok { needed_bytes: 165_000_000 });
+    }
+
+    #[test]
+    fn simple_mode_check_fails_when_the_drive_is_too_small() {
+        let check = simple_mode_check(1, 20_000_000, 100_000_000);
+        assert_eq!(
+            check,
+            SimpleCheck::TooLittleSpace { needed_bytes: 165_000_000, free_bytes: 100_000_000 }
+        );
+    }
+
+    #[test]
+    fn simple_mode_check_rejects_zero_minutes() {
+        assert_eq!(simple_mode_check(0, 20_000_000, u64::MAX), SimpleCheck::InvalidMinutes);
+    }
+
+    #[test]
+    fn simple_mode_check_saturates_instead_of_overflowing() {
+        let check = simple_mode_check(u32::MAX, u64::MAX, 1_000);
+        assert!(matches!(check, SimpleCheck::TooLittleSpace { needed_bytes: u64::MAX, .. }));
+    }
+
+    #[test]
+    fn a_lapped_audio_packet_costs_only_audio_not_video() {
+        // Small audio rings, so the audio the plan names is gone after a little more audio.
+        let mut dvr = DvrBuffer::new(DvrConfig { video_bytes: 10_000_000, audio_bytes: 20_000 });
+        let mut s = SyntheticStream::new();
+        push_all(&mut dvr, &s.take_secs(3));
+        let plan = dvr.plan_snapshot(Hns::from_secs(3)).unwrap();
+        let planned_video = plan.packets.iter().filter(|p| p.meta.track == TrackId::Video).count();
+        push_all(&mut dvr, &s.take_secs(1));
+
+        let mut copy = SnapshotCopy::new(plan);
+        while !copy.is_done() {
+            copy.copy_chunk(&dvr, 1_000_000).expect("an audio loss is not fatal");
+        }
+        let clip = copy.finish();
+        assert_eq!(clip.video().count(), planned_video, "no video was dropped for audio loss");
+    }
+
+    #[test]
+    fn plan_until_before_the_oldest_frame_is_empty_not_a_zero_second_clip() {
+        let mut dvr = DvrBuffer::new(roomy());
+        let mut s = SyntheticStream::new();
+        let video: Vec<Packet> = (0..60).map(|_| s.next_video()).collect();
+        push_all(&mut dvr, &video);
+        let oldest = dvr.oldest_pts().unwrap();
+        let err = dvr.plan_snapshot_until(Hns::from_secs(5), oldest).err();
+        assert_eq!(err, Some(DvrError::Empty));
     }
 
     #[test]

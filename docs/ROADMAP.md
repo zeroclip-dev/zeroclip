@@ -10,7 +10,7 @@ documented core beats a perfect product that isn't finished.
 How to see what is left in the code: `cargo test -- --ignored` runs every spec that
 hasn't been implemented yet.
 
-**Current phase: Phase 3 is done on hardware except P3.28 (README GIF), P3.29 (launch post) and P3.30 (tag v0.1.0). Next code: Phase 4, start at P4.1 ([docs/plan/P4.md](plan/P4.md)).**
+**Current phase: Phase 4 is in progress. Phase 3 is done on hardware except P3.28 (README GIF), P3.29 (launch post) and P3.30 (tag v0.1.0), so v0.1 is not tagged yet. Next code: P4.12, the rescue prompt, which is the phase's done-when ([docs/plan/P4.md](plan/P4.md)).**
 
 Every box below is broken into task cards in [docs/plan/](plan/README.md). Work the
 cards; tick a box here when its cards are done.
@@ -23,6 +23,19 @@ cards; tick a box here when its cards are done.
 - [x] egui app shell: settings persistence, logging, profile editor, activity feed
 - [x] Design, architecture and decision docs
 - [x] Add the CI workflow as `.github/workflows/ci.yml` (format, lint, test and docs on Windows)
+
+## GPUI migration
+
+The UI moves from egui to GPUI (D36). One screen per task; a box is ticked when the ported screen
+matches the egui one it replaces.
+
+- [x] Shell: window, navigation (tray is Phase 4)
+- [x] Home
+- [ ] Clips (merged, awaiting check by eye)
+- [ ] Profiles (merged, awaiting check by eye)
+- [ ] Settings (merged, awaiting check by eye)
+- [ ] Focus prompt + components (merged, awaiting check by eye)
+- [x] Remove eframe/egui deps and the glow note in `Cargo.toml`
 
 ## Phase 0 — Spike (a weekend)
 
@@ -76,19 +89,19 @@ Measured 2026-10-05 with `spike-phase2`: every track within ±11 ms of its minut
 ## Phase 4 — UI, profiles, watchdogs
 
 - [x] Specs: `Watchdog::on_event`, `ProfileSet`, `clamp_window` (`clamp_window` done early, in Phase 3: P3.16)
-- [x] `zc-store` (rusqlite, bundled) and the migrations
+- [x] `zc-store` (rusqlite, bundled) and the migrations (built, not wired in yet)
 - [x] Profile engine on foreground change, with safe buffer resizing
 - [x] Watchdog wiring and the `synthetic_harness` recovery spec (P4.9)
-- [ ] Crash rescue (`recovery.tmp` + prompt) (P4.11, P4.12)
-- [ ] Flight recorder: in-memory ring of recent events, dumped with crash rescue
-- [ ] System tray; close-to-tray; start with Windows
+- [x] Crash rescue (`recovery.tmp` + prompt) (P4.11, P4.12) (awaiting HW check on the prompt)
+- [x] Flight recorder: in-memory ring of recent events, dumped with crash rescue (awaiting HW check)
+- [ ] System tray; close-to-tray; start with Windows (awaiting HW check)
 
 *Done when:* killing the game process via Task Manager reliably produces a recovery prompt with intact video.
 
 ## Phase 5 — Editor
 
 - [ ] Keyframe thumbnail strip; preview in an external player (D22)
-- [ ] Specs: `snap_in_point`, `check_compatible`, `rms_peaks`
+- [x] Specs: `snap_in_point`, `check_compatible`, `rms_peaks`
 - [ ] `zc-editor::ffmpeg` jobs; trim with visible snap points; stitch; export remux
 - [ ] Waveform extraction on a background task, cached by file hash
 
@@ -111,7 +124,7 @@ Spread over the phases above; the cards are P2.24, P3.0a (do it before P3.1), P4
 and P5.14.
 
 - [x] Generalise `TrackId` (P3.0a)
-- [ ] `AppAudioSource`: one track per chosen app (P2.24)
+- [ ] `AppAudioSource`: one track per chosen app (P2.24) (awaiting HW check)
 - [ ] Audio tracks tab in Settings (P4.18)
 - [ ] Track mixer in the editor: volume, mute, solo, mixed export (P5.14)
 
@@ -120,3 +133,4 @@ and P5.14.
 - [ ] Publish the repo; add the CI badge to the README
 - [x] GitHub Sponsors (`.github/FUNDING.yml`) — ten minutes, no downside
 - [ ] Screenshots / a short GIF of saving a clip
+- [x] Single-instance guard: named mutex, second copy exits (X.4) (awaiting HW check)

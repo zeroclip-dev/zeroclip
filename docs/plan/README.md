@@ -40,7 +40,7 @@ The protocol:
    All three must pass before ticking.
 4. **Tick:** check the card's box in its plan file and the matching box in
    `docs/ROADMAP.md`. Update ARCHITECTURE, DESIGN or DECISIONS when the card says to.
-   For a new DECISIONS entry, use the next free D-number. D18–D22 are taken.
+   For a new DECISIONS entry, use the next free D-number. The next free number is the one after the last entry in DECISIONS.md.
 5. **Hardware cards (HW):** run whatever can run from the terminal (`cargo run -p …`,
    `ffprobe` on the output). Then write a short list of what 0xtikaa must check by eye
    (Task Manager, VLC, alt-tab, Netflix…). Leave the box unticked and append
@@ -134,7 +134,7 @@ Every card repeats the pitfalls that apply to it locally. These apply everywhere
     - Put `-t` after `-i`.
     - Add `-tag:v hvc1` for HEVC only.
     - ffprobe's `pts_time` is absolute, so subtract `start_time`.
-11. **eframe 0.36 tray.** The root window can't start hidden: send
+11. **Tray on eframe 0.36 (retired by D36; the rule carries over to GPUI).** The root window can't start hidden: send
     `ViewportCommand::Visible(false)` from `logic()`. Drain engine and tray events in
     `logic()`; `ui()` doesn't run while the window is hidden.
 12. **SQLite:** turn on `PRAGMA foreign_keys` on every connection and use WAL. Never edit
@@ -165,7 +165,7 @@ Every card repeats the pitfalls that apply to it locally. These apply everywhere
   extract on the second.
 - **Designing the app (Phase 4 UI cards and later):** load the `apple-design` and
   `emil-design-eng` skills before designing a screen, and apply their principles (restraint,
-  clear hierarchy, typography, purposeful motion, reduced motion) within egui. They are
+  clear hierarchy, typography, purposeful motion, reduced motion) within GPUI. They are
   written for the web, so translate rather than copy. Owner wants the UI to feel tasteful,
   not like a settings dump.
 

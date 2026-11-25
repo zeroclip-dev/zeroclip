@@ -168,6 +168,22 @@ impl HwEncoder {
         let activate = enum_encoders(device, codec)?.into_iter().next().ok_or_else(|| {
             SourceError::Unsupported(format!("no hardware {} encoder", codec.name()))
         })?;
+        // A failed open (the codec ladder tries several) must still release the MFT, which
+        // holds the GPU encoder session until `ShutdownObject`.
+        Self::open(device, config, size, inputs, activate.clone()).inspect_err(|_| {
+            // SAFETY: shutting down an activate object we own; failures have no remedy.
+            let _ = unsafe { activate.ShutdownObject() };
+        })
+    }
+
+    fn open(
+        device: &ID3D11Device,
+        config: &VideoStart,
+        size: (u32, u32),
+        inputs: &[ID3D11Texture2D],
+        activate: IMFActivate,
+    ) -> Result<Self, SourceError> {
+        let codec = config.codec;
         let frame_size = (u64::from(size.0) << 32) | u64::from(size.1);
         let frame_rate = (u64::from(config.fps.max(1)) << 32) | 1;
 
@@ -372,21 +388,26 @@ impl HwEncoder {
     pub fn take_output(&mut self, sink: &dyn PacketSink) -> Result<(), SourceError> {
         let mut out = [MFT_OUTPUT_DATA_BUFFER { dwStreamID: 0, ..Default::default() }];
         let mut status = 0u32;
-        // SAFETY: valid output array and status for the call.
-        match unsafe { self.transform.ProcessOutput(0, &mut out, &mut status) } {
-            Ok(()) => {}
-            Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                // The encoder settled its output format (e.g. after the first frame).
-                // SAFETY: plain COM calls on a live transform.
-                return unsafe {
-                    self.transform
-                        .GetOutputAvailableType(0, 0)
-                        .and_then(|t| self.transform.SetOutputType(0, &t, 0))
+        // After a stream change the call must be repeated for the pending output
+        // (https://learn.microsoft.com/windows/win32/medfound/handling-stream-changes),
+        // or the packet it announced is never taken. One repeat is enough.
+        for attempt in 0..2 {
+            // SAFETY: valid output array and status for the call.
+            match unsafe { self.transform.ProcessOutput(0, &mut out, &mut status) } {
+                Ok(()) => break,
+                Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE && attempt == 0 => {
+                    // The encoder settled its output format (e.g. after the first frame).
+                    // SAFETY: plain COM calls on a live transform.
+                    unsafe {
+                        self.transform
+                            .GetOutputAvailableType(0, 0)
+                            .and_then(|t| self.transform.SetOutputType(0, &t, 0))
+                    }
+                    .context("output stream change")?;
                 }
-                .context("output stream change");
+                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
+                Err(e) => return Err(e).context("ProcessOutput"),
             }
-            Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
-            Err(e) => return Err(e).context("ProcessOutput"),
         }
         // SAFETY: both fields are `ManuallyDrop`; each is taken or dropped exactly
         // once. Skipping this leaks a sample every frame.
@@ -405,11 +426,14 @@ impl HwEncoder {
             let mut data = std::ptr::null_mut();
             let mut len = 0u32;
             buffer.Lock(&mut data, None, Some(&mut len)).context("IMFMediaBuffer::Lock")?;
-            let bytes = std::slice::from_raw_parts(data, len as usize);
-            sink.push(PacketRef {
-                meta: PacketMeta { track: TrackId::Video, pts, duration, keyframe },
-                data: bytes,
-            });
+            // A null pointer or zero length would make the slice undefined behaviour.
+            if !data.is_null() && len != 0 {
+                let bytes = std::slice::from_raw_parts(data, len as usize);
+                sink.push(PacketRef {
+                    meta: PacketMeta { track: TrackId::Video, pts, duration, keyframe },
+                    data: bytes,
+                });
+            }
             buffer.Unlock().context("IMFMediaBuffer::Unlock")?;
         }
         Ok(())

@@ -65,10 +65,18 @@ pub fn save_png(
     size: (u32, u32),
     path: &Path,
 ) -> Result<(), SourceError> {
+    if size.0 == 0 || size.1 == 0 {
+        return Err(SourceError::Other("no frame to save: the capture has no size".into()));
+    }
     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
     // SAFETY: `staging` is CPU-readable; Map waits for the GPU copy to finish.
     unsafe { context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }.context("Map")?;
     let pitch = mapped.RowPitch as usize;
+    if mapped.pData.is_null() || pitch < size.0 as usize * 4 {
+        // SAFETY: balances the successful Map above.
+        unsafe { context.Unmap(staging, 0) };
+        return Err(SourceError::Other("the screenshot texture mapped to nothing usable".into()));
+    }
     // SAFETY: while mapped, `pData` points at `RowPitch` bytes for each of the
     // texture's rows, and `size` never exceeds the texture.
     let bytes =
@@ -86,7 +94,8 @@ fn bgra_to_rgba(src: &[u8], row_pitch: usize, width: u32, height: u32) -> Vec<u8
     let row_bytes = width as usize * 4;
     let mut out = Vec::with_capacity(row_bytes * height as usize);
     for row in src.chunks(row_pitch).take(height as usize) {
-        for px in row[..row_bytes].chunks_exact(4) {
+        let Some(row) = row.get(..row_bytes) else { break };
+        for px in row.as_chunks::<4>().0 {
             out.extend_from_slice(&[px[2], px[1], px[0], 255]);
         }
     }

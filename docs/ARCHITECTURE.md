@@ -15,14 +15,14 @@ state machine; editing never re-encodes; nothing is ever deleted unverified.
 
 | Crate | Owns | Depends on | OS |
 |---|---|---|---|
-| `zeroclip` (repo root) | egui UI, settings file, logging, **wiring** (composition root) | `zc-engine`, `zc-core`, `zc-mux`, `zc-video`, `zc-win` (drive probe, page-locking); more adapters as phases land | Windows |
-| `zc-engine` | the engine actor, recording modes, the `Recorder`, synthetic sources | `zc-core`, `zc-mux` | any |
+| `zeroclip` (repo root) | GPUI UI, settings file, logging, **wiring** (composition root), **system tray** (`tray.rs`), **self-update** (`update.rs`: GitHub Releases via system `curl.exe`, SHA-256 check, rename-swap restart) | `zc-engine`, `zc-core`, `zc-mux`, `zc-video`, `zc-win` (drive probe, page-locking), `zc-store` (waveform cache), `zc-editor` (Editor tab: ffmpeg jobs run on GPUI background threads); more adapters as phases land | Windows |
+| `zc-engine` | the engine actor, recording modes, the `Recorder`, the disk-backed DVR ring (`disk_dvr.rs`, D32 Disk mode), synthetic sources | `zc-core`, `zc-mux` | any |
 | `zc-core` | `Hns` time, packets, codecs, DVR buffer, watchdog FSM, profiles, hotkeys, DSP, settings, **ports** | — | any |
 | `zc-mux` | container writers (fMP4/MKV), chunked writes, HDD pacing | `zc-core` | any |
 | `zc-video` | D3D11 device, WGC capture, BGRA→NV12, MF hardware encoder, screenshots | `zc-core`, `zc-win` | Windows |
 | `zc-audio` | WASAPI process loopback, mic + push-to-talk, MF AAC encoder | `zc-core`, `zc-win` | Windows |
 | `zc-input` | Raw Input hotkeys, foreground-window tracking | `zc-core`, `zc-win` | Windows |
-| `zc-win` | COM/MF lifetimes, QPC clock, message-only window thread, drive detection, page-locking | `zc-core` | Windows |
+| `zc-win` | COM/MF lifetimes, QPC clock, message-only window thread, drive detection, page-locking, single-instance mutex, start-with-Windows Run key, main-window hide/show (tray) | `zc-core` | Windows |
 | `zc-store` | SQLite metadata: clips, keyframes, profiles, probe cache, waveforms, uploads | `zc-core` | any |
 | `zc-editor` | keyframe snapping, stitch compatibility, waveform peaks, ffmpeg CLI jobs | `zc-core` | any* |
 | `zc-destinations` | the `Destination` trait, Discord webhooks, YouTube (BYO credentials) | `zc-core` | any |
@@ -46,14 +46,15 @@ state machine; editing never re-encodes; nothing is ever deleted unverified.
 
 | Thread | Owner | Does | Must never |
 |---|---|---|---|
-| UI | eframe | draws; sends `Command`s; drains `EngineEvent`s | block on the engine |
+| UI | GPUI | draws; sends `Command`s; drains `EngineEvent`s | block on the engine |
 | `zc-engine` | engine actor | owns settings, profile, watchdog, modes; starts/stops sources | touch the hot path |
 | WGC frame pool | `zc-video` | pace to the target fps, convert to NV12, hand the ring slot to the encoder thread | allocate, block |
 | Encoder (`zc-video` thread) | `zc-video` | NeedInput → `ProcessInput`; HaveOutput → `ProcessOutput` → `PacketSink::push`; repeat the last frame while the screen is static | allocate, block on I/O |
 | `zc-game-audio`, `zc-mic`, one per app track (up to 6 source tracks) | `zc-audio` | WASAPI event loop → `SampleTimeline` → AAC → `PacketSink::push` (MMCSS "Pro Audio"); the mic applies the PTT gate and compressor; both reopen a lost device; each also writes its PCM into the Master `MixBus` | allocate, block on I/O |
 | `zc-master-mix` (Master, D30, audio track 1) | `zc-audio` | every 20 ms: mix the `MixBus` up to 200 ms behind real time → AAC → `PacketSink::push` (MMCSS "Pro Audio") | allocate, block on I/O, hold the bus lock across an encode |
 | `zc-input` (message thread) | `zc-input` | Raw Input + WinEvent hook → `OsEvent`s; never logs keystrokes | do real work in callbacks |
-| IO | engine (Phase 3) | one thread per clip dump and per recording (chunked writes; dumps paced on HDD) | hold the recorder lock |
+| IO | engine (Phase 3) | one thread per clip dump and per recording (chunked writes; dumps paced on HDD); in disk mode a dump also reads the ring file record by record | hold the recorder lock |
+| `zc-io-ring` (disk mode, D32) | `zc-engine` (`disk_dvr.rs`) | every 250 ms: copy finished GOPs out of the staging `DvrBuffer` in short holds, write each as one record to `zeroclip-dvr.ring` (paced on HDD) | hold the recorder lock across a write |
 | tokio pool | app (Phase 5–6) | uploads, waveform extraction, ffmpeg jobs | — |
 
 ## Data flow
@@ -104,7 +105,7 @@ carry only a PTS.
 - **UI → engine:** `zc_core::control::Command` (save clip, toggle recording, screenshot,
   push-to-talk, apply settings, shutdown) over a channel.
 - **Engine → UI:** `EngineEvent` (status, clip saved, warnings, …) over a channel, plus a
-  `wake` callback that makes egui repaint — egui sleeps otherwise, which is how the UI
+  `wake` callback that makes GPUI repaint — GPUI sleeps otherwise, which is how the UI
   costs nothing while a game runs.
 - **Input → engine:** `OsEvent::Key` goes through the `ChordMatcher` (in `zc-core`) and
   becomes commands; `OsEvent::Foreground` goes through `ProfileSet::resolve` and
@@ -132,11 +133,11 @@ stateDiagram-v2
 
 | Mode | Trigger | Path | Container |
 |---|---|---|---|
-| DVR clip | hotkey | snapshot of `DvrBuffer` → clip writer | fMP4 |
+| DVR clip | hotkey | snapshot of `DvrBuffer` → clip writer. Disk mode (`disk_dvr.rs`): staged part copied first, then the ring file's records are streamed into the writer one at a time | fMP4 |
 | Manual | hotkey toggle | `Tee` → session writer | fMP4 |
 | Session | game profile | `Tee` → session writer, for the life of the game | fMP4 |
 | Screenshot | hotkey | one texture → staging → PNG | PNG |
-| Crash rescue | game died unexpectedly | `DvrBuffer` → `recovery.tmp` → prompt | fMP4 |
+| Crash rescue | game died unexpectedly | `DvrBuffer` (disk mode: its staged part, then the ring file streamed on the IO thread) → `recovery-<unix_ms>.<ext>.tmp` → prompt | fMP4 |
 | Recording file | while a recording runs | spool → IO thread → `<name>.mp4.partial`, synced per fragment | fMP4, renamed to `<name>.mp4` when finished |
 | Startup repair | app start, for each `*.partial` left behind | cut to the last complete fragment → `<name>.mp4`; never overwrites | fMP4 |
 

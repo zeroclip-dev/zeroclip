@@ -3,7 +3,6 @@
 
 use std::path::Path;
 
-use eframe::egui::{self, Label};
 use zc_core::profile::{GameProfile, ProfileSet, exe_name};
 use zc_core::settings::{AppTrack, MAX_APP_TRACKS};
 use zc_win::process::{OpenApp, list_open_apps};
@@ -16,103 +15,31 @@ pub struct OpenAppsList {
 }
 
 impl OpenAppsList {
-    fn refresh(&mut self) {
+    pub fn refresh(&mut self) {
         self.apps = list_open_apps();
         self.loaded = true;
     }
-}
 
-/// The Refresh button, the open windows, and the configured audio tracks that aren't running.
-pub fn show(
-    ui: &mut egui::Ui,
-    list: &mut OpenAppsList,
-    profiles: &mut ProfileSet,
-    tracks: &mut Vec<AppTrack>,
-) {
-    if !list.loaded {
-        list.refresh();
-    }
-    if ui.button("Refresh").clicked() {
-        list.refresh();
-    }
-    ui.add_space(4.0);
-
-    if list.apps.is_empty() {
-        ui.weak("No open windows found.");
-    } else {
-        egui::Grid::new("open_apps").num_columns(4).striped(true).spacing([20.0, 6.0]).show(
-            ui,
-            |ui| {
-                ui.strong("App");
-                ui.strong("Window");
-                ui.strong("Game");
-                ui.strong("Audio track");
-                ui.end_row();
-
-                for app in &list.apps {
-                    ui.label(&app.exe);
-                    let title =
-                        if app.title.is_empty() { "(no title)" } else { app.title.as_str() };
-                    ui.add_sized([260.0, 18.0], Label::new(title).truncate()).on_hover_text(title);
-
-                    let mut game = profiles.find(&app.exe).is_some();
-                    if ui.checkbox(&mut game, "").changed() {
-                        set_game_profile(profiles, &app.exe, game);
-                    }
-
-                    let checked = has_live_track(tracks, &app.exe);
-                    let mut track = checked;
-                    let free = track_slot_free(tracks, &app.exe);
-                    let response =
-                        ui.add_enabled(free || checked, egui::Checkbox::new(&mut track, ""));
-                    let response = if free || checked {
-                        response
-                    } else {
-                        response.on_disabled_hover_text("Up to 4 app tracks")
-                    };
-                    if response.changed() {
-                        set_audio_track(tracks, &app.exe, track);
-                    }
-                    ui.end_row();
-                }
-            },
-        );
-    }
-
-    let not_running: Vec<String> = tracks
-        .iter()
-        .filter(|t| t.enabled && !list.apps.iter().any(|a| same_exe(&a.exe, &t.exe)))
-        .map(|t| t.exe.clone())
-        .collect();
-    if !not_running.is_empty() {
-        ui.add_space(8.0);
-        ui.weak("Audio tracks not running");
-        for exe in not_running {
-            let mut track = true;
-            ui.horizontal(|ui| {
-                if ui.checkbox(&mut track, exe_name(&exe)).changed() {
-                    set_audio_track(tracks, &exe, false);
-                }
-                ui.weak("not running");
-            });
+    /// The windows listed last, listing them first if that never happened.
+    pub fn apps(&mut self) -> &[OpenApp] {
+        if !self.loaded {
+            self.refresh();
         }
+        &self.apps
     }
-
-    ui.add_space(6.0);
-    ui.weak("Audio tracks apply after restarting ZeroClip.");
 }
 
-fn same_exe(a: &str, b: &str) -> bool {
+pub fn same_exe(a: &str, b: &str) -> bool {
     exe_name(a).eq_ignore_ascii_case(exe_name(b))
 }
 
-fn has_live_track(tracks: &[AppTrack], exe: &str) -> bool {
+pub fn has_live_track(tracks: &[AppTrack], exe: &str) -> bool {
     tracks.iter().any(|t| t.enabled && same_exe(&t.exe, exe))
 }
 
 /// Whether turning on a track for `exe` can succeed: it already has an entry to re-enable, or
 /// there is a free slot for a new one.
-fn track_slot_free(tracks: &[AppTrack], exe: &str) -> bool {
+pub fn track_slot_free(tracks: &[AppTrack], exe: &str) -> bool {
     tracks.len() < MAX_APP_TRACKS || tracks.iter().any(|t| same_exe(&t.exe, exe))
 }
 

@@ -8,7 +8,7 @@ use std::time::Duration;
 use zc_core::Hns;
 use zc_core::control::{Command, EngineEvent};
 use zc_core::ports::OsEvent;
-use zc_core::settings::{CaptureMode, Settings};
+use zc_core::settings::{CaptureMode, DvrStorage, Settings};
 use zc_engine::synthetic::{FaultPlan, SyntheticInput, SyntheticVideoSource};
 use zc_engine::{Engine, EngineConfig, EngineHandle, Ports};
 
@@ -129,6 +129,31 @@ fn saving_a_clip_writes_a_file() {
     let EngineEvent::ClipSaved { path, duration } = event else { unreachable!() };
     assert!(path.exists());
     assert!(duration.as_secs_f64() >= 2.0);
+}
+
+#[test]
+fn disk_mode_saves_a_clip_from_the_ring_file() {
+    let scratch =
+        ScratchDir(std::env::temp_dir().join(format!("zeroclip-disk-dvr-{}", std::process::id())));
+    let mut settings = screen_settings();
+    settings.recording.output_dir = Some(scratch.0.clone());
+    settings.dvr.storage = DvrStorage::Disk;
+    settings.profiles.default.buffer_secs = 10;
+    let config = EngineConfig { settings, default_output_dir: scratch.0.clone() };
+    let video = SyntheticVideoSource::new().realtime(true);
+    let ports = Ports { video: Some(Box::new(video)), ..Ports::default() };
+    let engine = Engine::spawn(config, ports, Arc::new(|()| {})).expect("spawn");
+    std::thread::sleep(Duration::from_secs(4));
+
+    engine.send(Command::SaveClip).unwrap();
+    let event = wait_for(&engine, |e| matches!(e, EngineEvent::ClipSaved { .. }));
+    let EngineEvent::ClipSaved { path, duration } = event else { unreachable!() };
+    assert!(path.is_file());
+    assert!(duration.as_secs_f64() >= 3.0, "{duration:?}");
+    let ring = scratch.0.join("zeroclip-dvr.ring");
+    assert!(ring.metadata().expect("the ring file exists").len() > 20_000_000);
+    engine.shutdown();
+    assert!(ring.is_file(), "the ring file is kept on a clean shutdown (D32)");
 }
 
 #[test]

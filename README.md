@@ -1,120 +1,94 @@
 # ZeroClip
 
-**A zero-impact game clipper for Windows, written in Rust.** ZeroClip keeps the last
-few minutes of gameplay in memory and saves them with one hotkey — without touching
-the game, without copying frames off the GPU, and without losing the clip when the
-game crashes.
+A game clipper for Windows, written in Rust. ZeroClip keeps the last few minutes of your
+gameplay in a rolling buffer and saves them when you press a hotkey, so you never have to
+decide to record in advance.
 
-> **Status: v0.1 scope.** ZeroClip can:
->
-> - keep a DVR buffer and save the last few minutes as a clip with one hotkey (Alt+F10)
-> - record manually (Alt+F9) to crash-safe fragmented MP4 files
-> - repair recordings that a crash cut short, on the next start
-> - write in HDD-aware chunks, and pace clip dumps on spinning disks
-> - record a live master mix track next to the game and microphone tracks
-> - keep the mic always on, or use push-to-talk
-> - encode with HEVC or H.264 on the GPU
->
-> See the [roadmap](docs/ROADMAP.md) for what comes next, and
-> [How ZeroClip works](docs/HOW_IT_WORKS.md) for the design in one read. Want to help? See
-> [CONTRIBUTING.md](CONTRIBUTING.md).
+> **Status: early (v0.1).** It works on the author's machine and is still being tested on
+> other hardware. Expect rough edges. Known gaps are listed below.
 
-<!-- GIF placeholder: docs/media/save-clip.gif (save a clip, 10 s max, 720p, 15 fps, under 5 MB). Not recorded yet (P3.28). -->
+## Features
 
-## Known limits in v0.1
+Working now:
 
-- Browsers and Discord play only the first audio track, which is the live master mix.
-  The separate game and mic tracks are heard in players such as VLC.
-- No MKV output. Recordings and clips are MP4 (fMP4).
-- Game audio follows the focused window only.
-- No tray, no per-game profiles, no watchdog yet.
+- **DVR buffer.** Press a hotkey (default Alt+F10) to save the last N minutes as a clip.
+  Manual recording is Alt+F9; there are also screenshot and bookmark hotkeys.
+- **Hardware encoding** through Media Foundation, with HEVC or H.264. Capture uses Windows.Graphics.Capture, a public Windows API.
+- **Audio tracks.** A master mix, game audio, your microphone (always on or push-to-talk) and
+  optional per-app tracks. Per-app capture needs Windows 11.
+- **Profiles per game.** Buffer length and other settings follow the game that has focus.
+- **Crash-safe files.** Recordings are fragmented MP4, repaired on the next start if a crash cut
+  them short. If a game dies, the buffer is saved and you are asked whether to keep it.
+- **Overlay toasts and failure popups** (click-through, not captured in your recording).
+- **Clips library** with game filters, a screenshot viewer and a built-in video player.
+- **Editor.** Reorder pieces, leave gaps, cut a range, split, and set the volume or mute of each
+  audio track per piece. Exports are stream copies, so they are fast.
+- **Tray, start with Windows, hotkey capture** (click a field and press the keys).
+- **Updates.** ZeroClip checks GitHub Releases at startup and once a day (can be turned off in
+  Settings). Updating is always your click, never while recording or saving, and the download
+  is checked against the release's SHA-256 before it is installed.
 
-## What makes it different
+Planned, not built:
 
-ShadowPlay, ReLive, Game Bar, OBS and Medal already exist. ZeroClip is about doing the
-systems work properly:
+- Sharing and one-drop upload to Discord and YouTube. The `zc-destinations` crate is a stub.
+- MKV output.
 
-- **Anti-cheat safe by construction.** Only public OS APIs — Windows.Graphics.Capture,
-  WASAPI, Raw Input. No DLL injection, no memory reading, no `SetWindowsHookEx`.
-- **Zero-copy capture.** Frames go from the compositor to the hardware encoder without
-  leaving VRAM. Only compressed data reaches system RAM.
-- **A GOP-aware DVR buffer.** The rolling buffer evicts whole GOPs, so every saved clip
-  starts on a keyframe and decodes; audio is evicted in step, so clips are never silent.
-- **Crash-survivable files.** Recordings use fragmented containers that stay playable if
-  the game — or ZeroClip — dies mid-write.
-- **A watchdog that is a state machine,** not a retry loop: drain → flush → re-init →
-  resume, stepping down the codec ladder (AV1 → HEVC → H.264) when a GPU can't cope.
-- **Instant editing.** Trim and stitch by stream copy, with no re-encode; keyframe snap
-  points are shown on the timeline.
-- **One-drop sharing.** Drag a clip onto Discord or YouTube and the link lands in your
-  clipboard.
+Known limits: browsers and Discord play only the first audio track (the master mix); the game
+and mic tracks are heard in players such as VLC. Game audio follows the focused window.
 
-The full design and the reasoning behind each choice: [docs/DESIGN.md](docs/DESIGN.md).
+## Install
 
-## Architecture at a glance
+1. Download `ZeroClip-vX.Y.Z-windows-x64.zip` (or the bare `.exe`) and `SHA256SUMS.txt` from
+   [Releases](https://github.com/zeroclip-dev/zeroclip/releases).
+2. Check the download against the published hash:
 
-```mermaid
-flowchart TD
-    app["<b>zeroclip</b><br/>egui app · composition root"]
-    engine["<b>zc-engine</b><br/>engine actor · recorder"]
-    core["<b>zc-core</b><br/>time · packets · DVR buffer<br/>watchdog · profiles · hotkeys"]
-    mux["<b>zc-mux</b><br/>containers · disk I/O"]
-    video["<b>zc-video</b><br/>D3D11 · WGC · Media Foundation"]
-    audio["<b>zc-audio</b><br/>WASAPI · AAC"]
-    input["<b>zc-input</b><br/>Raw Input · foreground"]
-    win["<b>zc-win</b><br/>Windows plumbing"]
+   ```powershell
+   (Get-FileHash .\ZeroClip-v0.1.0-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
+   Select-String 'windows-x64.zip' .\SHA256SUMS.txt
+   ```
 
-    app --> engine
-    engine --> core
-    engine --> mux
-    mux --> core
-    app -. plugs in .-> video
-    app -. plugs in .-> audio
-    app -. plugs in .-> input
-    video --> core
-    audio --> core
-    input --> core
-    video --> win
-    audio --> win
-    input --> win
-```
+   The two hex strings must match. Note that this only catches a corrupted download: the hash
+   comes from the same release page as the file. The exe is not code-signed yet, so Windows
+   SmartScreen may warn on first run. Release builds also carry a GitHub build attestation
+   (`gh attestation verify <file> --repo zeroclip-dev/zeroclip`).
+3. Unzip anywhere and run `zeroclip.exe`.
 
-The engine and everything beneath it is platform-independent and tested with
-synthetic streams. The Windows crates are adapters that implement the engine's
-ports; the app plugs them in. Later phases add `zc-store` (SQLite metadata),
-`zc-editor` (stream-copy trim/stitch via the ffmpeg CLI) and `zc-destinations`
-(Discord, YouTube). Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+### Requirements
 
-## Getting started
+- Windows 10 1903 or later (Windows 11 for per-app audio tracks).
+- A GPU with a hardware video encoder (recent NVIDIA, AMD or Intel). ZeroClip only uses a
+  hardware encoder; which GPUs work has not been tested widely.
+- `ffmpeg.exe` for the editor, thumbnails and making clips seekable in other players. Recording
+  and saving clips do not need it. ZeroClip looks next to `zeroclip.exe`, then on `PATH`, or use
+  the path set in Settings. ffmpeg is not bundled: its builds carry their own (L)GPL terms, so
+  install it yourself, for example with `winget install Gyan.FFmpeg`.
+- `curl.exe` (ships with Windows 10 1803+) for update checks.
 
-You need:
+## Build from source
 
-- Windows 10 1903 or later (Windows 11 for per-game audio capture).
-- A GPU with a hardware video encoder — any NVIDIA, AMD or Intel GPU from roughly the last eight years.
-- Rust 1.95 or newer, installed with [rustup](https://rustup.rs), plus the MSVC build tools: Visual
-  Studio Build Tools with the **Desktop development with C++** workload (rustup offers to install them).
-- From Phase 5: `ffmpeg` on your `PATH`.
+You need Rust 1.95 or newer ([rustup](https://rustup.rs)), the MSVC build tools (the *Desktop
+development with C++* workload) and the Windows SDK (its `fxc.exe` is needed by the UI
+toolkit's shader build).
 
 ```powershell
-cargo run --release          # the app
-cargo test                   # everything that is built so far
-cargo test -- --ignored      # the specs for what isn't built yet (these fail until implemented)
-cargo run -p spike-phase0    # the Phase 0 capture → encode spike
+cargo run --release
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-## How the work is organised
-
-Behaviour that is designed but not yet built is written down as tests marked
-`#[ignore = "spec: …"]`, next to the code they describe — the DVR buffer, the watchdog,
-the hotkey matcher, and more. Building a feature means removing the `ignore` and
-making the spec pass. Phases, and what "done" means for each, are in
-[docs/ROADMAP.md](docs/ROADMAP.md); settled choices are recorded in
-[docs/DECISIONS.md](docs/DECISIONS.md), unsettled ones in
-[docs/OPEN_QUESTIONS.md](docs/OPEN_QUESTIONS.md).
+The design is in [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) (short) and
+[docs/DESIGN.md](docs/DESIGN.md); crate layout in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md);
+what comes next in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## License
 
-Copyright © 2026 0xtikaa. ZeroClip is free to use under the
-[PolyForm Noncommercial License 1.0.0](LICENSE), plus one extra permission: download it,
-use it, study it, change it and share it for free, and use it to make videos that earn
-money. What you may not do is sell ZeroClip, or software built from its code.
+ZeroClip is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE), plus one
+extra permission: you may use it to make videos, clips and streams that earn money. You may not
+sell ZeroClip, software made from its code, or include either in a commercial product. Read
+[LICENSE](LICENSE) for the exact terms; this paragraph is a summary.
+
+## Contributing
+
+Open an issue first for anything bigger than a bug fix. Contributions need a signed
+[CLA](CLA.md) (the bot on your pull request walks you through it). See
+[CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md).

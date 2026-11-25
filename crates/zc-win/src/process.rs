@@ -147,9 +147,19 @@ fn window_title(hwnd: HWND) -> Option<String> {
 }
 
 /// The executable file name (no directory) of process `pid`, or `None` if it can't be opened.
-/// The full image path comes from [`QueryFullProcessImageNameW`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew),
-/// which works with limited rights, unlike the older module-name APIs.
 fn exe_name_for_pid(pid: u32) -> Option<String> {
+    Some(file_name(&exe_path_for_pid(pid)?).to_owned())
+}
+
+/// The full path of a running program called `exe`, or `None` when none runs or none can be read.
+#[must_use]
+pub fn exe_path(exe: &str) -> Option<String> {
+    pids_for_exe(exe).into_iter().find_map(exe_path_for_pid)
+}
+
+/// The full image path of process `pid`. It comes from [`QueryFullProcessImageNameW`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew),
+/// which works with limited rights, unlike the older module-name APIs.
+fn exe_path_for_pid(pid: u32) -> Option<String> {
     let process = open_process_limited(pid)?;
     let mut buffer = [0_u16; 1024];
     let mut len = u32::try_from(buffer.len()).ok()?;
@@ -163,8 +173,7 @@ fn exe_name_for_pid(pid: u32) -> Option<String> {
         )
     }
     .ok()?;
-    let full = String::from_utf16_lossy(buffer.get(..usize::try_from(len).ok()?)?);
-    Some(file_name(&full).to_owned())
+    Some(String::from_utf16_lossy(buffer.get(..usize::try_from(len).ok()?)?))
 }
 
 /// Opens `pid` with the least access that gives its image path and creation time. The handle closes when the result drops.
