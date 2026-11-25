@@ -344,9 +344,7 @@ impl ProfilesView {
         };
         if !profile_errors.is_empty() {
             self.save_attempted = true;
-            for touched in &mut self.touched {
-                *touched = true;
-            }
+            self.touched.fill(true);
             cx.notify();
             return;
         }
