@@ -60,6 +60,12 @@ impl AacEncoder {
         channels: u16,
         bitrate_bps: u32,
     ) -> Result<Self, SourceError> {
+        // `encode` and the mic loop divide by the channel count.
+        if channels == 0 || sample_rate == 0 {
+            return Err(SourceError::Other(format!(
+                "AAC needs at least one channel and a sample rate (got {channels} ch, {sample_rate} Hz)"
+            )));
+        }
         let block = u32::from(channels) * 2;
         // SAFETY: plain COM calls on objects created here.
         unsafe {
