@@ -161,6 +161,9 @@ pub struct EditorView {
     window_active: bool,
     /// Remembers whether playback was active when the window lost focus (never auto-resumes).
     paused_on_blur: bool,
+    /// The page should take keyboard focus on its next draw (it was just shown). Otherwise it only
+    /// does when nothing at all has focus, so it never pulls it from something else on every draw.
+    focus_pending: bool,
     /// Whether the timeline and editing tools show. Off, the clip plays like in a normal player.
     editing: bool,
     /// The picture is showing over the whole window, with a bar to seek by.
@@ -276,6 +279,7 @@ impl EditorView {
             window_activation_sub: None,
             window_active: true,
             paused_on_blur: false,
+            focus_pending: true,
             editing: true,
             fullscreen: false,
             full_bar: Rc::new(Cell::new(Bounds::default())),
@@ -386,7 +390,12 @@ impl EditorView {
         if generation != self.generation {
             return;
         }
-        self.loading.pop();
+        // The entry of this clip, not just the last one: reads finish in any order.
+        let read_name =
+            path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        if let Some(at) = self.loading.iter().position(|n| *n == read_name) {
+            self.loading.remove(at);
+        }
         match result {
             Ok((ffmpeg, info)) => {
                 // Clips differ in how many audio tracks they have (an app that was closed has no
@@ -419,6 +428,17 @@ impl EditorView {
                 self.checkpoint();
                 for piece in &mut self.timeline.pieces {
                     piece.tracks.truncate(tracks);
+                }
+                // Anything that still points at a track that was just dropped would index past it.
+                if self.range.is_some_and(|r| r.0 >= tracks)
+                    || self.drag.is_some_and(|d| d.1 >= tracks)
+                {
+                    self.range = None;
+                    self.drag = None;
+                    self.ranging = false;
+                }
+                if self.solo.is_some_and(|s| s >= tracks) {
+                    self.solo = None;
                 }
                 self.timeline.pieces.push(Piece {
                     source: index,
@@ -718,6 +738,7 @@ impl EditorView {
 
     /// Stops playback, picture and sound. Called when the user leaves the Editor tab.
     pub fn pause(&mut self, cx: &mut Context<Self>) {
+        self.focus_pending = true;
         if self.player.playing {
             self.player.pause();
             cx.notify();
@@ -888,6 +909,9 @@ impl EditorView {
         let Some((t, i, a, b)) = self.range.take() else { return };
         let Some(piece) = self.timeline.pieces.get(i) else { return };
         let span = piece.span();
+        if t >= piece.tracks.len() {
+            return;
+        }
         self.checkpoint();
         self.timeline.pieces[i].tracks[t].silence(a.min(b), a.max(b), span);
         // Playback restarts at the playhead so the new edit is heard.
@@ -1327,6 +1351,8 @@ impl EditorView {
         self.seek(at, cx);
         if self.timeline.pieces.is_empty() {
             self.selected = None;
+            // Nothing is left to play: stop the player so it doesn't run on over a stale piece.
+            self.player.pause();
         }
         cx.notify();
     }
@@ -1764,9 +1790,12 @@ impl Render for EditorView {
         self.ensure_visible_thumbs(cx);
         let focus = self.focus.get_or_insert_with(|| cx.focus_handle()).clone();
         // Keys only reach the page while it has focus, which coming back from another tab loses.
-        if !focus.contains_focused(window, cx) {
+        if (self.focus_pending || window.focused(cx).is_none())
+            && !focus.contains_focused(window, cx)
+        {
             window.focus(&focus, cx);
         }
+        self.focus_pending = false;
         let viewport = window.viewport_size();
         let vp_h = f32::from(viewport.height);
         let vp_w = f32::from(viewport.width);
@@ -4327,11 +4356,10 @@ impl EditorView {
                             .on_click({
                                 let file = files.first().cloned();
                                 cx.listener(move |_, _, _, _| {
-                                    if let Some(file) = &file {
-                                        let _ = std::process::Command::new("explorer")
-                                            .arg("/select,")
-                                            .arg(file)
-                                            .spawn();
+                                    if let Some(file) = &file
+                                        && let Err(error) = zc_win::shell::reveal(file)
+                                    {
+                                        tracing::warn!(%error, "could not show the file");
                                     }
                                 })
                             }),
