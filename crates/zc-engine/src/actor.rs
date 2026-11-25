@@ -127,12 +127,11 @@ impl Engine {
             total_mib,
             storage,
             persister: None,
-            output_dir: config
-                .settings
-                .recording
-                .output_dir
-                .clone()
-                .unwrap_or(config.default_output_dir),
+            output_dir: resolve_output_dir(
+                config.settings.recording.output_dir.as_deref(),
+                &config.default_output_dir,
+            ),
+            default_output_dir: config.default_output_dir,
             hotkeys: ChordMatcher::new(bindings(&config.settings)),
             hotkeys_suspended: false,
             settings: config.settings,
@@ -266,6 +265,8 @@ struct Actor {
     /// The thread that writes finished GOPs to the ring file, in disk mode (P4.21).
     persister: Option<Persister>,
     output_dir: PathBuf,
+    /// Where output goes when the setting is cleared.
+    default_output_dir: PathBuf,
     ports: Ports,
     /// Our own inbox, for the emitters handed to sources.
     inbox: Sender<Msg>,
@@ -1498,10 +1499,12 @@ impl Actor {
                 if video_changed && self.ports.video.is_some() && restart {
                     self.restart_capture();
                 }
-                if let Some(dir) = &self.settings.recording.output_dir
-                    && *dir != self.output_dir
-                {
-                    self.output_dir.clone_from(dir);
+                let dir = resolve_output_dir(
+                    self.settings.recording.output_dir.as_deref(),
+                    &self.default_output_dir,
+                );
+                if dir != self.output_dir {
+                    self.output_dir = dir;
                     self.detect_drive();
                 }
                 tracing::info!("settings applied");
@@ -2081,8 +2084,23 @@ impl Actor {
     }
 }
 
+/// The folder output goes to: the configured one, or the default when the setting is cleared.
+fn resolve_output_dir(configured: Option<&Path>, default: &Path) -> PathBuf {
+    configured.unwrap_or(default).to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_cleared_output_dir_falls_back_to_the_default() {
+        let default = Path::new("default");
+        assert_eq!(
+            super::resolve_output_dir(Some(Path::new("custom")), default),
+            Path::new("custom")
+        );
+        assert_eq!(super::resolve_output_dir(None, default), default);
+    }
+
     use std::path::Path;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
