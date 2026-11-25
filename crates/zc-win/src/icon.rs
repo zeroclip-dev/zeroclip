@@ -105,8 +105,8 @@ fn read_icon(icon: &windows::Win32::UI::WindowsAndMessaging::HICON) -> Option<Ic
         return None;
     }
     // BGRA to RGBA. An icon without an alpha channel has all zeros there: make it opaque.
-    let opaque = rgba.chunks_exact(4).all(|p| p[3] == 0);
-    for p in rgba.chunks_exact_mut(4) {
+    let opaque = rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 0);
+    for p in rgba.as_chunks_mut::<4>().0 {
         p.swap(0, 2);
         if opaque {
             p[3] = 255;
@@ -123,6 +123,6 @@ mod tests {
     fn a_system_program_has_a_visible_icon() {
         let icon = icon_of(Path::new(r"C:\Windows\explorer.exe")).expect("explorer has an icon");
         assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
-        assert!(icon.rgba.chunks_exact(4).any(|p| p[3] > 0), "all transparent");
+        assert!(icon.rgba.as_chunks::<4>().0.iter().any(|p| p[3] > 0), "all transparent");
     }
 }

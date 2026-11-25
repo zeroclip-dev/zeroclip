@@ -768,15 +768,18 @@ impl LiveAudio {
                 }
                 let samples = aligned_bytes / size_of::<f32>();
                 for (dst, bytes) in
-                    pcm_buf[..samples].iter_mut().zip(raw_buf[..aligned_bytes].chunks_exact(4))
+                    pcm_buf[..samples].iter_mut().zip(raw_buf[..aligned_bytes].as_chunks::<4>().0)
                 {
                     *dst = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
                 }
                 let target_gain = f32::from_bits(live_gain.load(Ordering::Relaxed));
                 scale_pcm_chunk(&mut pcm_buf[..samples], current_gain, target_gain, AUDIO_CHANNELS);
                 current_gain = target_gain;
-                for (dst, &sample) in
-                    raw_buf[..aligned_bytes].chunks_exact_mut(4).zip(&pcm_buf[..samples])
+                for (dst, &sample) in raw_buf[..aligned_bytes]
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(&pcm_buf[..samples])
                 {
                     dst.copy_from_slice(&sample.to_le_bytes());
                 }

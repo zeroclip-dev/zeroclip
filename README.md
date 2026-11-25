@@ -1,74 +1,98 @@
 # ZeroClip
 
-A game clipper for Windows, written in Rust. ZeroClip keeps the last few minutes of your
-gameplay in a rolling buffer and saves them when you press a hotkey, so you never have to
-decide to record in advance.
+**Missed an amazing play? Press a key and it's saved.**
 
-> **Status: early (v0.1).** It works on the author's machine and is still being tested on
-> other hardware. Expect rough edges. Known gaps are listed below.
+ZeroClip quietly keeps the last few minutes of your game. When something worth keeping
+happens, press **Alt+F10** and those minutes become a clip. No need to start recording
+beforehand.
 
-## Features
+Free for personal use, Windows only.
 
-Working now:
+> **Early release (v0.1).** It works well on the developer's PC but hasn't been tested on many
+> other machines yet. If something breaks, please
+> [open an issue](https://github.com/zeroclip-dev/zeroclip/issues).
 
-- **DVR buffer.** Press a hotkey (default Alt+F10) to save the last N minutes as a clip.
-  Manual recording is Alt+F9; there are also screenshot and bookmark hotkeys.
-- **Hardware encoding** through Media Foundation, with HEVC or H.264. Capture uses Windows.Graphics.Capture, a public Windows API.
-- **Audio tracks.** A master mix, game audio, your microphone (always on or push-to-talk) and
-  optional per-app tracks. Per-app capture needs Windows 11.
-- **Profiles per game.** Buffer length and other settings follow the game that has focus.
-- **Crash-safe files.** Recordings are fragmented MP4, repaired on the next start if a crash cut
-  them short. If a game dies, the buffer is saved and you are asked whether to keep it.
-- **Overlay toasts and failure popups** (click-through, not captured in your recording).
-- **Clips library** with game filters, a screenshot viewer and a built-in video player.
-- **Editor.** Reorder pieces, leave gaps, cut a range, split, and set the volume or mute of each
-  audio track per piece. Exports are stream copies, so they are fast.
-- **Tray, start with Windows, hotkey capture** (click a field and press the keys).
-- **Updates.** ZeroClip checks GitHub Releases at startup and once a day (can be turned off in
-  Settings). Updating is always your click, never while recording or saving, and the download
-  is checked against the release's SHA-256 before it is installed.
+## Get started
 
-Planned, not built:
-
-- Sharing and one-drop upload to Discord and YouTube. The `zc-destinations` crate is a stub.
-- MKV output.
-
-Known limits: browsers and Discord play only the first audio track (the master mix); the game
-and mic tracks are heard in players such as VLC. Game audio follows the focused window.
-
-## Install
-
-1. Download `ZeroClip-vX.Y.Z-windows-x64.zip` (or the bare `.exe`) and `SHA256SUMS.txt` from
+1. Download the latest `ZeroClip-vX.Y.Z-windows-x64.zip` from
    [Releases](https://github.com/zeroclip-dev/zeroclip/releases).
-2. Check the download against the published hash:
+2. Unzip it anywhere and run `zeroclip.exe`. Windows may show a SmartScreen warning because the
+   app isn't code-signed yet: click **More info → Run anyway**.
+3. Start a game, play, and press **Alt+F10** when something good happens.
 
-   ```powershell
-   (Get-FileHash .\ZeroClip-v0.1.0-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
-   Select-String 'windows-x64.zip' .\SHA256SUMS.txt
-   ```
+Your clips show up in the **Clips** tab. ZeroClip lives in the system tray while it runs.
 
-   The two hex strings must match. Note that this only catches a corrupted download: the hash
-   comes from the same release page as the file. The exe is not code-signed yet, so Windows
-   SmartScreen may warn on first run. Release builds also carry a GitHub build attestation
-   (`gh attestation verify <file> --repo zeroclip-dev/zeroclip`).
-3. Unzip anywhere and run `zeroclip.exe`.
+**Optional:** install ffmpeg for the editor, thumbnails, and clips that seek smoothly in other
+players. Open PowerShell and run:
 
-### Requirements
+```powershell
+winget install Gyan.FFmpeg
+```
 
-- Windows 10 1903 or later (Windows 11 for per-app audio tracks).
-- A GPU with a hardware video encoder (recent NVIDIA, AMD or Intel). ZeroClip only uses a
-  hardware encoder; which GPUs work has not been tested widely.
-- `ffmpeg.exe` for the editor, thumbnails and making clips seekable in other players. Recording
-  and saving clips do not need it. ZeroClip looks next to `zeroclip.exe`, then on `PATH`, or use
-  the path set in Settings. ffmpeg is not bundled: its builds carry their own (L)GPL terms, so
-  install it yourself, for example with `winget install Gyan.FFmpeg`.
-- `curl.exe` (ships with Windows 10 1803+) for update checks.
+Recording and saving clips work without it.
 
-## Build from source
+## Hotkeys
 
-You need Rust 1.95 or newer ([rustup](https://rustup.rs)), the MSVC build tools (the *Desktop
-development with C++* workload) and the Windows SDK (its `fxc.exe` is needed by the UI
-toolkit's shader build).
+| Key | What it does |
+|---|---|
+| **Alt+F10** | Save the last few minutes as a clip |
+| **Alt+F9** | Start or stop a normal recording |
+
+There are also hotkeys for screenshots, bookmarks and push-to-talk. To change any of them, open
+**Settings → Hotkeys**, click the field and press the keys you want.
+
+## What it can do
+
+- **Saves the moment after it happens.** Set how many minutes to keep, per game if you like.
+- **Uses your graphics card's video encoder** (HEVC or H.264), so the heavy lifting stays off
+  your CPU.
+- **Separate audio tracks.** Game sound, your microphone (always on or push-to-talk) and a full
+  mix are kept on separate tracks, so you can turn your voice down later. On Windows 11 it can
+  also record specific apps, such as Discord, on their own track.
+- **Clip library.** Browse clips and screenshots, filter by game, and play them in the built-in
+  player.
+- **Editor.** Trim, split, reorder, add black gaps, and set the volume of each track. Exports
+  are near-instant because the video isn't re-encoded.
+- **Crash-safe.** If a game crashes, ZeroClip saves what it had and asks whether to keep it. A
+  recording cut short by a crash is repaired the next time ZeroClip starts.
+- **Popups that stay out of your clips.** Short notices confirm a saved clip or warn you when
+  something fails. They never show up in the recording.
+- **Updates itself, when you say so.** It tells you when a new version is out. It installs only
+  when you click, never while you're recording, and checks the download first. You can turn
+  this off in Settings.
+
+**Coming later:** one-click sharing to Discord and YouTube.
+
+**Good to know:** web browsers and Discord play only the first audio track (the full mix). To
+hear the separate game and mic tracks, use a player such as VLC.
+
+## Requirements
+
+- Windows 10 (version 1903) or Windows 11. Recording single apps needs Windows 11.
+- A graphics card with a hardware video encoder: most NVIDIA, AMD and Intel GPUs from the last
+  several years. Which GPUs work hasn't been tested widely yet.
+
+## Check your download (optional)
+
+Each release lists the SHA-256 hash of every file in `SHA256SUMS.txt`. To compare them:
+
+```powershell
+(Get-FileHash .\ZeroClip-v0.1.0-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
+Select-String 'windows-x64.zip' .\SHA256SUMS.txt
+```
+
+If the two match, the download is complete and undamaged. This doesn't prove who made the file;
+for that, every release also has a GitHub build attestation that you can check with
+`gh attestation verify <file> --repo zeroclip-dev/zeroclip`.
+
+## For developers
+
+ZeroClip is written in Rust. It captures with Windows.Graphics.Capture, encodes with Media
+Foundation, and uses GPUI for its interface.
+
+To build it, you need Rust 1.95 or newer ([rustup](https://rustup.rs)), the MSVC build tools
+(the *Desktop development with C++* workload) and the Windows SDK, whose `fxc.exe` the UI's
+shader build uses.
 
 ```powershell
 cargo run --release
@@ -76,19 +100,25 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-The design is in [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) (short) and
-[docs/DESIGN.md](docs/DESIGN.md); crate layout in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md);
-what comes next in [docs/ROADMAP.md](docs/ROADMAP.md).
+To see how it works, start with [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md). The full design is
+in [docs/DESIGN.md](docs/DESIGN.md), the crate layout in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and the plans in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## License
 
-ZeroClip is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE), plus one
-extra permission: you may use it to make videos, clips and streams that earn money. You may not
-sell ZeroClip, software made from its code, or include either in a commercial product. Read
-[LICENSE](LICENSE) for the exact terms; this paragraph is a summary.
+ZeroClip is **source-available** under the [PolyForm Noncommercial License 1.0.0](LICENSE), with
+one extra permission:
+
+- ✅ You can use it for free, read and change the code, and **make money from the videos,
+  clips and streams you record with it**.
+- ❌ You can't sell ZeroClip, sell software built from its code, or put either into a
+  commercial product.
+
+This is a summary; [LICENSE](LICENSE) has the exact terms.
 
 ## Contributing
 
-Open an issue first for anything bigger than a bug fix. Contributions need a signed
-[CLA](CLA.md) (the bot on your pull request walks you through it). See
+Bug reports and ideas are welcome in [Issues](https://github.com/zeroclip-dev/zeroclip/issues).
+For anything bigger than a bug fix, please open an issue first. Pull requests need a signed
+[CLA](CLA.md); a bot on your pull request walks you through it. See
 [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md).
