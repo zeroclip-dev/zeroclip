@@ -93,6 +93,31 @@ pub enum UiMode {
 }
 
 impl Settings {
+    /// Highest video bitrate a loaded file may ask for, kbit/s. Sizes the DVR buffer, so an
+    /// absurd value would otherwise ask for terabytes.
+    const MAX_LOADED_BITRATE_KBPS: u32 = 500_000;
+
+    /// Pulls numbers read from a hand-edited or damaged settings file into the ranges
+    /// [`problems`](Self::problems) enforces, so a bad value can't size a buffer from nonsense
+    /// or poison the mix with NaN. The UI never writes such values; the file can.
+    pub fn sanitize_loaded(&mut self) {
+        let video = &mut self.video;
+        video.fps = video.fps.clamp(1, 240);
+        video.max_bitrate_kbps = video.max_bitrate_kbps.clamp(1, Self::MAX_LOADED_BITRATE_KBPS);
+        video.min_bitrate_kbps = video.min_bitrate_kbps.min(video.max_bitrate_kbps);
+        video.keyframe_interval_ms = video.keyframe_interval_ms.clamp(500, 4_000);
+        self.dvr.ram_ceiling_mib = self.dvr.ram_ceiling_mib.max(64);
+        self.storage.write_chunk_mib = self.storage.write_chunk_mib.clamp(1, 64);
+        for gain in [&mut self.audio.mix_gain_db.game, &mut self.audio.mix_gain_db.mic] {
+            // `clamp` passes NaN through, so catch it first.
+            *gain = if gain.is_nan() {
+                0.0
+            } else {
+                gain.clamp(*MIX_GAIN_DB.start(), *MIX_GAIN_DB.end())
+            };
+        }
+    }
+
     /// Problems that should block saving, as sentences for the UI. Empty when the
     /// settings are usable.
     #[must_use]
@@ -520,6 +545,20 @@ pub struct UploadSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loaded_nonsense_is_pulled_into_range() {
+        let mut s = Settings::default();
+        s.audio.mix_gain_db.game = f32::NAN;
+        s.audio.mix_gain_db.mic = 1e9;
+        s.video.max_bitrate_kbps = u32::MAX;
+        s.video.min_bitrate_kbps = u32::MAX;
+        s.video.fps = 0;
+        s.sanitize_loaded();
+        assert!(s.problems().is_empty(), "{:?}", s.problems());
+        assert_eq!(s.audio.mix_gain_db.game, 0.0);
+        assert_eq!(s.audio.mix_gain_db.mic, 12.0);
+    }
 
     #[test]
     fn defaults_follow_the_design_doc() {
