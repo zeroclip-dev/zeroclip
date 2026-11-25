@@ -1434,6 +1434,14 @@ impl Actor {
             }
             CaptureDecision::Start { hwnd, clear_buffer } => {
                 if active {
+                    // The file's header holds the old window's size and codec, so it can't
+                    // carry the new window's frames (as in `restart_capture`).
+                    if self.recording.as_ref().is_some_and(|r| r.id.is_some()) {
+                        self.stop_recording();
+                        self.emit(EngineEvent::Warning(
+                            "Capture moved to another window, so the recording was stopped.".into(),
+                        ));
+                    }
                     self.stop_capture();
                 }
                 // A rescue waiting for the dump slot still needs the dead game's footage, so it
