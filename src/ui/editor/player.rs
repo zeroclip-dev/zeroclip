@@ -530,7 +530,9 @@ impl Player {
         }
         let mut ended = false;
         if let Some(decoder) = self.decoder.as_mut() {
-            loop {
+            // Take frames only while the queue has room, so the bounded channel pushes back on the
+            // reader thread and ffmpeg (decoding runs faster than playback; each frame is ~8 MB).
+            while self.queue.len() < BACKLOG {
                 match decoder.frames.try_recv() {
                     Ok(image) => {
                         let time = f64::from(decoder.taken) / f64::from(FPS);
