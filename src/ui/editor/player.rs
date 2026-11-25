@@ -28,10 +28,12 @@ use image::{Frame, Rgba, RgbaImage};
 use zc_core::Hns;
 use zc_editor::ffmpeg::{EnvelopePoint, Ffmpeg, SILENT_DB, frames_args};
 
-/// Size every frame is made at. Small, because it is only a preview.
-const WIDTH: u32 = 960;
-const HEIGHT: u32 = 540;
-const FPS: u32 = 24;
+/// Size every frame is made at: full HD at 60 fps, so the editor and clip viewer show what was
+/// recorded. Larger sources are scaled down to fit.
+// ponytail: raw BGRA over a pipe is ~500 MB/s at this size; decode on the GPU if it shows in profiles.
+const WIDTH: u32 = 1920;
+const HEIGHT: u32 = 1080;
+const FPS: u32 = 60;
 /// Frames that may wait between the reader thread and the screen.
 const BACKLOG: usize = 6;
 
