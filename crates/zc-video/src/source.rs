@@ -18,7 +18,7 @@
 //! ([`MediaFoundation`]) for the hardware encoder.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -65,7 +65,15 @@ struct Shared {
     arrived: AtomicU64,
     /// Same, but never reset: the encoder thread watches it for stalls.
     seen: AtomicU64,
+    /// Converted frames sitting in the hand-off channel, not yet submitted. The converter only
+    /// reuses an NV12 slot after its frame left the channel, so a stalled encoder can't have
+    /// queued slots overwritten under it.
+    queued: AtomicUsize,
 }
+
+/// How many converted frames may wait for the encoder. Well under the converter's 8-slot ring,
+/// which also has to cover the frames the encoder itself holds.
+const QUEUE_DEPTH: usize = 2;
 
 /// How long WGC may send nothing before capture is restarted (see `run`).
 const STALL: Duration = Duration::from_secs(3);
@@ -214,6 +222,11 @@ impl FrameHandler {
         let slot = match self.sdr_frame(frame) {
             Ok(texture) => {
                 self.keep_latest(&texture, frame.size);
+                if self.shared.queued.load(Ordering::Acquire) >= QUEUE_DEPTH {
+                    // Converting now would advance the ring onto a slot still waiting in the channel.
+                    self.drop_frame();
+                    return;
+                }
                 self.converter.convert(&texture, frame.size)
             }
             Err(e) => Err(e),
@@ -271,17 +284,28 @@ impl FrameHandler {
             let shot = staging_copy(&self.device, &self.context, texture).map(|t| (t, *size));
             let _ = tx.try_send(shot);
         }
-        if let Some(time) = self.pacer.repeat_due(now)
+        if self.shared.queued.load(Ordering::Acquire) < QUEUE_DEPTH
+            && let Some(time) = self.pacer.repeat_due(now)
             && let Some(slot) = self.converter.repeat_last()
         {
             self.hand_off(Ok(slot), time);
         }
     }
 
+    /// Counts a frame lost before it reached the channel: warns once per run of drops.
+    fn drop_frame(&mut self) {
+        if !self.dropping {
+            tracing::warn!("dropping frames: the encoder isn't keeping up");
+        }
+        (self.health)(HealthEvent::FrameDropped);
+        self.dropping = true;
+    }
+
     fn hand_off(&mut self, slot: Result<usize, SourceError>, time: Hns) {
         let sent = slot.map(|slot| self.frames.try_send((slot, time)));
         match sent {
             Ok(Ok(())) => {
+                self.shared.queued.fetch_add(1, Ordering::AcqRel);
                 // ponytail: FrameDelivered only on leaving a drop run. The engine's
                 // health channel allocates as it grows, and the Phase 4 watchdog only
                 // needs it to reset its drop count.
@@ -448,6 +472,7 @@ fn run(
             }
             match frames.recv_timeout(Duration::from_millis(1)) {
                 Ok((slot, pts)) => {
+                    shared.queued.fetch_sub(1, Ordering::AcqRel);
                     if shared.keyframe.swap(false, Ordering::Relaxed)
                         && let Err(e) = encoder.force_keyframe()
                     {
@@ -539,7 +564,7 @@ impl Pipeline {
             }
         };
 
-        let (frames_tx, frames) = mpsc::sync_channel(2);
+        let (frames_tx, frames) = mpsc::sync_channel(QUEUE_DEPTH);
         let handler = Arc::new(Mutex::new(FrameHandler {
             pacer: FramePacer::new(config.fps),
             converter,
