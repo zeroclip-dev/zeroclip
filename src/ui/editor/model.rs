@@ -188,7 +188,11 @@ impl TrackEdit {
         }
         for w in p.windows(2) {
             if t <= w[1].at {
-                let f = (t - w[0].at).as_secs_f64() / (w[1].at - w[0].at).as_secs_f64();
+                let run = (w[1].at - w[0].at).as_secs_f64();
+                if run <= 0.0 {
+                    return w[1].db;
+                }
+                let f = (t - w[0].at).as_secs_f64() / run;
                 return w[0].db + (w[1].db - w[0].db) * f;
             }
         }
@@ -198,6 +202,11 @@ impl TrackEdit {
     /// Puts a point at `at` (a piece `span` long) at level `db`; the first one also pins both ends
     /// at the old flat level. Returns the new point's index.
     pub fn add_point(&mut self, at: Hns, db: f64, span: Hns) -> usize {
+        // A piece too short to fit a point clear of both ends has no room for one (and the clamp
+        // below would panic with its bounds crossed).
+        if span < MIN_GAP + MIN_GAP {
+            return 0;
+        }
         if self.points.len() < 2 {
             let base = if self.mute { 0.0 } else { self.gain_db };
             self.mute = false;
@@ -223,7 +232,9 @@ impl TrackEdit {
         } else if i == last {
             span
         } else {
-            at.clamp(self.points[i - 1].at + MIN_GAP, self.points[i + 1].at - MIN_GAP)
+            let (lo, hi) = (self.points[i - 1].at + MIN_GAP, self.points[i + 1].at - MIN_GAP);
+            // Neighbours closer than two gaps leave no room: stay where it is.
+            if lo <= hi { at.clamp(lo, hi) } else { self.points[i].at }
         };
         self.points[i] = EnvPoint { at, db: db.clamp(MIN_DB, MAX_DB) };
     }
@@ -384,6 +395,17 @@ impl TrackEdit {
         if let Some(p) = points.last_mut() {
             p.at = len + next_len;
         }
+        // Keep the times strictly rising: a point of `next` within a gap of its end would land on
+        // or past the end point, and two points at one time divide by zero in `db_at`.
+        let end = points.pop();
+        let mut rising: Vec<EnvPoint> = Vec::with_capacity(points.len() + 1);
+        for p in points {
+            if end.is_none_or(|e| p.at < e.at) && rising.last().is_none_or(|l| p.at > l.at) {
+                rising.push(p);
+            }
+        }
+        rising.extend(end);
+        let points = rising;
         let mut out = Self { gain_db: 0.0, mute: false, points };
         out.simplify();
         out
@@ -438,6 +460,10 @@ impl Piece {
             // A gap has no clip to stay inside: only its length is limited.
             let a = a.min(b - MIN_PIECE);
             return Self { a, b, ..self.clone() };
+        }
+        if duration < MIN_PIECE {
+            // A source shorter than a piece can only be taken whole, never run past its end.
+            return Self { a: Hns::ZERO, b: duration, ..self.clone() };
         }
         let a = a.clamp(Hns::ZERO, (b - MIN_PIECE).max(Hns::ZERO));
         let b = b.clamp(a + MIN_PIECE, duration.max(a + MIN_PIECE));
@@ -1365,5 +1391,42 @@ mod tests {
         let scratch = scratch_name(Path::new("d/Ace (edited).mp4"), "trim");
         assert_eq!(scratch.parent(), Some(Path::new("d")));
         assert_ne!(scratch, Path::new("d/Ace (edited).mp4"));
+    }
+
+    #[test]
+    fn short_pieces_never_panic_the_volume_line() {
+        let mut t = TrackEdit::default();
+        assert_eq!(t.add_point(Hns::from_millis(30), -6.0, Hns::from_millis(90)), 0);
+        assert!(t.points.is_empty());
+        let mut t = TrackEdit::default();
+        let span = Hns::from_millis(300);
+        t.add_point(Hns::from_millis(100), -6.0, span);
+        t.add_point(Hns::from_millis(160), -9.0, span);
+        t.move_point(1, Hns::from_millis(150), 0.0, span);
+        t.move_point(2, Hns::from_millis(100), 0.0, span);
+    }
+
+    #[test]
+    fn joined_line_has_no_duplicate_times() {
+        let line = |db| TrackEdit {
+            gain_db: 0.0,
+            mute: false,
+            points: vec![
+                EnvPoint { at: Hns::ZERO, db },
+                EnvPoint { at: Hns::from_millis(970), db: -20.0 },
+                EnvPoint { at: Hns::from_secs(1), db: 0.0 },
+            ],
+        };
+        let j = line(0.0).joined(secs(1), &line(-3.0), secs(1));
+        assert!(j.points.windows(2).all(|w| w[0].at < w[1].at), "{:?}", j.points);
+        assert!(j.db_at(Hns::from_millis(1990)).is_finite());
+    }
+
+    #[test]
+    fn trim_of_a_tiny_source_stays_inside_it() {
+        let p =
+            Piece { source: 0, a: Hns::ZERO, b: Hns::from_millis(80), tracks: vec![], gap: false };
+        let t = p.trimmed(Hns::ZERO, Hns::from_millis(80), Hns::from_millis(80));
+        assert_eq!(t.b, Hns::from_millis(80));
     }
 }
