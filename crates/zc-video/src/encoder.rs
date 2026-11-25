@@ -168,6 +168,22 @@ impl HwEncoder {
         let activate = enum_encoders(device, codec)?.into_iter().next().ok_or_else(|| {
             SourceError::Unsupported(format!("no hardware {} encoder", codec.name()))
         })?;
+        // A failed open (the codec ladder tries several) must still release the MFT, which
+        // holds the GPU encoder session until `ShutdownObject`.
+        Self::open(device, config, size, inputs, activate.clone()).inspect_err(|_| {
+            // SAFETY: shutting down an activate object we own; failures have no remedy.
+            let _ = unsafe { activate.ShutdownObject() };
+        })
+    }
+
+    fn open(
+        device: &ID3D11Device,
+        config: &VideoStart,
+        size: (u32, u32),
+        inputs: &[ID3D11Texture2D],
+        activate: IMFActivate,
+    ) -> Result<Self, SourceError> {
+        let codec = config.codec;
         let frame_size = (u64::from(size.0) << 32) | u64::from(size.1);
         let frame_rate = (u64::from(config.fps.max(1)) << 32) | 1;
 
