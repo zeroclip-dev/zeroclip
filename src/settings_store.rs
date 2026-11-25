@@ -21,7 +21,10 @@ pub fn load(path: &Path) -> Settings {
         }
     };
     match toml::from_str(&text) {
-        Ok(settings) => settings,
+        Ok(mut settings) => {
+            Settings::sanitize_loaded(&mut settings);
+            settings
+        }
         Err(e) => {
             let backup = path.with_extension("toml.bak");
             tracing::warn!(error = %e, backup = %backup.display(), "settings file is invalid; using defaults");
@@ -42,7 +45,13 @@ pub fn save(path: &Path, settings: &Settings) -> anyhow::Result<()> {
     }
     let text = toml::to_string_pretty(settings).context("couldn't serialise settings")?;
     let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text).with_context(|| format!("couldn't write {}", tmp.display()))?;
+    // sync_all before the rename, or a power cut can leave the new name pointing at empty data.
+    let mut file =
+        std::fs::File::create(&tmp).with_context(|| format!("couldn't write {}", tmp.display()))?;
+    std::io::Write::write_all(&mut file, text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("couldn't write {}", tmp.display()))?;
+    drop(file);
     std::fs::rename(&tmp, path).with_context(|| format!("couldn't replace {}", path.display()))?;
     tracing::info!(path = %path.display(), "settings saved");
     Ok(())

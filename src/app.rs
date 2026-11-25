@@ -234,7 +234,7 @@ impl ZeroClipApp {
     pub fn open_in_editor(&mut self, path: PathBuf, watch: bool, cx: &mut Context<Self>) {
         let ffmpeg = self.settings.editor.ffmpeg_path.clone();
         let store = self.store.clone();
-        let bitrate_bps = self.settings.audio.bitrate_kbps * 1_000;
+        let bitrate_bps = self.settings.audio.bitrate_kbps.saturating_mul(1_000);
         let prefs = (self.settings.editor.finish, usize::from(self.settings.editor.listen_track));
         self.screens.editor().update(cx, |editor, cx| {
             editor.open(path, watch, Some(prefs), ffmpeg, store, bitrate_bps, cx)
