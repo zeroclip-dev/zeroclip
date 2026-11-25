@@ -52,6 +52,23 @@ pub struct Settings {
     /// The editor preview's volume and mute, kept apart from the clip player's.
     #[serde(default)]
     pub editor_volume: PlayerSettings,
+    /// Update checks.
+    #[serde(default)]
+    pub updates: UpdateSettings,
+}
+
+/// Update checks. Installing is always a click, never automatic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateSettings {
+    /// Look for a newer release at startup and once a day.
+    pub check: bool,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self { check: true }
+    }
 }
 
 fn default_overlay_toasts() -> bool {
@@ -76,6 +93,7 @@ impl Default for Settings {
             overlay_toasts: default_overlay_toasts(),
             player: PlayerSettings::default(),
             editor_volume: PlayerSettings::default(),
+            updates: UpdateSettings::default(),
         }
     }
 }

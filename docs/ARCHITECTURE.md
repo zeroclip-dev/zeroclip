@@ -15,7 +15,7 @@ state machine; editing never re-encodes; nothing is ever deleted unverified.
 
 | Crate | Owns | Depends on | OS |
 |---|---|---|---|
-| `zeroclip` (repo root) | GPUI UI, settings file, logging, **wiring** (composition root), **system tray** (`tray.rs`) | `zc-engine`, `zc-core`, `zc-mux`, `zc-video`, `zc-win` (drive probe, page-locking), `zc-store` (waveform cache), `zc-editor` (Editor tab: ffmpeg jobs run on GPUI background threads); more adapters as phases land | Windows |
+| `zeroclip` (repo root) | GPUI UI, settings file, logging, **wiring** (composition root), **system tray** (`tray.rs`), **self-update** (`update.rs`: GitHub Releases via system `curl.exe`, SHA-256 check, rename-swap restart) | `zc-engine`, `zc-core`, `zc-mux`, `zc-video`, `zc-win` (drive probe, page-locking), `zc-store` (waveform cache), `zc-editor` (Editor tab: ffmpeg jobs run on GPUI background threads); more adapters as phases land | Windows |
 | `zc-engine` | the engine actor, recording modes, the `Recorder`, the disk-backed DVR ring (`disk_dvr.rs`, D32 Disk mode), synthetic sources | `zc-core`, `zc-mux` | any |
 | `zc-core` | `Hns` time, packets, codecs, DVR buffer, watchdog FSM, profiles, hotkeys, DSP, settings, **ports** | — | any |
 | `zc-mux` | container writers (fMP4/MKV), chunked writes, HDD pacing | `zc-core` | any |
