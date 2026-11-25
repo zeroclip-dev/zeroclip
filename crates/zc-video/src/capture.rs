@@ -339,28 +339,39 @@ impl WgcCapture {
                 };
                 let (on_frame, last_size, device) = &mut *state;
                 let frame = pool.TryGetNextFrame()?;
-                let content = frame.ContentSize()?;
-                if content != *last_size {
-                    pool.Recreate(&winrt_device(device)?, format, 2, content)?;
-                    *last_size = content;
-                }
-                let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
-                // SAFETY: WGC surfaces are D3D11 textures.
-                let texture: ID3D11Texture2D = unsafe { access.GetInterface()? };
-                let mut desc = D3D11_TEXTURE2D_DESC::default();
-                // SAFETY: `desc` is a valid out-parameter.
-                unsafe { texture.GetDesc(&mut desc) };
-                // The frame in hand can predate the Recreate, so clamp to its buffer.
-                let width = u32::try_from(content.Width).unwrap_or(0).min(desc.Width);
-                let height = u32::try_from(content.Height).unwrap_or(0).min(desc.Height);
-                let time = Hns(frame.SystemRelativeTime()?.Duration);
-                on_frame(CapturedFrame {
-                    texture,
-                    time,
-                    size: (width, height),
-                    sdr_white: hdr_white,
-                });
-                frame.Close()
+                // Every path closes the frame, or the pool (2 buffers) runs dry and capture
+                // stalls; a failed step only skips this frame.
+                let handled: windows::core::Result<()> = (|| {
+                    let content = frame.ContentSize()?;
+                    // A minimised window reports 0 (or 1) pixels; the pool can't be resized
+                    // to that, so wait for it to come back.
+                    if content.Width < 2 || content.Height < 2 {
+                        return Ok(());
+                    }
+                    if content != *last_size {
+                        pool.Recreate(&winrt_device(device)?, format, 2, content)?;
+                        *last_size = content;
+                    }
+                    let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
+                    // SAFETY: WGC surfaces are D3D11 textures.
+                    let texture: ID3D11Texture2D = unsafe { access.GetInterface()? };
+                    let mut desc = D3D11_TEXTURE2D_DESC::default();
+                    // SAFETY: `desc` is a valid out-parameter.
+                    unsafe { texture.GetDesc(&mut desc) };
+                    // The frame in hand can predate the Recreate, so clamp to its buffer.
+                    let width = u32::try_from(content.Width).unwrap_or(0).min(desc.Width);
+                    let height = u32::try_from(content.Height).unwrap_or(0).min(desc.Height);
+                    let time = Hns(frame.SystemRelativeTime()?.Duration);
+                    on_frame(CapturedFrame {
+                        texture,
+                        time,
+                        size: (width, height),
+                        sdr_white: hdr_white,
+                    });
+                    Ok(())
+                })();
+                let closed = frame.Close();
+                handled.and(closed)
             });
         let token = pool.FrameArrived(&handler).map_err(err("FrameArrived"))?;
         let session = pool.CreateCaptureSession(item).map_err(err("CreateCaptureSession"))?;
