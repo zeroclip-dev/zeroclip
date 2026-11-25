@@ -606,6 +606,8 @@ impl SnapshotCopy {
                 // A lost audio packet costs that packet only: the video is still whole, and a
                 // gap at the start of one audio track beats losing a GOP or the whole clip.
                 if self.plan.packets[lost].meta.track != TrackId::Video {
+                    // Its buffer is still the zero fill: mark it so `finish` leaves it out.
+                    self.packets[lost].data = Vec::new();
                     self.next = lost + 1;
                     return Ok(());
                 }
@@ -630,7 +632,8 @@ impl SnapshotCopy {
     #[must_use]
     pub fn finish(mut self) -> DvrClip {
         let floor = self.floor;
-        self.packets.retain(|p| p.meta.pts >= floor);
+        // An emptied payload is a packet that was lapped before it was copied.
+        self.packets.retain(|p| p.meta.pts >= floor && !p.data.is_empty());
         // Stable sort, and TrackId orders video first, so equal PTS keep video ahead of audio.
         self.packets.sort_by_key(|p| (p.meta.pts, p.meta.track));
         DvrClip { packets: self.packets }
@@ -720,6 +723,7 @@ mod tests {
         push_all(&mut dvr, &s.take_secs(3));
         let plan = dvr.plan_snapshot(Hns::from_secs(3)).unwrap();
         let planned_video = plan.packets.iter().filter(|p| p.meta.track == TrackId::Video).count();
+        let plan_audio = plan.packets.len() - planned_video;
         push_all(&mut dvr, &s.take_secs(1));
 
         let mut copy = SnapshotCopy::new(plan);
@@ -728,6 +732,9 @@ mod tests {
         }
         let clip = copy.finish();
         assert_eq!(clip.video().count(), planned_video, "no video was dropped for audio loss");
+        // A lapped audio packet must be left out, not shipped as a zero-filled buffer.
+        assert!(clip.packets.iter().all(|p| p.data.iter().any(|&b| b != 0)), "zero packet");
+        assert!(clip.packets.len() - planned_video < plan_audio, "lapped audio was kept");
     }
 
     #[test]
