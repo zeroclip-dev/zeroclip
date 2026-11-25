@@ -17,8 +17,8 @@ use zc_core::control::Command;
 use zc_core::hotkey::{Chord, Key};
 use zc_core::media::{Codec, ContainerFormat};
 use zc_core::settings::{
-    AAC_BITRATES_KBPS, CaptureMode, DvrStorage, MIX_GAIN_DB, MicMode, Settings, StorageLayout,
-    UiMode,
+    AAC_BITRATES_KBPS, CaptureMode, DvrStorage, MIX_GAIN_DB, MicMode, OutputResolution, Settings,
+    StorageLayout, UiMode,
 };
 use zc_video::capture::MonitorInfo;
 
@@ -623,6 +623,25 @@ fn warn_row(text: impl Into<SharedString>) -> AnyElement {
 }
 
 /// A switch row with label + helper on the left and the toggle switch on the right.
+/// Output resolution, in both views. Applies the next time capture starts.
+fn resolution_row(
+    id: &'static str,
+    current: OutputResolution,
+    cx: &mut Context<SettingsView>,
+) -> AnyElement {
+    setting_row(
+        "Resolution",
+        "Scales the video down to this height, keeping its shape. Never scales up.",
+        segmented(
+            id,
+            OutputResolution::ALL.iter().map(|r| r.label().into()).collect(),
+            OutputResolution::ALL.iter().position(|r| *r == current),
+            true,
+            bind!(cx, |d, i: &usize| d.settings.video.resolution = OutputResolution::ALL[*i]),
+        ),
+    )
+}
+
 /// "Check now": looks for a newer release immediately and installs it if there is one.
 fn update_now_row(state: &UpdateState, cx: &mut Context<SettingsView>) -> AnyElement {
     let label = match state {
@@ -1109,22 +1128,25 @@ impl Render for SettingsView {
             let quality = section_block(
                 "Quality",
                 "Frame rate and bitrate preset used for clips and recordings.",
-                vec![setting_row(
-                    "Video preset",
-                    quality_hint,
-                    segmented(
-                        "simple-quality",
-                        QUALITIES.iter().map(|q| q.label.into()).collect(),
-                        quality_ix,
-                        true,
-                        bind!(cx, |d, i: &usize| {
-                            let q = &QUALITIES[*i];
-                            d.settings.video.fps = q.fps;
-                            d.settings.video.min_bitrate_kbps = q.min_kbps;
-                            d.settings.video.max_bitrate_kbps = q.max_kbps;
-                        }),
+                vec![
+                    setting_row(
+                        "Video preset",
+                        quality_hint,
+                        segmented(
+                            "simple-quality",
+                            QUALITIES.iter().map(|q| q.label.into()).collect(),
+                            quality_ix,
+                            true,
+                            bind!(cx, |d, i: &usize| {
+                                let q = &QUALITIES[*i];
+                                d.settings.video.fps = q.fps;
+                                d.settings.video.min_bitrate_kbps = q.min_kbps;
+                                d.settings.video.max_bitrate_kbps = q.max_kbps;
+                            }),
+                        ),
                     ),
-                )],
+                    resolution_row("simple-resolution", v.resolution, cx),
+                ],
             );
 
             let recording = section_block(
@@ -1314,6 +1336,7 @@ impl Render for SettingsView {
                             [None, Some(Codec::Av1), Some(Codec::Hevc), Some(Codec::H264)][*i]),
                     ),
                 ));
+                video_rows.push(resolution_row("resolution", video.resolution, cx));
                 video_rows.push(setting_row(
                     "Frame rate",
                     "Target capture frame rate.",

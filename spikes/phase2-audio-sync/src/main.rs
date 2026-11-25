@@ -109,6 +109,7 @@ fn main() -> Result<()> {
             max_bitrate_bps: 20_000_000,
             keyframe_interval: Hns::from_secs(1),
             capture_cursor: false,
+            resolution: Default::default(),
         },
         sink.clone(),
         health,

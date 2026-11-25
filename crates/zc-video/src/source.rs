@@ -533,8 +533,9 @@ impl Pipeline {
             .map_err(|e| SourceError::Other(format!("GraphicsCaptureItem::Size: {e}")))?;
         let size_in =
             (u32::try_from(size.Width).unwrap_or(0), u32::try_from(size.Height).unwrap_or(0));
-        // NV12 and the encoders need even sizes.
-        let size_out = (size_in.0 & !1, size_in.1 & !1);
+        // Even (NV12 and the encoders need it), and scaled down to the chosen resolution with
+        // the same aspect ratio; the video processor does the scaling in the same blit.
+        let size_out = config.resolution.output_size(size_in);
         if size_out.0 == 0 || size_out.1 == 0 {
             return Err(SourceError::Other(format!(
                 "the capture target has no size ({}x{}); is the window minimised?",

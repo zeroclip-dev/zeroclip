@@ -341,6 +341,66 @@ pub struct VideoSettings {
     /// What to record: only profiled games (default), or the whole screen (D31).
     #[serde(default)]
     pub capture_mode: CaptureMode,
+    /// The height the video is encoded at. Smaller means smaller files.
+    pub resolution: OutputResolution,
+}
+
+/// The height the video is encoded at. The width follows the source's aspect ratio.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputResolution {
+    /// The size of what is captured.
+    #[default]
+    Native,
+    /// 1440 pixels tall.
+    P1440,
+    /// 1080 pixels tall.
+    P1080,
+    /// 720 pixels tall.
+    P720,
+}
+
+impl OutputResolution {
+    /// Every choice, in the order the UI lists them.
+    pub const ALL: [Self; 4] = [Self::Native, Self::P1440, Self::P1080, Self::P720];
+
+    /// The UI label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Native => "Native",
+            Self::P1440 => "1440p",
+            Self::P1080 => "1080p",
+            Self::P720 => "720p",
+        }
+    }
+
+    /// The target height, or `None` for the source's own.
+    #[must_use]
+    pub fn height(self) -> Option<u32> {
+        match self {
+            Self::Native => None,
+            Self::P1440 => Some(1_440),
+            Self::P1080 => Some(1_080),
+            Self::P720 => Some(720),
+        }
+    }
+
+    /// The encode size for a `source` of `(width, height)`: scaled down to the target height
+    /// with the source's aspect ratio, never up, and rounded down to even numbers (encoders
+    /// need even sizes, D24).
+    #[must_use]
+    pub fn output_size(self, source: (u32, u32)) -> (u32, u32) {
+        let (w, h) = source;
+        let (w, h) = match self.height() {
+            Some(target) if target < h => (
+                u32::try_from(u64::from(w) * u64::from(target) / u64::from(h)).unwrap_or(w),
+                target,
+            ),
+            _ => (w, h),
+        };
+        (w & !1, h & !1)
+    }
 }
 
 impl Default for VideoSettings {
@@ -354,6 +414,7 @@ impl Default for VideoSettings {
             capture_cursor: false,
             monitor: None,
             capture_mode: CaptureMode::default(),
+            resolution: OutputResolution::default(),
         }
     }
 }
@@ -768,5 +829,17 @@ storage = \"disk\"
         assert_eq!(older.player, PlayerSettings { volume: 100, muted: false });
         let saved: Settings = toml::from_str("[player]\nvolume = 65\nmuted = true\n").unwrap();
         assert_eq!(saved.player, PlayerSettings { volume: 65, muted: true });
+    }
+
+    #[test]
+    fn output_size_scales_down_keeps_aspect_and_never_scales_up() {
+        assert_eq!(OutputResolution::Native.output_size((2560, 1440)), (2560, 1440));
+        assert_eq!(OutputResolution::P1080.output_size((2560, 1440)), (1920, 1080));
+        assert_eq!(OutputResolution::P720.output_size((3440, 1440)), (1720, 720));
+        assert_eq!(OutputResolution::P1440.output_size((1920, 1080)), (1920, 1080));
+        assert_eq!(OutputResolution::P720.output_size((1366, 768)), (1280, 720));
+        assert_eq!(OutputResolution::Native.output_size((1365, 767)), (1364, 766));
+        let older: Settings = toml::from_str("[video]\nfps = 30\n").unwrap();
+        assert_eq!(older.video.resolution, OutputResolution::Native);
     }
 }
