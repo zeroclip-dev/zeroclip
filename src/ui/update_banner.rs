@@ -15,7 +15,7 @@ use crate::update::UpdateState;
 /// The strip for the current update state. Nothing to draw when there is no update.
 pub fn banner(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> Option<impl IntoElement> {
     let (text, actions) = match &app.update {
-        UpdateState::None => return None,
+        UpdateState::None | UpdateState::Checking => return None,
         UpdateState::Available(r) => (
             format!("Update to v{} available", r.version),
             div()
