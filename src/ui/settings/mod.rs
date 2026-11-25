@@ -38,6 +38,7 @@ use super::icons::icon;
 use super::theme;
 use super::{dvr_megabytes, dvr_ring_megabytes, effective_ceiling, human_duration};
 use crate::app::ZeroClipApp;
+use crate::update::UpdateState;
 use simple::{
     MAX_MINUTES, MIN_MINUTES, QUALITIES, buffer_bitrate_bps, current_quality, free_space,
     minutes_from_buffer_secs, quality_line, storage_line,
@@ -622,6 +623,35 @@ fn warn_row(text: impl Into<SharedString>) -> AnyElement {
 }
 
 /// A switch row with label + helper on the left and the toggle switch on the right.
+/// "Check now": looks for a newer release immediately and installs it if there is one.
+fn update_now_row(state: &UpdateState, cx: &mut Context<SettingsView>) -> AnyElement {
+    let label = match state {
+        UpdateState::Checking => "Checking…",
+        UpdateState::Downloading(_) => "Downloading…",
+        UpdateState::Available(_) | UpdateState::Ready { .. } => "Install update",
+        UpdateState::None => "Check now",
+    };
+    let idle = !matches!(state, UpdateState::Checking | UpdateState::Downloading(_));
+    let mut b = button("update-now", label);
+    if idle {
+        b = b.on_click(cx.listener(|this, _, _, cx| {
+            if let Some(app) = this.app.upgrade() {
+                app.update(cx, |app, cx| app.check_update_now(cx));
+            }
+        }));
+    } else {
+        b = b.opacity(0.6);
+    }
+    setting_row(
+        "Update now",
+        format!(
+            "You have v{}. Installs right away when a newer one is out.",
+            env!("CARGO_PKG_VERSION")
+        ),
+        b,
+    )
+}
+
 fn toggle_row(
     id: &'static str,
     label: &'static str,
@@ -920,9 +950,9 @@ impl Render for SettingsView {
                 }
             }
         });
-        let (d, saved) = {
+        let (d, saved, update_state) = {
             let a = app.read(cx);
-            (a.draft.clone(), a.settings.clone())
+            (a.draft.clone(), a.settings.clone(), a.update.clone())
         };
         let dirty = d.is_dirty(&saved);
         let wide = is_two_column(f32::from(window.viewport_size().width));
@@ -1154,6 +1184,7 @@ impl Render for SettingsView {
                         true,
                         bind!(cx, |d, v: &bool| d.settings.updates.check = *v),
                     ),
+                    update_now_row(&update_state, cx),
                 ],
             );
 
@@ -1722,14 +1753,17 @@ impl Render for SettingsView {
                 section_block(
                     "Updates",
                     format!("ZeroClip v{}.", env!("CARGO_PKG_VERSION")),
-                    vec![toggle_row(
-                        "check-updates",
-                        "Check for updates",
-                        "Look for a newer release at startup and once a day. Installing is always your click, and never while recording.",
-                        d.settings.updates.check,
-                        true,
-                        bind!(cx, |d, v: &bool| d.settings.updates.check = *v),
-                    )],
+                    vec![
+                        toggle_row(
+                            "check-updates",
+                            "Check for updates",
+                            "Look for a newer release at startup and once a day. Installing is always your click, and never while recording.",
+                            d.settings.updates.check,
+                            true,
+                            bind!(cx, |d, v: &bool| d.settings.updates.check = *v),
+                        ),
+                        update_now_row(&update_state, cx),
+                    ],
                 ),
                 section_block(
                     "Editor",
