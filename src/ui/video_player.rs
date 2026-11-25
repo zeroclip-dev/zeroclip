@@ -105,6 +105,9 @@ pub struct VideoPlayerView {
     persist_gen: u64,
     /// When the mouse went down on the picture, while it is still down.
     hold: Option<Instant>,
+    /// The user left this screen (`pause`) since the clip was opened, so a clip that finishes
+    /// reading now must not start playing behind another tab.
+    left: bool,
     /// Playing at the hold speed.
     boosted: bool,
     ticking: bool,
@@ -162,6 +165,7 @@ impl VideoPlayerView {
             prefs_dirty: false,
             persist_gen: 0,
             hold: None,
+            left: false,
             boosted: false,
             ticking: false,
             fullscreen: false,
@@ -324,6 +328,9 @@ impl VideoPlayerView {
         self.boosted = false;
         self.hold = None;
         self.paused_on_blur = false;
+        self.left = false;
+        // Nothing of the last clip may play under this one if this one fails to open.
+        self.ffmpeg = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -348,12 +355,12 @@ impl VideoPlayerView {
                         this.has_sound = !this.audio_tracks.is_empty();
                         this.selected_track = 0;
                         this.ffmpeg = Some(ffmpeg);
-                        if this.window_active {
+                        if this.window_active && !this.left {
                             this.play_from(Hns::ZERO, cx);
                         } else if let (Some(ffmpeg), Some(path)) =
                             (this.ffmpeg.as_ref(), this.path.as_ref())
                         {
-                            this.paused_on_blur = true;
+                            this.paused_on_blur = !this.window_active;
                             this.player.show_at(ffmpeg, path, Hns::ZERO, Hns::ZERO);
                             this.ensure_ticking(cx);
                         }
@@ -366,8 +373,27 @@ impl VideoPlayerView {
         .detach();
     }
 
+    /// Closes the clip when it is `path`, a file that was just deleted.
+    pub fn forget(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if self.path.as_deref() != Some(path) {
+            return;
+        }
+        self.pause(cx);
+        self.generation += 1;
+        self.player.reset();
+        self.path = None;
+        self.ffmpeg = None;
+        self.name.clear();
+        self.loading = false;
+        self.problem = Some("This clip was deleted.".to_owned());
+        cx.notify();
+    }
+
     /// Stops playback, picture and sound (when the user leaves this screen).
     pub fn pause(&mut self, cx: &mut Context<Self>) {
+        self.left = true;
+        self.hold = None;
+        self.boosted = false;
         self.track_menu_open = false;
         if self.prefs_dirty {
             self.persist_audio_prefs_now(cx);
@@ -443,6 +469,8 @@ impl VideoPlayerView {
     /// Plays or pauses. At the very end it starts over.
     fn toggle(&mut self, cx: &mut Context<Self>) {
         if self.player.playing {
+            self.hold = None;
+            self.boosted = false;
             self.stop_audio();
             self.player.pause();
             cx.notify();
@@ -650,10 +678,12 @@ impl LiveAudio {
             .args(["-hide_banner", "-nostdin", "-loglevel", "error"])
             .arg("-ss")
             .arg(format!("{:.6}", from.as_secs_f64()))
-            .arg("-i")
-            .arg(path)
+            // `-t` before `-i` counts source time: after it, it would count output time, which
+            // `atempo` stretches, and a slow speed would cut the sound short.
             .arg("-t")
             .arg(format!("{duration_secs:.6}"))
+            .arg("-i")
+            .arg(zc_editor::ffmpeg::input_arg(path))
             .args(["-vn", "-sn", "-map"])
             .arg(format!("0:a:{track}"));
         let tempo_filters = atempo_filters(rate);
@@ -795,14 +825,16 @@ fn stop_live_audio(mut sink: Child, mut decoder: Child) {
         no_window(&mut cmd);
         cmd.spawn().ok()
     };
+    // Killed here (quick), so quitting right after never leaves a process behind; only the waiting
+    // is left to a thread.
+    let _ = decoder.kill();
+    let _ = sink.kill();
     std::thread::spawn(move || {
-        let _ = decoder.kill();
         let _ = decoder.wait();
         #[cfg(windows)]
         if let Some(mut tree) = tree {
             let _ = tree.wait();
         }
-        let _ = sink.kill();
         let _ = sink.wait();
     });
 }
@@ -1188,6 +1220,17 @@ impl Render for VideoPlayerView {
                         this.restart(cx);
                     } else if held.is_some() {
                         this.toggle(cx);
+                    }
+                }),
+            )
+            // Released outside the picture: the hold is over, but it was no click.
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    this.hold = None;
+                    if this.boosted {
+                        this.boosted = false;
+                        this.restart(cx);
                     }
                 }),
             );
