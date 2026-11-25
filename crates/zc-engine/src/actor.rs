@@ -127,12 +127,11 @@ impl Engine {
             total_mib,
             storage,
             persister: None,
-            output_dir: config
-                .settings
-                .recording
-                .output_dir
-                .clone()
-                .unwrap_or(config.default_output_dir),
+            output_dir: resolve_output_dir(
+                config.settings.recording.output_dir.as_deref(),
+                &config.default_output_dir,
+            ),
+            default_output_dir: config.default_output_dir,
             hotkeys: ChordMatcher::new(bindings(&config.settings)),
             hotkeys_suspended: false,
             settings: config.settings,
@@ -142,6 +141,7 @@ impl Engine {
             wake,
             status: EngineStatus::default(),
             recorder: Arc::new(Recorder::new(dvr)),
+            dvr_applied: dvr,
             stats_seen: RecorderStats::default(),
             audio_tracks: Vec::new(),
             recording: None,
@@ -266,6 +266,11 @@ struct Actor {
     /// The thread that writes finished GOPs to the ring file, in disk mode (P4.21).
     persister: Option<Persister>,
     output_dir: PathBuf,
+    /// The size the RAM buffer was last given, so a change of bitrate or of `enabled` resizes it
+    /// even when the window stays the same.
+    dvr_applied: DvrConfig,
+    /// Where output goes when the setting is cleared.
+    default_output_dir: PathBuf,
     ports: Ports,
     /// Our own inbox, for the emitters handed to sources.
     inbox: Sender<Msg>,
@@ -769,8 +774,9 @@ impl Actor {
         let ram = effective_ram_ceiling(self.settings.dvr.ram_ceiling_mib, self.total_mib);
         let disk = self.storage == DvrStorage::Disk;
         let clamp = clamp_for(&self.settings, profile, if disk { u32::MAX } else { ram.mib });
-        if clamp.window != self.status.buffer_window && self.settings.dvr.enabled {
-            let config = dvr_for(&self.settings, clamp.window);
+        let config = dvr_for(&self.settings, clamp.window);
+        let changed = clamp.window != self.status.buffer_window || config != self.dvr_applied;
+        if changed && self.settings.dvr.enabled {
             if disk {
                 // Sized at start for the largest saved window, so this is a no-op unless a
                 // settings change since then asked for more (and then it keeps the footage).
@@ -786,6 +792,7 @@ impl Actor {
                 }
             } else {
                 self.recorder.resize(config);
+                self.dvr_applied = config;
             }
         }
         self.status.buffer_window = clamp.window;
@@ -1061,6 +1068,17 @@ impl Actor {
         if let Some(audio) = self.ports.game_audio.as_mut() {
             audio.set_target_process(None);
         }
+        // Game mode captures the game's window, which is gone now: stop instead of leaving the
+        // encoder running on a dead target. The buffer stays for clips.
+        let gone = self.tracked.as_ref().map(|t| t.exe.as_str());
+        if self
+            .game_capture
+            .as_ref()
+            .is_some_and(|c| gone.is_some_and(|g| g.eq_ignore_ascii_case(&c.exe)))
+        {
+            self.game_capture = None;
+            self.stop_capture();
+        }
         self.tracked = None;
         // A prompt about the game that just exited has nothing left to switch away from (D35).
         self.focus_pending = None;
@@ -1321,13 +1339,14 @@ impl Actor {
 
     /// Starts the video source on `target`, and the audio sources unless they already run.
     fn start_capture(&mut self, target: CaptureTarget) {
-        self.start_video(target);
-        if !self.audio_running {
+        // No audio without video: it would fill the buffer with tracks no clip can use.
+        if self.start_video(target) && !self.audio_running {
             self.start_audio();
         }
     }
 
-    fn start_video(&mut self, target: CaptureTarget) {
+    /// Returns false when a video source exists but failed to start.
+    fn start_video(&mut self, target: CaptureTarget) -> bool {
         let health = self.health_emitter();
         let config = video_start(&self.settings, target);
         let sink: SharedSink = self.recorder.clone();
@@ -1342,11 +1361,15 @@ impl Actor {
                 self.status.codec = Some(codec);
                 self.video_track = self.ports.video.as_ref().and_then(|video| video.format());
             }
-            Some(Err(e)) => self.emit(EngineEvent::Error(format!("Capture couldn't start: {e}"))),
+            Some(Err(e)) => {
+                self.emit(EngineEvent::Error(format!("Capture couldn't start: {e}")));
+                return false;
+            }
             None => self.emit(EngineEvent::Warning(
                 "No capture source is attached, so nothing is captured or buffered.".into(),
             )),
         }
+        true
     }
 
     fn stop_sources(&mut self) {
@@ -1376,7 +1399,9 @@ impl Actor {
         self.status.capturing = false;
         match target {
             // Audio keeps running when only the video restarts.
-            Some(target) if was_capturing => self.start_video(target),
+            Some(target) if was_capturing => {
+                self.start_video(target);
+            }
             Some(target) => self.start_capture(target),
             None => self.stop_capture(),
         }
@@ -1409,6 +1434,14 @@ impl Actor {
             }
             CaptureDecision::Start { hwnd, clear_buffer } => {
                 if active {
+                    // The file's header holds the old window's size and codec, so it can't
+                    // carry the new window's frames (as in `restart_capture`).
+                    if self.recording.as_ref().is_some_and(|r| r.id.is_some()) {
+                        self.stop_recording();
+                        self.emit(EngineEvent::Warning(
+                            "Capture moved to another window, so the recording was stopped.".into(),
+                        ));
+                    }
                     self.stop_capture();
                 }
                 // A rescue waiting for the dump slot still needs the dead game's footage, so it
@@ -1498,10 +1531,12 @@ impl Actor {
                 if video_changed && self.ports.video.is_some() && restart {
                     self.restart_capture();
                 }
-                if let Some(dir) = &self.settings.recording.output_dir
-                    && *dir != self.output_dir
-                {
-                    self.output_dir.clone_from(dir);
+                let dir = resolve_output_dir(
+                    self.settings.recording.output_dir.as_deref(),
+                    &self.default_output_dir,
+                );
+                if dir != self.output_dir {
+                    self.output_dir = dir;
                     self.detect_drive();
                 }
                 tracing::info!("settings applied");
@@ -1561,14 +1596,9 @@ impl Actor {
 
     /// Where a `kind` file ("Clips", "Recordings", "Screenshots") goes under the chosen layout.
     fn media_dir(&self, kind: &str) -> PathBuf {
-        let game = self.status.game.as_deref().map(|g| g.strip_suffix(".exe").unwrap_or(g));
-        match (self.settings.recording.layout, game) {
+        match (self.settings.recording.layout, self.status.game.as_deref()) {
             (StorageLayout::PerGame, Some(game)) => {
-                let safe: String = game
-                    .chars()
-                    .map(|c| if r#"<>:"/\|?*"#.contains(c) || c.is_control() { '_' } else { c })
-                    .collect();
-                self.output_dir.join(safe.trim()).join(kind)
+                self.output_dir.join(zc_core::fs_name::safe_folder_name(game)).join(kind)
             }
             _ => self.output_dir.clone(),
         }
@@ -1999,7 +2029,9 @@ impl Actor {
             }
             WatchdogAction::GiveUp => {
                 tracing::error!("watchdog gave up: no codec could be re-initialised");
-                self.status.capturing = false;
+                // Audio and a recording would otherwise run on with no video behind them.
+                self.stop_recording();
+                self.stop_capture();
                 self.emit(EngineEvent::Error(
                     "Capture stopped: no hardware encoder could be restarted. Update the GPU \
                      driver or restart ZeroClip."
@@ -2015,6 +2047,14 @@ impl Actor {
     fn reinit(&mut self, codec: Codec) -> HealthEvent {
         let Some(config) = self.video_config else { return HealthEvent::ReinitFailed };
         let config = VideoStart { codec, ..config };
+        // Before the new encoder starts: the tee would otherwise write its packets under the old
+        // track header, as `restart_capture` avoids.
+        if self.recording.as_ref().is_some_and(|r| r.id.is_some()) {
+            self.stop_recording();
+            self.emit(EngineEvent::Warning(
+                "The encoder restarted, so the recording was stopped.".into(),
+            ));
+        }
         let sink: SharedSink = self.recorder.clone();
         let health = self.health_emitter();
         let Some(video) = self.ports.video.as_mut() else { return HealthEvent::ReinitFailed };
@@ -2029,14 +2069,6 @@ impl Actor {
                     )));
                 }
                 self.status.codec = Some(actual);
-                // The tee would keep writing the new encoder's packets under the old track
-                // header, as `restart_capture` avoids.
-                if self.recording.as_ref().is_some_and(|r| r.id.is_some()) {
-                    self.stop_recording();
-                    self.emit(EngineEvent::Warning(
-                        "The encoder restarted, so the recording was stopped.".into(),
-                    ));
-                }
                 // A step down the ladder changes the track; the buffer is cleared at RESUMING,
                 // so later clips hold only the new format.
                 self.video_track = format;
@@ -2086,8 +2118,23 @@ impl Actor {
     }
 }
 
+/// The folder output goes to: the configured one, or the default when the setting is cleared.
+fn resolve_output_dir(configured: Option<&Path>, default: &Path) -> PathBuf {
+    configured.unwrap_or(default).to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_cleared_output_dir_falls_back_to_the_default() {
+        let default = Path::new("default");
+        assert_eq!(
+            super::resolve_output_dir(Some(Path::new("custom")), default),
+            Path::new("custom")
+        );
+        assert_eq!(super::resolve_output_dir(None, default), default);
+    }
+
     use std::path::Path;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2240,6 +2287,44 @@ mod tests {
         let event = wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
         let EngineEvent::Status(status) = event else { unreachable!() };
         assert!(!status.capturing);
+    }
+
+    #[test]
+    fn audio_does_not_start_when_video_failed() {
+        let game = FakeAudio::default();
+        let ports = Ports {
+            video: Some(Box::new(FakeVideo { fail: true, targets: Arc::default() })),
+            game_audio: Some(Box::new(game.clone())),
+            ..Ports::default()
+        };
+        let (engine, _) = spawn_in(screen_settings(), ports);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Error(m) if m.starts_with("Capture")));
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        assert_eq!(game.0.lock().unwrap().0, 0, "no audio without video");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn game_mode_capture_stops_when_the_game_exits() {
+        let (targets, input) = (Arc::new(Mutex::new(Vec::new())), FakeInput::default());
+        let ports = Ports {
+            input: Some(Box::new(input.clone())),
+            video: Some(Box::new(FakeVideo { fail: false, targets })),
+            ..Ports::default()
+        };
+        let mut settings = Settings::default();
+        settings.profiles.games.iter_mut().for_each(|game| game.session_recording = false);
+        let (engine, _) = spawn_in(settings, ports);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        let emit = input.0.lock().unwrap().clone().expect("input started");
+        emit(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into(), fullscreen: false });
+        wait_for_focus(&engine, CS2, true);
+        emit(OsEvent::ProcessExited { pid: 42, exit_code: 0 });
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Status(s) if s.game.is_none() && !s.capturing),
+        );
+        engine.shutdown();
     }
 
     #[test]

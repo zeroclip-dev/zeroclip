@@ -542,9 +542,19 @@ impl PersistState {
                     written += 1;
                 }
                 // The staging area was lapped or cleared under the copy. Skip the GOP.
-                GopCopy::Lost { end, epoch } => self.done = Some((end, epoch)),
+                GopCopy::Lost { end, epoch } => self.skip_lost(ring, end, epoch),
             }
         }
+    }
+
+    /// Skips a GOP that couldn't be copied. The ring's footage up to it can't join the footage
+    /// after it without a hole, so the ring is emptied and starts again after the lost GOP.
+    fn skip_lost(&mut self, ring: &DiskRing, end: Hns, epoch: u64) {
+        // A changed epoch means the ring was cleared already, which is the same thing.
+        if ring.epoch() == epoch {
+            ring.clear();
+        }
+        self.done = Some((end, ring.epoch()));
     }
 }
 
@@ -683,6 +693,19 @@ mod tests {
             assert!(p.data[5..].iter().all(|&b| b == 0xAB), "a payload was torn");
         }
         assert!(clip.packets.windows(2).all(|w| w[0].meta.pts <= w[1].meta.pts));
+    }
+
+    #[test]
+    fn a_lost_gop_empties_the_ring_instead_of_leaving_a_hole() {
+        let scratch = Scratch::new("lost");
+        let mut pair = Pair::new(&scratch, 8_000_000);
+        pair.feed(10);
+        assert!(pair.ring.oldest_start().is_some());
+        let epoch = pair.ring.epoch();
+        let end = pair.disk.video_end();
+        pair.state.skip_lost(&pair.ring, end, epoch);
+        assert!(pair.ring.oldest_start().is_none(), "older records can't join newer ones");
+        assert_eq!(pair.state.done, Some((end, pair.ring.epoch())));
     }
 
     #[test]

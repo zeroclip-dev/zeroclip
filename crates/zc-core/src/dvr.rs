@@ -62,7 +62,9 @@ impl DvrConfig {
     pub fn ring_file_bytes(&self) -> u64 {
         const AUDIO_SLOTS: u64 = TrackId::COUNT as u64 - 1;
         const SLACK: u64 = 1 << 20;
-        self.video_bytes as u64 + self.audio_bytes as u64 * AUDIO_SLOTS + SLACK
+        (self.video_bytes as u64)
+            .saturating_add((self.audio_bytes as u64).saturating_mul(AUDIO_SLOTS))
+            .saturating_add(SLACK)
     }
 }
 
@@ -314,12 +316,19 @@ impl DvrBuffer {
             .map_or(oldest, |(meta, _, _)| meta.pts);
 
         let mut packets = Vec::with_capacity(self.rings.iter().map(PacketRing::len).sum());
-        for ring in &self.rings {
+        let mut video_packets = 0;
+        for (index, ring) in self.rings.iter().enumerate() {
             for (meta, abs, len) in ring.positions() {
                 if meta.pts >= start && until.is_none_or(|end| meta.pts < end) {
                     packets.push(PlannedPacket { meta, abs, len });
+                    video_packets += usize::from(index == VIDEO_RING);
                 }
             }
+        }
+        // `until` at or before the oldest frame cuts everything: a clip with no video is
+        // not a clip.
+        if video_packets == 0 {
+            return Err(DvrError::Empty);
         }
         Ok(SnapshotPlan { generation: self.generation, packets })
     }
@@ -594,6 +603,12 @@ impl SnapshotCopy {
                 // The lost packet and everything before the next keyframe after it go: that GOP
                 // is broken, and audio must not outlive the video it plays against.
                 let lost = self.next + index;
+                // A lost audio packet costs that packet only: the video is still whole, and a
+                // gap at the start of one audio track beats losing a GOP or the whole clip.
+                if self.plan.packets[lost].meta.track != TrackId::Video {
+                    self.next = lost + 1;
+                    return Ok(());
+                }
                 let lost_pts = self.plan.packets[lost].meta.pts;
                 let key = self
                     .plan
@@ -665,6 +680,12 @@ mod tests {
     }
 
     #[test]
+    fn ring_file_bytes_saturates_instead_of_overflowing() {
+        let huge = DvrConfig { video_bytes: usize::MAX, audio_bytes: usize::MAX };
+        assert_eq!(huge.ring_file_bytes(), u64::MAX);
+    }
+
+    #[test]
     fn simple_mode_check_passes_when_the_drive_has_room() {
         // 1 min at 20 Mbps = 150 MB; with the 10% margin, 165 MB.
         let check = simple_mode_check(1, 20_000_000, 200_000_000);
@@ -689,6 +710,35 @@ mod tests {
     fn simple_mode_check_saturates_instead_of_overflowing() {
         let check = simple_mode_check(u32::MAX, u64::MAX, 1_000);
         assert!(matches!(check, SimpleCheck::TooLittleSpace { needed_bytes: u64::MAX, .. }));
+    }
+
+    #[test]
+    fn a_lapped_audio_packet_costs_only_audio_not_video() {
+        // Small audio rings, so the audio the plan names is gone after a little more audio.
+        let mut dvr = DvrBuffer::new(DvrConfig { video_bytes: 10_000_000, audio_bytes: 20_000 });
+        let mut s = SyntheticStream::new();
+        push_all(&mut dvr, &s.take_secs(3));
+        let plan = dvr.plan_snapshot(Hns::from_secs(3)).unwrap();
+        let planned_video = plan.packets.iter().filter(|p| p.meta.track == TrackId::Video).count();
+        push_all(&mut dvr, &s.take_secs(1));
+
+        let mut copy = SnapshotCopy::new(plan);
+        while !copy.is_done() {
+            copy.copy_chunk(&dvr, 1_000_000).expect("an audio loss is not fatal");
+        }
+        let clip = copy.finish();
+        assert_eq!(clip.video().count(), planned_video, "no video was dropped for audio loss");
+    }
+
+    #[test]
+    fn plan_until_before_the_oldest_frame_is_empty_not_a_zero_second_clip() {
+        let mut dvr = DvrBuffer::new(roomy());
+        let mut s = SyntheticStream::new();
+        let video: Vec<Packet> = (0..60).map(|_| s.next_video()).collect();
+        push_all(&mut dvr, &video);
+        let oldest = dvr.oldest_pts().unwrap();
+        let err = dvr.plan_snapshot_until(Hns::from_secs(5), oldest).err();
+        assert_eq!(err, Some(DvrError::Empty));
     }
 
     #[test]
