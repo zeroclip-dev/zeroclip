@@ -2,12 +2,11 @@
 //! trailing count badge. Keyboard-operable with Tab + Enter/Space.
 
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, ElementId, FontFeatures, FontWeight, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Role, SharedString, StatefulInteractiveElement, Styled, Window, div, px, rgb,
+    App, ElementId, FontFeatures, FontWeight, InteractiveElement, IntoElement, ParentElement, Role,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, px, rgb,
 };
 
 use super::exe_icon;
@@ -38,8 +37,6 @@ pub fn filter_chip(
     let label: SharedString = label.into();
     let noun = if count == 1 { "clip" } else { "clips" };
     let aria: SharedString = format!("{label}, {count} {noun}").into();
-    let on_select = Rc::new(on_select);
-    let on_click = Rc::clone(&on_select);
 
     let icon_el = leading.map(|kind| match kind {
         ChipIcon::Image(path) => exe_icon::chip_view(path).into_any_element(),
@@ -99,11 +96,7 @@ pub fn filter_chip(
     chip.children(icon_el)
         .child(label)
         .child(count_el)
-        .on_click(move |_, window, cx| on_click(&(), window, cx))
-        .on_key_down(move |ev: &KeyDownEvent, window, cx| {
-            if matches!(ev.keystroke.key.as_str(), "enter" | "space") {
-                cx.stop_propagation();
-                on_select(&(), window, cx);
-            }
-        })
+        // Enter and Space on the focused chip arrive as a click (GPUI does that for any focusable
+        // element with a click handler); a key handler too would select twice.
+        .on_click(move |_, window, cx| on_select(&(), window, cx))
 }

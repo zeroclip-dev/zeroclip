@@ -212,18 +212,6 @@ fn shortcut_hint(keys: &[&'static str], action: &'static str) -> gpui::Div {
     )
 }
 
-fn on_activate_key<E: gpui::InteractiveElement>(
-    el: E,
-    handler: impl Fn(&(), &mut Window, &mut gpui::App) + 'static,
-) -> E {
-    el.on_key_down(move |ev: &KeyDownEvent, window, cx| {
-        if matches!(ev.keystroke.key.as_str(), "enter" | "space") {
-            cx.stop_propagation();
-            handler(&(), window, cx);
-        }
-    })
-}
-
 fn nav_button(
     id: &'static str,
     label: &'static str,
@@ -312,15 +300,12 @@ impl Render for ImageViewerView {
             current.as_ref().map(|f| format_meta(f.modified, f.size_bytes).into());
 
         let show_in_folder_btn = current.as_ref().map(|_| {
-            on_activate_key(
-                button("viewer-reveal", "Show in folder")
-                    .aria_label("Show screenshot in folder")
-                    .flex_none()
-                    .whitespace_nowrap()
-                    .child(icon("folder-open", theme::FG_SOFT).size(px(14.)))
-                    .on_click(cx.listener(|this, _, _, cx| this.reveal_current(cx))),
-                cx.listener(|this, _, _, cx| this.reveal_current(cx)),
-            )
+            button("viewer-reveal", "Show in folder")
+                .aria_label("Show screenshot in folder")
+                .flex_none()
+                .whitespace_nowrap()
+                .child(icon("folder-open", theme::FG_SOFT).size(px(14.)))
+                .on_click(cx.listener(|this, _, _, cx| this.reveal_current(cx)))
         });
 
         let copy_path_btn = current.as_ref().map(|_| {
@@ -330,31 +315,25 @@ impl Render for ImageViewerView {
             } else {
                 icon("copy", theme::FG_SOFT).size(px(14.))
             };
-            on_activate_key(
-                button("viewer-copy", label)
-                    .aria_label("Copy screenshot file path")
-                    .flex_none()
-                    .whitespace_nowrap()
-                    .when(copied, |d| {
-                        d.bg(rgb(theme::BRAND_SOFT))
-                            .border_color(rgb(theme::BRAND_BORDER))
-                            .text_color(rgb(theme::FG))
-                    })
-                    .child(glyph)
-                    .on_click(cx.listener(|this, _, _, cx| this.copy_current_path(cx))),
-                cx.listener(|this, _, _, cx| this.copy_current_path(cx)),
-            )
-        });
-
-        let close_btn = on_activate_key(
-            button("viewer-close", "Close")
-                .aria_label("Close screenshot viewer")
+            button("viewer-copy", label)
+                .aria_label("Copy screenshot file path")
                 .flex_none()
                 .whitespace_nowrap()
-                .child(icon("x", theme::FG_SOFT).size(px(14.)))
-                .on_click(cx.listener(|this, _, _, cx| this.close(cx))),
-            cx.listener(|this, _, _, cx| this.close(cx)),
-        );
+                .when(copied, |d| {
+                    d.bg(rgb(theme::BRAND_SOFT))
+                        .border_color(rgb(theme::BRAND_BORDER))
+                        .text_color(rgb(theme::FG))
+                })
+                .child(glyph)
+                .on_click(cx.listener(|this, _, _, cx| this.copy_current_path(cx)))
+        });
+
+        let close_btn = button("viewer-close", "Close")
+            .aria_label("Close screenshot viewer")
+            .flex_none()
+            .whitespace_nowrap()
+            .child(icon("x", theme::FG_SOFT).size(px(14.)))
+            .on_click(cx.listener(|this, _, _, cx| this.close(cx)));
 
         let header = div()
             .flex()
@@ -502,11 +481,8 @@ impl Render for ImageViewerView {
         };
 
         let prev_btn = if can_step {
-            on_activate_key(
-                nav_button("viewer-prev", "Previous", "chevron-left", true, "Previous screenshot")
-                    .on_click(cx.listener(|this, _, _, cx| this.step(-1, cx))),
-                cx.listener(|this, _, _, cx| this.step(-1, cx)),
-            )
+            nav_button("viewer-prev", "Previous", "chevron-left", true, "Previous screenshot")
+                .on_click(cx.listener(|this, _, _, cx| this.step(-1, cx)))
         } else {
             disabled_nav_button(
                 "viewer-prev",
@@ -518,11 +494,8 @@ impl Render for ImageViewerView {
         };
 
         let next_btn = if can_step {
-            on_activate_key(
-                nav_button("viewer-next", "Next", "chevron-right", false, "Next screenshot")
-                    .on_click(cx.listener(|this, _, _, cx| this.step(1, cx))),
-                cx.listener(|this, _, _, cx| this.step(1, cx)),
-            )
+            nav_button("viewer-next", "Next", "chevron-right", false, "Next screenshot")
+                .on_click(cx.listener(|this, _, _, cx| this.step(1, cx)))
         } else {
             disabled_nav_button("viewer-next", "Next", "chevron-right", false, "Next screenshot")
         };
