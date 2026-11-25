@@ -438,6 +438,19 @@ fn capture_decision(
     CaptureDecision::Start { hwnd: focus.hwnd, clear_buffer: kept.is_some() && !same_game }
 }
 
+/// Whether the video track a capture start produced can't share a clip with the one before it:
+/// another codec or size.
+fn video_format_changed(old: Option<&TrackInfo>, new: Option<&TrackInfo>) -> bool {
+    let key = |t: &TrackInfo| match t.kind {
+        TrackKind::Video { codec, width, height, .. } => Some((codec, width, height)),
+        _ => None,
+    };
+    match (old.and_then(key), new.and_then(key)) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    }
+}
+
 /// A manual recording, from its start until its IO thread has finished the file.
 struct ActiveRecording {
     /// The recorder's tee slot. `None` once the recording has been stopped: the spool is
@@ -1359,8 +1372,19 @@ impl Actor {
                 self.video_config = Some(config);
                 self.status.watchdog = WatchdogState::Running;
                 self.status.capturing = true;
+                let format = self.ports.video.as_ref().and_then(|video| video.format());
+                // Same game, but a new size or codec (window resized, fullscreen toggled): the
+                // buffered GOPs can't share a clip's sample description with the new ones. A
+                // rescue waiting for the dump slot still needs the old footage, as in
+                // `on_capture_focus`.
+                if self.rescue_waiting.is_none()
+                    && video_format_changed(self.video_track.as_ref(), format.as_ref())
+                {
+                    tracing::info!("video format changed; clearing the DVR buffer");
+                    self.recorder.clear();
+                }
                 self.status.codec = Some(codec);
-                self.video_track = self.ports.video.as_ref().and_then(|video| video.format());
+                self.video_track = format;
             }
             Some(Err(e)) => {
                 self.emit(EngineEvent::Error(format!("Capture couldn't start: {e}")));
@@ -2134,6 +2158,21 @@ mod tests {
             Path::new("custom")
         );
         assert_eq!(super::resolve_output_dir(None, default), default);
+    }
+
+    #[test]
+    fn a_new_codec_or_size_changes_the_video_format() {
+        let track = |codec, width, height| TrackInfo {
+            track: TrackId::Video,
+            label: "Video".into(),
+            kind: TrackKind::Video { codec, width, height, fps: 60 },
+            codec_private: Vec::new(),
+        };
+        let base = track(Codec::H264, 1920, 1080);
+        assert!(!super::video_format_changed(Some(&base), Some(&base)));
+        assert!(super::video_format_changed(Some(&base), Some(&track(Codec::H264, 1280, 720))));
+        assert!(super::video_format_changed(Some(&base), Some(&track(Codec::Hevc, 1920, 1080))));
+        assert!(!super::video_format_changed(None, Some(&base)), "no earlier track");
     }
 
     use std::path::Path;
