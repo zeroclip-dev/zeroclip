@@ -6,8 +6,8 @@ use gpui::{AnyView, App, AppContext, Entity, WeakEntity};
 
 use crate::app::{Tab, ZeroClipApp};
 use crate::ui::{
-    clips::ClipsView, editor::EditorView, home::HomeView, profiles::ProfilesView,
-    settings::SettingsView, video_player::VideoPlayerView,
+    clips::ClipsView, editor::EditorView, home::HomeView, image_viewer::ImageViewerView,
+    profiles::ProfilesView, settings::SettingsView, video_player::VideoPlayerView,
 };
 
 /// One live view per tab.
@@ -18,6 +18,7 @@ pub struct Screens {
     editor: Entity<EditorView>,
     settings: Entity<SettingsView>,
     player: Entity<VideoPlayerView>,
+    viewer: Entity<ImageViewerView>,
 }
 
 impl Screens {
@@ -28,13 +29,19 @@ impl Screens {
             profiles: cx.new(|cx| ProfilesView::new(app.clone(), cx)),
             editor: cx.new(|_| EditorView::new(app.clone())),
             settings: cx.new(|_| SettingsView::new(app.clone())),
-            player: cx.new(|_| VideoPlayerView::new(app)),
+            player: cx.new(|_| VideoPlayerView::new(app.clone())),
+            viewer: cx.new(|_| ImageViewerView::new(app)),
         }
     }
 
     /// The Editor view, so other screens can open a clip in it.
     pub fn editor(&self) -> &Entity<EditorView> {
         &self.editor
+    }
+
+    /// The Settings view, which receives raw keys while a hotkey field listens.
+    pub fn settings(&self) -> &Entity<SettingsView> {
+        &self.settings
     }
 
     /// The Clips view, so the clip menu can start a rename there.
@@ -47,6 +54,11 @@ impl Screens {
         &self.player
     }
 
+    /// The screenshot viewer, so Clips can inspect a screenshot full-size.
+    pub fn viewer(&self) -> &Entity<ImageViewerView> {
+        &self.viewer
+    }
+
     /// The view shown for `tab`.
     pub fn view(&self, tab: Tab) -> AnyView {
         match tab {
@@ -56,6 +68,7 @@ impl Screens {
             Tab::Editor => self.editor.clone().into(),
             Tab::Settings => self.settings.clone().into(),
             Tab::Player => self.player.clone().into(),
+            Tab::Viewer => self.viewer.clone().into(),
         }
     }
 }

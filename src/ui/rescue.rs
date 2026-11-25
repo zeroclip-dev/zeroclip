@@ -6,12 +6,13 @@ use std::path::{Path, PathBuf};
 
 use gpui::{
     Context, FontWeight, IntoElement, ParentElement, StatefulInteractiveElement as _, Styled, div,
+    px, rgb,
 };
 use zc_core::Hns;
 
 use super::components::banner::banner as strip;
-use super::components::button::button;
-use super::human_duration;
+use super::components::button::{button_danger, button_ghost, button_primary};
+use super::{human_duration, icons, theme};
 use crate::app::{Notice, NoticeLevel, ZeroClipApp};
 
 /// Footage waiting for an answer. `game` and `duration` are unknown for files found at startup.
@@ -82,6 +83,7 @@ fn question(rescue: &Rescue) -> String {
 /// The banner for the first waiting rescue. Nothing to draw when the list is empty.
 pub fn banner(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> Option<impl IntoElement> {
     let rescue = app.rescues.first()?;
+    let extra = app.rescues.len().saturating_sub(1);
     let answer = |choice| {
         cx.listener(move |app, _, _, cx| {
             app.answer_rescue(choice);
@@ -90,10 +92,48 @@ pub fn banner(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> Option<impl I
     };
     Some(
         strip()
-            .child(div().font_weight(FontWeight::SEMIBOLD).child(question(rescue)))
-            .child(button("rescue-keep", "Keep").on_click(answer(RescueChoice::Keep)))
-            .child(button("rescue-discard", "Discard").on_click(answer(RescueChoice::Discard)))
-            .child(button("rescue-later", "Later").on_click(answer(RescueChoice::Later))),
+            .px_4()
+            .py_2()
+            .gap_3()
+            .border_color(rgb(theme::WARN_BORDER))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(220.))
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(icons::icon("film", theme::WARN))
+                    .child(
+                        div()
+                            .text_size(px(theme::TEXT_BODY))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(theme::FG))
+                            .child(question(rescue)),
+                    )
+                    .children((extra > 0).then(|| theme::caption(format!("+{extra} more")))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        button_primary("rescue-keep", "Keep clip")
+                            .on_click(answer(RescueChoice::Keep)),
+                    )
+                    .child(
+                        button_danger("rescue-discard", "Discard")
+                            .on_click(answer(RescueChoice::Discard)),
+                    )
+                    .child(
+                        button_ghost("rescue-later", "Later").on_click(answer(RescueChoice::Later)),
+                    ),
+            ),
     )
 }
 

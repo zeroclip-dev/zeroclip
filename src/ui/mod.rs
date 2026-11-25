@@ -1,6 +1,7 @@
 //! The UI shell: top bar, optional focus banner, the active screen, status bar. Screens are
 //! views registered in `components/screens.rs`; this file never needs to change for a new screen.
 
+pub mod art;
 pub mod clip_menu;
 pub mod clips;
 pub mod components;
@@ -8,6 +9,7 @@ pub mod editor;
 pub mod focus_prompt;
 pub mod home;
 pub mod icons;
+pub mod image_viewer;
 pub mod overlay;
 pub mod profiles;
 pub mod rescue;
@@ -16,8 +18,8 @@ pub mod theme;
 pub mod video_player;
 
 use gpui::{
-    Context, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled,
-    WindowControlArea, div, px, rgb,
+    Context, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, WindowControlArea, div, px, rgb,
 };
 use zc_core::Hns;
 use zc_core::media::Codec;
@@ -25,10 +27,6 @@ use zc_core::media::Codec;
 use crate::app::{Tab, ZeroClipApp};
 use components::{mic_indicator::mic_indicator, status_dot::status_dot, tab_button::tab_button};
 use icons::icon;
-
-const RED: u32 = theme::DANGER;
-const GREEN: u32 = theme::BRAND;
-const GRAY: u32 = theme::MUTED_FG;
 
 gpui::actions!(zeroclip, [ToggleFullscreen]);
 
@@ -43,6 +41,7 @@ pub fn shell(
         .flex_col()
         .bg(rgb(theme::BG))
         .text_color(rgb(theme::FG))
+        .text_size(px(theme::TEXT_BODY))
         // F11 (bound in main.rs) toggles fullscreen.
         .on_action(|_: &ToggleFullscreen, window, _| window.toggle_fullscreen())
         .child(top_bar(app, cx))
@@ -55,50 +54,90 @@ pub fn shell(
 
 fn top_bar(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoElement {
     let status = &app.status;
-    let (color, text) = if status.recording {
-        (RED, "Recording".to_owned())
+    let (dot_color, text_color, pill_bg, pill_border, text) = if status.recording {
+        (
+            theme::DANGER,
+            theme::DANGER,
+            theme::DANGER_SOFT,
+            theme::DANGER_BORDER,
+            "Recording".to_owned(),
+        )
     } else if status.capturing && status.buffered == Hns::ZERO {
         // Capturing, but the DVR has no footage yet, so there's no span to show.
-        (GREEN, "Capturing".to_owned())
+        (theme::BRAND, theme::BRAND, theme::BRAND_SOFT, theme::BRAND_BORDER, "Capturing".to_owned())
     } else if status.capturing {
-        (GREEN, format!("Buffering {}", human_duration(status.buffered)))
+        (
+            theme::BRAND,
+            theme::BRAND,
+            theme::BRAND_SOFT,
+            theme::BRAND_BORDER,
+            format!("Buffering {}", human_duration(status.buffered)),
+        )
     } else {
-        (GRAY, "Idle".to_owned())
+        (theme::TEXT_DIM, theme::MUTED_FG, theme::SURFACE_RAISED, theme::BORDER, "Idle".to_owned())
     };
+    let tabs =
+        div().flex().flex_row().items_center().gap_1().children(Tab::ALL.into_iter().map(|tab| {
+            tab_button(tab.icon(), tab.label(), app.tab == tab).on_click(cx.listener(
+                move |app, _, _, cx| {
+                    // Leaving the Editor stops its playback; it isn't drawn, so nothing else would.
+                    if app.tab == Tab::Editor && tab != Tab::Editor {
+                        app.screens.editor().clone().update(cx, |editor, cx| editor.pause(cx));
+                    }
+                    if app.tab == Tab::Player {
+                        app.screens.player().clone().update(cx, |player, cx| player.pause(cx));
+                    }
+                    app.tab = tab;
+                    cx.notify();
+                },
+            ))
+        }));
+    let status_pill = div()
+        .h(px(26.))
+        .px(px(10.))
+        .mr_3()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.))
+        .rounded_full()
+        .bg(rgb(pill_bg))
+        .border_1()
+        .border_color(rgb(pill_border))
+        .text_size(px(theme::TEXT_CAPTION))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(text_color))
+        .child(status_dot(rgb(dot_color)))
+        .child(text);
     div()
         .flex()
         .flex_row()
         .items_center()
-        .gap_2()
-        .pl_3()
         .h(px(48.))
-        .child(div().text_xl().font_weight(gpui::FontWeight::BOLD).mr_4().child("ZeroClip"))
-        .children(Tab::ALL.into_iter().map(|tab| {
-            tab_button(tab.icon(), tab.label(), app.tab == tab).on_click(cx.listener(move |app, _, _, cx| {
-                // Leaving the Editor stops its playback; it isn't drawn, so nothing else would.
-                if app.tab == Tab::Editor && tab != Tab::Editor {
-                    app.screens.editor().clone().update(cx, |editor, cx| editor.pause(cx));
-                }
-                if app.tab == Tab::Player {
-                    app.screens.player().clone().update(cx, |player, cx| player.pause(cx));
-                }
-                app.tab = tab;
-                cx.notify();
-            }))
-        }))
-        // The empty stretch is what you grab to move the window.
-        .child(div().flex_1().h_full().window_control_area(WindowControlArea::Drag))
+        .pl_4()
+        .bg(rgb(theme::BG))
+        .border_b_1()
+        .border_color(rgb(theme::BORDER_SUBTLE))
         .child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .mr_2()
-                .text_color(rgb(color))
-                .child(status_dot(rgb(color)))
-                .child(text),
+                .mr_5()
+                .child(icons::logo(24.))
+                .child(
+                    div()
+                        .text_size(px(15.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(theme::FG))
+                        .child("ZeroClip"),
+                ),
         )
+        .child(tabs)
+        // The empty stretch is what you grab to move the window.
+        .child(div().flex_1().h_full().window_control_area(WindowControlArea::Drag))
+        .child(status_pill)
         .child(window_button("win-min", "minus", WindowControlArea::Min, false))
         .child(window_button("win-max", "square", WindowControlArea::Max, false))
         .child(window_button("win-close", "x", WindowControlArea::Close, true))
@@ -122,36 +161,74 @@ fn window_button(
         .text_color(rgb(theme::MUTED_FG))
         .hover(move |s| {
             if close {
-                s.bg(rgb(theme::DANGER)).text_color(rgb(theme::BG))
+                s.bg(rgb(theme::DANGER)).text_color(rgb(theme::PRIMARY_FG))
             } else {
                 s.bg(rgb(theme::ACCENT)).text_color(rgb(theme::FG))
+            }
+        })
+        .active(move |s| {
+            if close {
+                s.bg(rgb(theme::DANGER)).opacity(0.85)
+            } else {
+                s.bg(rgb(theme::SURFACE_ACTIVE))
             }
         })
         .window_control_area(area)
         .child(icon(name, theme::MUTED_FG))
 }
 
-fn status_bar(app: &ZeroClipApp) -> impl IntoElement {
-    let status = &app.status;
+fn status_item(label: &'static str, value: impl Into<SharedString>) -> gpui::Div {
     div()
         .flex()
         .flex_row()
         .items_center()
-        .gap_4()
-        .px_3()
-        .py_1()
-        .text_sm()
-        .text_color(rgb(GRAY))
-        .child(format!("Codec: {}", status.codec.map_or("-", Codec::name)))
-        .child(format!(
-            "Buffer: {} of {}",
-            human_duration(status.buffered),
-            human_duration(status.buffer_window)
+        .gap_1()
+        .child(div().text_color(rgb(theme::TEXT_DIM)).child(label))
+        .child(div().text_color(rgb(theme::MUTED_FG)).child(value.into()))
+}
+
+fn status_sep() -> gpui::Div {
+    div().text_color(rgb(theme::BORDER_STRONG)).child("\u{00b7}")
+}
+
+fn status_bar(app: &ZeroClipApp) -> impl IntoElement {
+    let status = &app.status;
+    let mic = mic_indicator(status.mic);
+    let mut bar = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(10.))
+        .h(px(28.))
+        .px_4()
+        .bg(rgb(theme::BG))
+        .border_t_1()
+        .border_color(rgb(theme::BORDER_SUBTLE))
+        .text_size(px(theme::TEXT_MICRO))
+        .text_color(rgb(theme::MUTED_FG))
+        .child(status_item("Codec", status.codec.map_or("-", Codec::name)))
+        .child(status_sep())
+        .child(status_item(
+            "Buffer",
+            format!(
+                "{} / {}",
+                human_duration(status.buffered),
+                human_duration(status.buffer_window)
+            ),
         ))
-        .child(format!("Watchdog: {:?}", status.watchdog))
-        .child(format!("Game: {}", status.game.as_deref().unwrap_or("none")))
-        .children(mic_indicator(status.mic))
-        .child(div().ml_auto().child(concat!("v", env!("CARGO_PKG_VERSION"))))
+        .child(status_sep())
+        .child(status_item("Watchdog", format!("{:?}", status.watchdog)))
+        .child(status_sep())
+        .child(status_item("Game", status.game.as_deref().unwrap_or("none")));
+    if let Some(mic_el) = mic {
+        bar = bar.child(status_sep()).child(mic_el);
+    }
+    bar.child(
+        div()
+            .ml_auto()
+            .text_color(rgb(theme::TEXT_DIM))
+            .child(concat!("v", env!("CARGO_PKG_VERSION"))),
+    )
 }
 
 /// "45 s", "2 min", "1 min 30 s".

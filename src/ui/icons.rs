@@ -7,10 +7,13 @@ use std::borrow::Cow;
 
 use gpui::{AssetSource, Result, SharedString, Styled, Svg, px, rgb, svg};
 
-const ICONS: [(&str, &[u8]); 23] = [
+const ICONS: [(&str, &[u8]); 28] = [
+    ("icons/zc-ring.svg", include_bytes!("../../assets/icons/zc-ring.svg")),
+    ("icons/zc-play.svg", include_bytes!("../../assets/icons/zc-play.svg")),
     ("icons/check.svg", include_bytes!("../../assets/icons/check.svg")),
     ("icons/chevron-left.svg", include_bytes!("../../assets/icons/chevron-left.svg")),
     ("icons/chevron-right.svg", include_bytes!("../../assets/icons/chevron-right.svg")),
+    ("icons/copy.svg", include_bytes!("../../assets/icons/copy.svg")),
     ("icons/download.svg", include_bytes!("../../assets/icons/download.svg")),
     ("icons/ellipsis.svg", include_bytes!("../../assets/icons/ellipsis.svg")),
     ("icons/film.svg", include_bytes!("../../assets/icons/film.svg")),
@@ -18,6 +21,7 @@ const ICONS: [(&str, &[u8]); 23] = [
     ("icons/gamepad-2.svg", include_bytes!("../../assets/icons/gamepad-2.svg")),
     ("icons/headphones.svg", include_bytes!("../../assets/icons/headphones.svg")),
     ("icons/house.svg", include_bytes!("../../assets/icons/house.svg")),
+    ("icons/image.svg", include_bytes!("../../assets/icons/image.svg")),
     ("icons/minus.svg", include_bytes!("../../assets/icons/minus.svg")),
     ("icons/pause.svg", include_bytes!("../../assets/icons/pause.svg")),
     ("icons/play.svg", include_bytes!("../../assets/icons/play.svg")),
@@ -28,6 +32,7 @@ const ICONS: [(&str, &[u8]); 23] = [
     ("icons/sliders-horizontal.svg", include_bytes!("../../assets/icons/sliders-horizontal.svg")),
     ("icons/square.svg", include_bytes!("../../assets/icons/square.svg")),
     ("icons/trash-2.svg", include_bytes!("../../assets/icons/trash-2.svg")),
+    ("icons/volume-1.svg", include_bytes!("../../assets/icons/volume-1.svg")),
     ("icons/volume-2.svg", include_bytes!("../../assets/icons/volume-2.svg")),
     ("icons/volume-x.svg", include_bytes!("../../assets/icons/volume-x.svg")),
     ("icons/x.svg", include_bytes!("../../assets/icons/x.svg")),
@@ -50,4 +55,21 @@ impl AssetSource for Icons {
 /// with its own text colour, not the parent's, so the colour is given here.
 pub fn icon(name: &str, color: u32) -> Svg {
     svg().path(format!("icons/{name}.svg")).size(px(16.)).flex_none().text_color(rgb(color))
+}
+
+/// The ZeroClip mark (`assets/brand/logo-mark.svg`) as two tinted layers on the app background,
+/// since GPUI paints an SVG in one colour.
+pub fn logo(size: f32) -> gpui::Div {
+    use gpui::{ParentElement, div};
+    let layer = |name: &str, color: u32| {
+        svg().path(format!("icons/{name}.svg")).size(px(size)).flex_none().text_color(rgb(color))
+    };
+    div()
+        .size(px(size))
+        .flex_none()
+        .relative()
+        .rounded(px(size * 0.22))
+        .bg(rgb(super::theme::BG))
+        .child(layer("zc-ring", super::theme::BRAND))
+        .child(div().absolute().top_0().left_0().child(layer("zc-play", super::theme::FG)))
 }

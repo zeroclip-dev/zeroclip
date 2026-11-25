@@ -14,6 +14,7 @@ fn main() {
         muted: 0xa1a1aa,
         hold: Duration::from_millis(1500),
         fade: Duration::from_millis(250),
+        alert: false,
     });
     println!("{r:?}");
     std::thread::sleep(Duration::from_secs(3));
