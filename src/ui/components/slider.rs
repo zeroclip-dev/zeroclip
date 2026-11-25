@@ -8,13 +8,15 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
-    App, Bounds, InteractiveElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
-    Pixels, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, canvas, div, px,
-    relative, rgb, transparent_black,
+    App, Bounds, InteractiveElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    ParentElement, Pixels, SharedString, Stateful, StatefulInteractiveElement, Styled, Window,
+    canvas, div, px, relative, rgb, transparent_black,
 };
 
 use crate::ui::theme;
 
+/// How far an arrow key moves a slider, as a fraction of its track.
+const KEY_STEP: f32 = 0.05;
 const THUMB: f32 = 14.0;
 const TRACK_H: f32 = 4.0;
 /// Inner height inside the 32 px control after the 1 px top and bottom focus-ring borders.
@@ -100,7 +102,7 @@ pub fn slider(
 
     let (down, drag, drop, out) =
         (state.clone(), state.clone(), state.dragging.clone(), state.dragging.clone());
-    let (on_down, on_drag) = (on_change.clone(), on_change);
+    let (on_down, on_drag, on_key) = (on_change.clone(), on_change.clone(), on_change);
     div()
         .id(id)
         .group(group_id)
@@ -121,6 +123,18 @@ pub fn slider(
         .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, window, cx| {
             down.dragging.set(true);
             on_down(down.fraction_at(ev.position.x), window, cx);
+        })
+        // Arrow keys nudge it by 5% (Home and End jump to the ends), for keyboard use.
+        .on_key_down(move |ev: &KeyDownEvent, window, cx| {
+            let to = match ev.keystroke.key.as_str() {
+                "left" => fraction - KEY_STEP,
+                "right" => fraction + KEY_STEP,
+                "home" => 0.0,
+                "end" => 1.0,
+                _ => return,
+            };
+            cx.stop_propagation();
+            on_key(to.clamp(0.0, 1.0), window, cx);
         })
         .on_mouse_move(move |ev: &MouseMoveEvent, window, cx| {
             if drag.dragging.get() && ev.dragging() {

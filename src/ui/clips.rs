@@ -463,6 +463,11 @@ fn thumb_file_name(file: &ClipFile) -> String {
 /// Recordings are fragmented so a crash can't corrupt them, but VLC and Windows Media Player
 /// mishandle seeking in those, and in files with several audio tracks.
 pub fn remux_plain(ffmpeg_path: Option<&Path>, clip: &Path, to: &Path) -> Result<(), String> {
+    // The cleanup below deletes `to` on failure: never when it was already there (ffmpeg refuses
+    // to overwrite, and that file isn't ours).
+    if to.exists() {
+        return Err(format!("{} already exists", to.display()));
+    }
     let ffmpeg = Ffmpeg::locate(ffmpeg_path).map_err(|e| e.to_string())?;
     let result = ffmpeg.remux_for_export(clip, to).map_err(|e| e.to_string());
     if result.is_err() || std::fs::metadata(to).map_or(true, |m| m.len() == 0) {
@@ -476,6 +481,8 @@ pub fn remux_plain(ffmpeg_path: Option<&Path>, clip: &Path, to: &Path) -> Result
 /// when something else (the player) holds it open.
 pub fn make_plain_in_place(ffmpeg_path: Option<&Path>, clip: &Path) -> Result<(), String> {
     let tmp = clip.with_extension("zc-plain.mp4");
+    // A leftover of an earlier, killed run: ours to clear.
+    let _ = std::fs::remove_file(&tmp);
     remux_plain(ffmpeg_path, clip, &tmp)?;
     std::fs::rename(&tmp, clip).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
@@ -647,6 +654,14 @@ impl ClipsView {
         // Created here too: Rename from Home runs before Clips has ever rendered.
         self.rename_focus.get_or_insert_with(|| cx.focus_handle()).focus(window, cx);
         cx.notify();
+    }
+
+    /// Drops the selection when it is `path`, a clip that was just deleted.
+    pub fn forget(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if self.selected.as_deref() == Some(path) {
+            self.selected = None;
+            cx.notify();
+        }
     }
 
     /// Updates the highlighted clip selection (e.g. when stepping through screenshots in the
@@ -1590,6 +1605,9 @@ mod tests {
         assert!(renamed_path(path, "what?").is_err());
         assert!(renamed_path(path, "dots.").is_err());
         assert!(renamed_path(path, "NUL").is_err());
+        assert!(renamed_path(path, "con").is_err());
+        assert!(renamed_path(path, "COM3.txt").is_err());
+        assert!(renamed_path(path, "COM10").is_ok());
         assert!(renamed_path(path, "old").is_err(), "the same name is refused");
     }
 

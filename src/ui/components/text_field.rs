@@ -55,16 +55,22 @@ pub fn text_field(
             let mut text = current.clone();
             if k.modifiers.control && k.key == "v" {
                 if let Some(paste) = cx.read_from_clipboard().and_then(|c| c.text()) {
-                    text.push_str(paste.lines().next().unwrap_or(""));
+                    text.extend(
+                        paste.lines().next().unwrap_or("").chars().filter(|c| !c.is_control()),
+                    );
                 }
             } else if k.key == "backspace" {
                 text.pop();
             } else if let (false, Some(ch)) = (k.modifiers.control || k.modifiers.alt, &k.key_char)
+                && !ch.chars().any(char::is_control)
             {
+                // Enter, Tab and Escape carry control characters; they must not end up in the text.
                 text.push_str(ch);
             } else {
                 return;
             }
+            // Handled here: no shortcut further up the page should fire for the same key.
+            cx.stop_propagation();
             on_change(&text, window, cx);
         })
         .child(shown)
