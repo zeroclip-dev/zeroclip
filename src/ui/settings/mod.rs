@@ -1135,6 +1135,14 @@ impl Render for SettingsView {
                         true,
                         bind!(cx, |d, v: &bool| d.settings.overlay_toasts = *v),
                     ),
+                    toggle_row(
+                        "check-updates",
+                        "Check for updates",
+                        "Look for a newer release at startup and once a day. Installing is always your click.",
+                        d.settings.updates.check,
+                        true,
+                        bind!(cx, |d, v: &bool| d.settings.updates.check = *v),
+                    ),
                 ],
             );
 
@@ -1699,6 +1707,18 @@ impl Render for SettingsView {
                             bind!(cx, |d, v: &bool| d.settings.app.start_with_windows = *v),
                         ),
                     ],
+                ),
+                section_block(
+                    "Updates",
+                    format!("ZeroClip v{}.", env!("CARGO_PKG_VERSION")),
+                    vec![toggle_row(
+                        "check-updates",
+                        "Check for updates",
+                        "Look for a newer release at startup and once a day. Installing is always your click, and never while recording.",
+                        d.settings.updates.check,
+                        true,
+                        bind!(cx, |d, v: &bool| d.settings.updates.check = *v),
+                    )],
                 ),
                 section_block(
                     "Editor",

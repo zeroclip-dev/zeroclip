@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use gpui::{Context, FocusHandle, IntoElement, PathPromptOptions, Pixels, Point, Render, Window};
 use zc_core::control::{Command, EngineEvent, EngineStatus, FocusChoice};
@@ -15,6 +16,7 @@ use crate::paths::AppPaths;
 use crate::tray::{self, TrayCommand};
 use crate::ui;
 use crate::ui::components::screens::Screens;
+use crate::update::{self, UpdateState};
 
 /// The top-level tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,7 +118,16 @@ pub struct ZeroClipApp {
     tray_hint_shown: bool,
     /// Which failures the overlay popup has shown lately, so a flapping device can't storm it.
     alerts: ui::overlay::Coalescer,
+    /// Self-update progress; drawn by `ui::update_banner`.
+    pub update: UpdateState,
+    /// When a clip last started saving, until it is saved. Blocks installing an update.
+    saving_since: Option<Instant>,
 }
+
+/// A clip save that never reports back stops blocking an update after this long.
+const SAVE_BLOCK_MAX: Duration = Duration::from_secs(120);
+/// Update checks run at startup and then once a day.
+const UPDATE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl ZeroClipApp {
     pub fn new(
@@ -193,6 +204,39 @@ impl ZeroClipApp {
         })
         .detach();
 
+        // Check for a newer release a few seconds after startup, then daily. The setting is read
+        // every hour, so turning it on takes effect without a restart.
+        cx.spawn(async move |this, cx| {
+            let mut last: Option<Instant> = None;
+            cx.background_executor().timer(Duration::from_secs(5)).await;
+            loop {
+                let due = last.is_none_or(|t| t.elapsed() >= UPDATE_EVERY);
+                let Ok(enabled) = this.update(cx, |app, _| {
+                    app.settings.updates.check && app.update == UpdateState::None
+                }) else {
+                    return;
+                };
+                if enabled && due {
+                    last = Some(Instant::now());
+                    let found =
+                        cx.background_executor().spawn(async { update::check_latest() }).await;
+                    let _ = this.update(cx, |app, cx| {
+                        match found {
+                            Ok(Some(release)) if app.update == UpdateState::None => {
+                                app.update = UpdateState::Available(release);
+                            }
+                            Ok(_) => {}
+                            // Offline is normal; keep it out of the user's way.
+                            Err(error) => tracing::warn!(%error, "update check failed"),
+                        }
+                        cx.notify();
+                    });
+                }
+                cx.background_executor().timer(Duration::from_secs(60 * 60)).await;
+            }
+        })
+        .detach();
+
         let store = match open_store(&paths.db_file) {
             Ok(store) => Some(Arc::new(Mutex::new(store))),
             Err(error) => {
@@ -217,6 +261,8 @@ impl ZeroClipApp {
             quitting: false,
             tray_hint_shown: false,
             alerts: ui::overlay::Coalescer::default(),
+            update: UpdateState::None,
+            saving_since: None,
             clips: ui::clips::ClipList::default(),
             clip_menu: None,
             menu_focus: cx.focus_handle(),
@@ -227,6 +273,66 @@ impl ZeroClipApp {
             flight,
             repairs,
         })
+    }
+
+    /// "Update": downloads and verifies the new exe off the UI thread, then offers (or, when it is
+    /// safe, performs) the restart.
+    pub fn start_update(&mut self, cx: &mut Context<Self>) {
+        let UpdateState::Available(release) = self.update.clone() else { return };
+        self.update = UpdateState::Downloading(release.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let job = release.clone();
+            let result =
+                cx.background_executor().spawn(async move { update::download(&job) }).await;
+            let _ = this.update(cx, |app, cx| {
+                match result {
+                    Ok(path) => {
+                        app.update = UpdateState::Ready { release, path };
+                        app.install_update(cx);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "update download failed");
+                        app.update = UpdateState::Available(release);
+                        app.notify(NoticeLevel::Error, format!("Update failed: {error:#}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Swaps in the downloaded exe and restarts, unless a recording or clip save is running.
+    pub fn install_update(&mut self, cx: &mut Context<Self>) {
+        let UpdateState::Ready { path, .. } = &self.update else { return };
+        let saving = self.saving_since.is_some_and(|t| t.elapsed() < SAVE_BLOCK_MAX);
+        if let Err(wait_for) = update::can_install(&self.status, saving) {
+            self.notify(
+                NoticeLevel::Info,
+                format!("Update downloaded. Restart to install it once {wait_for}."),
+            );
+            return;
+        }
+        match update::swap_and_restart(path) {
+            Ok(()) => {
+                self.quitting = true;
+                cx.quit();
+            }
+            Err(error) => {
+                tracing::warn!(%error, "update install failed");
+                let _ = std::fs::remove_file(path);
+                self.update = UpdateState::None;
+                self.notify(NoticeLevel::Error, format!("Update failed: {error:#}"));
+            }
+        }
+    }
+
+    /// Hides the update strip until the next check.
+    pub fn dismiss_update(&mut self) {
+        if let UpdateState::Available(_) = self.update {
+            self.update = UpdateState::None;
+        }
     }
 
     /// Opens `path` in the Editor tab: as a plain player when `watch`, else ready to edit (the Clips
@@ -565,8 +671,12 @@ impl ZeroClipApp {
                     // ponytail: egui flashed the taskbar here; GPUI has no equivalent yet.
                     // Never raise or activate the window (D35).
                 }
-                EngineEvent::ClipSaving => self.show_toast(ToastKind::Saving, cx),
+                EngineEvent::ClipSaving => {
+                    self.saving_since = Some(Instant::now());
+                    self.show_toast(ToastKind::Saving, cx);
+                }
                 EngineEvent::ClipSaved { path, duration } => {
+                    self.saving_since = None;
                     self.tag_game(&path);
                     self.finish_clip(path.clone(), cx);
                     self.show_toast(ToastKind::ClipSaved { length: duration }, cx);
