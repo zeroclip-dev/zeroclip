@@ -2029,7 +2029,9 @@ impl Actor {
             }
             WatchdogAction::GiveUp => {
                 tracing::error!("watchdog gave up: no codec could be re-initialised");
-                self.status.capturing = false;
+                // Audio and a recording would otherwise run on with no video behind them.
+                self.stop_recording();
+                self.stop_capture();
                 self.emit(EngineEvent::Error(
                     "Capture stopped: no hardware encoder could be restarted. Update the GPU \
                      driver or restart ZeroClip."
@@ -2045,6 +2047,14 @@ impl Actor {
     fn reinit(&mut self, codec: Codec) -> HealthEvent {
         let Some(config) = self.video_config else { return HealthEvent::ReinitFailed };
         let config = VideoStart { codec, ..config };
+        // Before the new encoder starts: the tee would otherwise write its packets under the old
+        // track header, as `restart_capture` avoids.
+        if self.recording.as_ref().is_some_and(|r| r.id.is_some()) {
+            self.stop_recording();
+            self.emit(EngineEvent::Warning(
+                "The encoder restarted, so the recording was stopped.".into(),
+            ));
+        }
         let sink: SharedSink = self.recorder.clone();
         let health = self.health_emitter();
         let Some(video) = self.ports.video.as_mut() else { return HealthEvent::ReinitFailed };
@@ -2059,14 +2069,6 @@ impl Actor {
                     )));
                 }
                 self.status.codec = Some(actual);
-                // The tee would keep writing the new encoder's packets under the old track
-                // header, as `restart_capture` avoids.
-                if self.recording.as_ref().is_some_and(|r| r.id.is_some()) {
-                    self.stop_recording();
-                    self.emit(EngineEvent::Warning(
-                        "The encoder restarted, so the recording was stopped.".into(),
-                    ));
-                }
                 // A step down the ladder changes the track; the buffer is cleared at RESUMING,
                 // so later clips hold only the new format.
                 self.video_track = format;
