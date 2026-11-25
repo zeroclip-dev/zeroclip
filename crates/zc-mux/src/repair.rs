@@ -415,7 +415,7 @@ fn traf_times(traf: &[u8]) -> Option<TrafTimes> {
     }
     // Each sample is 12 bytes, after the count and the data offset.
     let entries = trun.get(12..)?;
-    if entries.len() != 12 * usize::try_from(samples).ok()? {
+    if entries.len() != usize::try_from(samples).ok()?.checked_mul(12)? {
         return None;
     }
     // The length check above means there is no partial entry left over, so `.0` is every entry.
@@ -425,7 +425,7 @@ fn traf_times(traf: &[u8]) -> Option<TrafTimes> {
         .iter()
         .map(|entry| u64::from(u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]])))
         .sum();
-    Some(TrafTimes { track_id, base, end: base + duration })
+    Some(TrafTimes { track_id, base, end: base.saturating_add(duration) })
 }
 
 /// The final name of a `.partial` file: its name without the `.partial` suffix.

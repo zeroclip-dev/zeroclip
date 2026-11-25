@@ -18,7 +18,7 @@
 //! ([`MediaFoundation`]) for the hardware encoder.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -37,6 +37,7 @@ use zc_core::time::FramePacer;
 use zc_core::watchdog::HealthEvent;
 use zc_win::clock;
 use zc_win::com::Apartment;
+use zc_win::error::WinResultExt;
 use zc_win::mf::MediaFoundation;
 
 use crate::capture::{CapturedFrame, WgcCapture, capture_item, hdr_sdr_white};
@@ -64,7 +65,15 @@ struct Shared {
     arrived: AtomicU64,
     /// Same, but never reset: the encoder thread watches it for stalls.
     seen: AtomicU64,
+    /// Converted frames sitting in the hand-off channel, not yet submitted. The converter only
+    /// reuses an NV12 slot after its frame left the channel, so a stalled encoder can't have
+    /// queued slots overwritten under it.
+    queued: AtomicUsize,
 }
+
+/// How many converted frames may wait for the encoder. Well under the converter's 8-slot ring,
+/// which also has to cover the frames the encoder itself holds.
+const QUEUE_DEPTH: usize = 2;
 
 /// How long WGC may send nothing before capture is restarted (see `run`).
 const STALL: Duration = Duration::from_secs(3);
@@ -177,9 +186,15 @@ impl VideoSource for GpuVideoSource {
         *self.shared.screenshot.lock().map_err(|_| SourceError::Other("poisoned lock".into()))? =
             Some(tx);
         self.shared.screenshot_wanted.store(true, Ordering::Release);
-        let (staging, size) = rx
-            .recv_timeout(Duration::from_secs(2))
-            .map_err(|_| SourceError::Other("no frame captured yet".into()))??;
+        let Ok(shot) = rx.recv_timeout(Duration::from_secs(2)) else {
+            // Withdraw the request, or a late frame would take a screenshot nobody waits for.
+            self.shared.screenshot_wanted.store(false, Ordering::Release);
+            if let Ok(mut slot) = self.shared.screenshot.lock() {
+                *slot = None;
+            }
+            return Err(SourceError::Other("no frame captured yet".into()));
+        };
+        let (staging, size) = shot?;
         save_png(context, &staging, size, path)
     }
 }
@@ -213,6 +228,11 @@ impl FrameHandler {
         let slot = match self.sdr_frame(frame) {
             Ok(texture) => {
                 self.keep_latest(&texture, frame.size);
+                if self.shared.queued.load(Ordering::Acquire) >= QUEUE_DEPTH {
+                    // Converting now would advance the ring onto a slot still waiting in the channel.
+                    self.drop_frame();
+                    return;
+                }
                 self.converter.convert(&texture, frame.size)
             }
             Err(e) => Err(e),
@@ -270,17 +290,28 @@ impl FrameHandler {
             let shot = staging_copy(&self.device, &self.context, texture).map(|t| (t, *size));
             let _ = tx.try_send(shot);
         }
-        if let Some(time) = self.pacer.repeat_due(now)
+        if self.shared.queued.load(Ordering::Acquire) < QUEUE_DEPTH
+            && let Some(time) = self.pacer.repeat_due(now)
             && let Some(slot) = self.converter.repeat_last()
         {
             self.hand_off(Ok(slot), time);
         }
     }
 
+    /// Counts a frame lost before it reached the channel: warns once per run of drops.
+    fn drop_frame(&mut self) {
+        if !self.dropping {
+            tracing::warn!("dropping frames: the encoder isn't keeping up");
+        }
+        (self.health)(HealthEvent::FrameDropped);
+        self.dropping = true;
+    }
+
     fn hand_off(&mut self, slot: Result<usize, SourceError>, time: Hns) {
         let sent = slot.map(|slot| self.frames.try_send((slot, time)));
         match sent {
             Ok(Ok(())) => {
+                self.shared.queued.fetch_add(1, Ordering::AcqRel);
                 // ponytail: FrameDelivered only on leaving a drop run. The engine's
                 // health channel allocates as it grows, and the Phase 4 watchdog only
                 // needs it to reset its drop count.
@@ -296,7 +327,13 @@ impl FrameHandler {
             Ok(Err(TrySendError::Full(_))) | Err(_) => {
                 if !self.dropping {
                     match &sent {
-                        Err(e) => tracing::warn!(%e, "dropping frames: conversion failed"),
+                        Err(e) => {
+                            tracing::warn!(%e, "dropping frames: conversion failed");
+                            // SAFETY: plain COM call on a live device.
+                            if let Err(lost) = unsafe { self.device.GetDeviceRemovedReason() } {
+                                (self.health)(HealthEvent::EncoderFault { hresult: lost.code().0 });
+                            }
+                        }
                         _ => tracing::warn!("dropping frames: the encoder isn't keeping up"),
                     }
                 }
@@ -380,6 +417,9 @@ fn run(
                     device = ?device_ok,
                     "video health (last 5 s)"
                 );
+                // A removed or reset GPU never recovers by itself: end the loop so the fault
+                // below reaches the watchdog, which rebuilds the device and encoder.
+                device_ok.context("D3D11 device removed")?;
             }
             let now_seen = shared.seen.load(Ordering::Relaxed);
             if now_seen != seen {
@@ -438,6 +478,7 @@ fn run(
             }
             match frames.recv_timeout(Duration::from_millis(1)) {
                 Ok((slot, pts)) => {
+                    shared.queued.fetch_sub(1, Ordering::AcqRel);
                     if shared.keyframe.swap(false, Ordering::Relaxed)
                         && let Err(e) = encoder.force_keyframe()
                     {
@@ -494,6 +535,12 @@ impl Pipeline {
             (u32::try_from(size.Width).unwrap_or(0), u32::try_from(size.Height).unwrap_or(0));
         // NV12 and the encoders need even sizes.
         let size_out = (size_in.0 & !1, size_in.1 & !1);
+        if size_out.0 == 0 || size_out.1 == 0 {
+            return Err(SourceError::Other(format!(
+                "the capture target has no size ({}x{}); is the window minimised?",
+                size_in.0, size_in.1
+            )));
+        }
         let converter = NvConverter::new(&device, size_in, size_out)?;
 
         // The codec ladder: the preference if the GPU has it, else the best it has;
@@ -523,7 +570,7 @@ impl Pipeline {
             }
         };
 
-        let (frames_tx, frames) = mpsc::sync_channel(2);
+        let (frames_tx, frames) = mpsc::sync_channel(QUEUE_DEPTH);
         let handler = Arc::new(Mutex::new(FrameHandler {
             pacer: FramePacer::new(config.fps),
             converter,

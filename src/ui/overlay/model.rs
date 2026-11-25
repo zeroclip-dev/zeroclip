@@ -71,6 +71,16 @@ pub fn accent(kind: ToastKind) -> u32 {
     }
 }
 
+/// The 1 px hairline border around the floating toast card, subtly tinted for active states.
+pub fn border(kind: ToastKind) -> u32 {
+    match kind {
+        ToastKind::Saving | ToastKind::ClipSaved { .. } => theme::BRAND_BORDER,
+        ToastKind::RecordingStarted => theme::DANGER_BORDER,
+        ToastKind::Bookmarked { .. } => theme::WARN_BORDER,
+        ToastKind::RecordingStopped { .. } | ToastKind::ScreenshotTaken => theme::BORDER_STRONG,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +106,21 @@ mod tests {
     #[test]
     fn toast_lives_about_three_seconds() {
         assert_eq!(HOLD + FADE * 2, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn border_matches_semantic_state() {
+        assert_eq!(border(ToastKind::Saving), theme::BRAND_BORDER);
+        assert_eq!(
+            border(ToastKind::ClipSaved { length: Hns::from_secs(30) }),
+            theme::BRAND_BORDER
+        );
+        assert_eq!(border(ToastKind::RecordingStarted), theme::DANGER_BORDER);
+        assert_eq!(border(ToastKind::Bookmarked { at: Hns::from_secs(10) }), theme::WARN_BORDER);
+        assert_eq!(
+            border(ToastKind::RecordingStopped { length: Hns::from_secs(30) }),
+            theme::BORDER_STRONG
+        );
+        assert_eq!(border(ToastKind::ScreenshotTaken), theme::BORDER_STRONG);
     }
 }

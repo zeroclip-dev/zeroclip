@@ -4,8 +4,9 @@ use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
-use gpui::{Context, FocusHandle, IntoElement, Pixels, Point, Render, Window};
+use gpui::{Context, FocusHandle, IntoElement, PathPromptOptions, Pixels, Point, Render, Window};
 use zc_core::control::{Command, EngineEvent, EngineStatus, FocusChoice};
 use zc_core::settings::{CaptureMode, Settings, UiMode};
 use zc_engine::{Engine, EngineConfig, EngineHandle};
@@ -15,6 +16,7 @@ use crate::paths::AppPaths;
 use crate::tray::{self, TrayCommand};
 use crate::ui;
 use crate::ui::components::screens::Screens;
+use crate::update::{self, UpdateState};
 
 /// The top-level tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +28,8 @@ pub enum Tab {
     Settings,
     /// Not in the top bar: reached by playing a clip.
     Player,
+    /// Not in the top bar: reached by viewing a screenshot.
+    Viewer,
 }
 
 impl Tab {
@@ -40,6 +44,7 @@ impl Tab {
             Tab::Editor => "scissors",
             Tab::Settings => "settings",
             Tab::Player => "play",
+            Tab::Viewer => "image",
         }
     }
 
@@ -51,6 +56,7 @@ impl Tab {
             Tab::Editor => "Editor",
             Tab::Settings => "Settings",
             Tab::Player => "Player",
+            Tab::Viewer => "Viewer",
         }
     }
 }
@@ -94,7 +100,6 @@ pub struct ZeroClipApp {
     pub menu_focus: FocusHandle,
     /// The metadata database (waveform cache). `None` when it couldn't be opened.
     pub store: Option<Arc<Mutex<zc_store::Store>>>,
-    #[allow(dead_code)] // used by the Profiles screen
     pub open_apps: ui::components::open_apps::OpenAppsList,
     /// The focus prompt on screen, if a second game asked to take over (D35).
     pub focus_prompt: Option<ui::focus_prompt::FocusPrompt>,
@@ -110,7 +115,18 @@ pub struct ZeroClipApp {
     quitting: bool,
     /// The "keeps running in the tray" notice is shown once per session.
     tray_hint_shown: bool,
+    /// Which failures the overlay popup has shown lately, so a flapping device can't storm it.
+    alerts: ui::overlay::Coalescer,
+    /// Self-update progress; drawn by `ui::update_banner`.
+    pub update: UpdateState,
+    /// When a clip last started saving, until it is saved. Blocks installing an update.
+    saving_since: Option<Instant>,
 }
+
+/// A clip save that never reports back stops blocking an update after this long.
+const SAVE_BLOCK_MAX: Duration = Duration::from_secs(120);
+/// Update checks run at startup and then once a day.
+const UPDATE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl ZeroClipApp {
     pub fn new(
@@ -187,6 +203,39 @@ impl ZeroClipApp {
         })
         .detach();
 
+        // Check for a newer release a few seconds after startup, then daily. The setting is read
+        // every hour, so turning it on takes effect without a restart.
+        cx.spawn(async move |this, cx| {
+            let mut last: Option<Instant> = None;
+            cx.background_executor().timer(Duration::from_secs(5)).await;
+            loop {
+                let due = last.is_none_or(|t| t.elapsed() >= UPDATE_EVERY);
+                let Ok(enabled) = this.update(cx, |app, _| {
+                    app.settings.updates.check && app.update == UpdateState::None
+                }) else {
+                    return;
+                };
+                if enabled && due {
+                    last = Some(Instant::now());
+                    let found =
+                        cx.background_executor().spawn(async { update::check_latest() }).await;
+                    let _ = this.update(cx, |app, cx| {
+                        match found {
+                            Ok(Some(release)) if app.update == UpdateState::None => {
+                                app.update = UpdateState::Available(release);
+                            }
+                            Ok(_) => {}
+                            // Offline is normal; keep it out of the user's way.
+                            Err(error) => tracing::warn!(%error, "update check failed"),
+                        }
+                        cx.notify();
+                    });
+                }
+                cx.background_executor().timer(Duration::from_secs(60 * 60)).await;
+            }
+        })
+        .detach();
+
         let store = match open_store(&paths.db_file) {
             Ok(store) => Some(Arc::new(Mutex::new(store))),
             Err(error) => {
@@ -210,6 +259,9 @@ impl ZeroClipApp {
             tray,
             quitting: false,
             tray_hint_shown: false,
+            alerts: ui::overlay::Coalescer::default(),
+            update: UpdateState::None,
+            saving_since: None,
             clips: ui::clips::ClipList::default(),
             clip_menu: None,
             menu_focus: cx.focus_handle(),
@@ -222,12 +274,72 @@ impl ZeroClipApp {
         })
     }
 
+    /// "Update": downloads and verifies the new exe off the UI thread, then offers (or, when it is
+    /// safe, performs) the restart.
+    pub fn start_update(&mut self, cx: &mut Context<Self>) {
+        let UpdateState::Available(release) = self.update.clone() else { return };
+        self.update = UpdateState::Downloading(release.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let job = release.clone();
+            let result =
+                cx.background_executor().spawn(async move { update::download(&job) }).await;
+            let _ = this.update(cx, |app, cx| {
+                match result {
+                    Ok(path) => {
+                        app.update = UpdateState::Ready { release, path };
+                        app.install_update(cx);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "update download failed");
+                        app.update = UpdateState::Available(release);
+                        app.notify(NoticeLevel::Error, format!("Update failed: {error:#}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Swaps in the downloaded exe and restarts, unless a recording or clip save is running.
+    pub fn install_update(&mut self, cx: &mut Context<Self>) {
+        let UpdateState::Ready { path, .. } = &self.update else { return };
+        let saving = self.saving_since.is_some_and(|t| t.elapsed() < SAVE_BLOCK_MAX);
+        if let Err(wait_for) = update::can_install(&self.status, saving) {
+            self.notify(
+                NoticeLevel::Info,
+                format!("Update downloaded. Restart to install it once {wait_for}."),
+            );
+            return;
+        }
+        match update::swap_and_restart(path) {
+            Ok(()) => {
+                self.quitting = true;
+                cx.quit();
+            }
+            Err(error) => {
+                tracing::warn!(%error, "update install failed");
+                let _ = std::fs::remove_file(path);
+                self.update = UpdateState::None;
+                self.notify(NoticeLevel::Error, format!("Update failed: {error:#}"));
+            }
+        }
+    }
+
+    /// Hides the update strip until the next check.
+    pub fn dismiss_update(&mut self) {
+        if let UpdateState::Available(_) = self.update {
+            self.update = UpdateState::None;
+        }
+    }
+
     /// Opens `path` in the Editor tab: as a plain player when `watch`, else ready to edit (the Clips
     /// tab's Watch and Edit buttons).
     pub fn open_in_editor(&mut self, path: PathBuf, watch: bool, cx: &mut Context<Self>) {
         let ffmpeg = self.settings.editor.ffmpeg_path.clone();
         let store = self.store.clone();
-        let bitrate_bps = self.settings.audio.bitrate_kbps * 1_000;
+        let bitrate_bps = self.settings.audio.bitrate_kbps.saturating_mul(1_000);
         let prefs = (self.settings.editor.finish, usize::from(self.settings.editor.listen_track));
         self.screens.editor().update(cx, |editor, cx| {
             editor.open(path, watch, Some(prefs), ffmpeg, store, bitrate_bps, cx)
@@ -254,6 +366,18 @@ impl ZeroClipApp {
         let ffmpeg = self.settings.editor.ffmpeg_path.clone();
         self.screens.player().update(cx, |player, cx| player.open(path, ffmpeg, cx));
         self.tab = Tab::Player;
+        cx.notify();
+    }
+
+    /// Opens the screenshot at `index` inside `screenshots` in the full-size image viewer.
+    pub fn view_screenshot(
+        &mut self,
+        screenshots: Vec<ui::clips::ClipFile>,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.screens.viewer().update(cx, |viewer, cx| viewer.open(screenshots, index, cx));
+        self.tab = Tab::Viewer;
         cx.notify();
     }
 
@@ -344,26 +468,21 @@ impl ZeroClipApp {
 
     /// Asks where clips should be saved and switches to it at once. Settings edits that are not
     /// saved yet stay in the draft, as in [`Self::set_ui_mode`].
-    pub fn choose_output_dir(&mut self) {
+    pub fn choose_output_dir(&mut self, cx: &mut Context<Self>) {
         let current = self.output_dir();
-        match zc_win::shell::pick_folder(Some(&current)) {
-            Ok(Some(dir)) if dir != current => {
-                let mut settings = self.settings.clone();
-                settings.recording.output_dir = Some(dir.clone());
-                let draft = self.draft.clone();
-                self.apply_settings(settings);
-                self.draft = draft;
-                self.draft.output_dir = dir.display().to_string();
-                self.notify(NoticeLevel::Info, format!("New clips go to {}", dir.display()));
+        pick_folder(cx, move |app, dir, cx| {
+            if dir == current {
+                return;
             }
-            Ok(_) => {}
-            Err(error) => {
-                self.notify(
-                    NoticeLevel::Error,
-                    format!("Couldn't open the folder picker: {error}"),
-                );
-            }
-        }
+            let mut settings = app.settings.clone();
+            settings.recording.output_dir = Some(dir.clone());
+            let draft = app.draft.clone();
+            app.apply_settings(settings);
+            app.draft = draft;
+            app.draft.output_dir = dir.display().to_string();
+            app.notify(NoticeLevel::Info, format!("New clips go to {}", dir.display()));
+            cx.notify();
+        });
     }
 
     /// The window's close button (P4.15). With close-to-tray on and a tray icon to come back from,
@@ -467,6 +586,24 @@ impl ZeroClipApp {
         self.send(Command::FocusChoice(choice));
     }
 
+    /// Tells a player in a game that something failed: the overlay popup, and for an error a
+    /// Windows notification when ZeroClip is not the window in front. Repeats are coalesced.
+    fn popup(&mut self, level: ui::overlay::AlertLevel, text: &str, cx: &mut gpui::App) {
+        let Some(count) = self.alerts.admit(std::time::Instant::now(), level, text) else {
+            return;
+        };
+        ui::overlay::show_alert(cx, level, text, count);
+        if level == ui::overlay::AlertLevel::Error
+            && count == 1
+            && !zc_win::notify::app_is_foreground()
+        {
+            let (title, detail) = ui::overlay::split_alert(level, text);
+            if let Err(error) = zc_win::notify::error(&title, &detail) {
+                tracing::warn!(%error, "desktop notification not shown");
+            }
+        }
+    }
+
     /// Puts a toast on screen, replacing the one that is up. Off when the setting is off.
     fn show_toast(&mut self, kind: ui::overlay::ToastKind, cx: &mut gpui::App) {
         if !self.settings.overlay_toasts {
@@ -524,6 +661,7 @@ impl ZeroClipApp {
     fn drain_engine_events(&mut self, cx: &mut Context<Self>) {
         use ui::overlay::ToastKind;
         let events: Vec<EngineEvent> = self.engine.poll_events().collect();
+        let mut raw_keys = Vec::new();
         for event in events {
             match event {
                 EngineEvent::Status(status) => self.status = status,
@@ -532,8 +670,12 @@ impl ZeroClipApp {
                     // ponytail: egui flashed the taskbar here; GPUI has no equivalent yet.
                     // Never raise or activate the window (D35).
                 }
-                EngineEvent::ClipSaving => self.show_toast(ToastKind::Saving, cx),
+                EngineEvent::ClipSaving => {
+                    self.saving_since = Some(Instant::now());
+                    self.show_toast(ToastKind::Saving, cx);
+                }
                 EngineEvent::ClipSaved { path, duration } => {
+                    self.saving_since = None;
                     self.tag_game(&path);
                     self.finish_clip(path.clone(), cx);
                     self.show_toast(ToastKind::ClipSaved { length: duration }, cx);
@@ -600,13 +742,31 @@ impl ZeroClipApp {
                     // ponytail: egui flashed the taskbar here; GPUI has no equivalent yet.
                     // Never raise or activate the window (the user may be relaunching the game).
                 }
-                EngineEvent::Warning(text) => self.notify(NoticeLevel::Warning, text),
-                EngineEvent::Error(text) => self.notify(NoticeLevel::Error, text),
+                EngineEvent::CaptureKey { key, down } => raw_keys.push((key, down)),
+                EngineEvent::Warning(text) => {
+                    self.popup(ui::overlay::AlertLevel::Warning, &text, cx);
+                    self.notify(NoticeLevel::Warning, text);
+                }
+                EngineEvent::Error(text) => {
+                    self.popup(ui::overlay::AlertLevel::Error, &text, cx);
+                    self.notify(NoticeLevel::Error, text);
+                }
                 EngineEvent::NotImplemented { feature, phase } => self.notify(
                     NoticeLevel::Info,
                     format!("{feature}: not built yet (arrives in Phase {phase})."),
                 ),
             }
+        }
+        if !raw_keys.is_empty() {
+            // Deferred: the view sends engine commands through this entity, which is mid-update.
+            let settings = self.screens.settings().clone();
+            cx.defer(move |cx| {
+                settings.update(cx, |view, cx| {
+                    for (key, down) in raw_keys {
+                        view.on_capture_key(key, down, cx);
+                    }
+                });
+            });
         }
     }
 }
@@ -614,6 +774,14 @@ impl ZeroClipApp {
 impl Render for ZeroClipApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         ui::focus_prompt::clear_if_left(self);
+        // A hotkey field that was listening when the user left Settings (by any route) must not
+        // leave the global hotkeys suspended. Deferred: the view updates this entity.
+        if self.tab != Tab::Settings {
+            let settings = self.screens.settings().clone();
+            if settings.read(cx).is_listening() {
+                cx.defer(move |cx| settings.update(cx, |view, cx| view.leave(cx)));
+            }
+        }
         ui::shell(self, window, cx)
     }
 }
@@ -720,6 +888,31 @@ fn open_store(path: &Path) -> anyhow::Result<zc_store::Store> {
         std::fs::create_dir_all(parent)?;
     }
     Ok(zc_store::Store::open(path)?)
+}
+
+/// Opens the system folder picker and calls `then` with the chosen folder. GPUI runs the dialog
+/// off the event handler; a blocking `IFileOpenDialog::Show` inside a click handler re-enters
+/// GPUI's window while it is borrowed and aborts the app.
+pub fn pick_folder<T: 'static>(
+    cx: &mut Context<T>,
+    then: impl FnOnce(&mut T, std::path::PathBuf, &mut Context<T>) + 'static,
+) {
+    let chosen = cx.prompt_for_paths(PathPromptOptions {
+        files: false,
+        directories: true,
+        multiple: false,
+        prompt: Some("Select folder".into()),
+    });
+    cx.spawn(async move |this, cx| match chosen.await {
+        Ok(Ok(Some(mut paths))) => {
+            if let Some(dir) = paths.pop() {
+                let _ = this.update(cx, |this, cx| then(this, dir, cx));
+            }
+        }
+        Ok(Err(error)) => tracing::warn!(%error, "folder picker failed"),
+        _ => {}
+    })
+    .detach();
 }
 
 #[cfg(test)]

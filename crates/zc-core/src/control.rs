@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use crate::hotkey::Key;
 use crate::media::Codec;
 use crate::settings::Settings;
 use crate::time::Hns;
@@ -28,6 +29,8 @@ pub enum Command {
     /// The user answered the focus prompt (D35). Clip desktop is not a choice here: the UI
     /// sends `ApplySettings` with capture mode Screen.
     FocusChoice(FocusChoice),
+    /// Suspend global hotkey dispatch while the UI is capturing a new hotkey binding.
+    SetHotkeysSuspended(bool),
     /// Stop all sources and exit the engine thread.
     Shutdown,
 }
@@ -104,6 +107,15 @@ pub enum EngineEvent {
         current: String,
         /// The app that has focus and kept it for the debounce.
         candidate: String,
+    },
+    /// A raw key or mouse-button transition, sent only while hotkeys are suspended
+    /// ([`Command::SetHotkeysSuspended`]) so a hotkey field can bind the true virtual-key code
+    /// (Numpad1 vs 1) instead of what the UI toolkit makes of it. Never sent during gameplay.
+    CaptureKey {
+        /// The key as Raw Input reports it (may be a left/right modifier variant).
+        key: Key,
+        /// Pressed (`true`) or released.
+        down: bool,
     },
     /// Something the user should know about, but not an error.
     Warning(String),

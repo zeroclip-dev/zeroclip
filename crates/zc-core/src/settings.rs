@@ -46,6 +46,29 @@ pub struct Settings {
     /// excluded from capture, so they never end up in a recording.
     #[serde(default = "default_overlay_toasts")]
     pub overlay_toasts: bool,
+    /// Video player playback preferences (volume and mute).
+    #[serde(default)]
+    pub player: PlayerSettings,
+    /// The editor preview's volume and mute, kept apart from the clip player's.
+    #[serde(default)]
+    pub editor_volume: PlayerSettings,
+    /// Update checks.
+    #[serde(default)]
+    pub updates: UpdateSettings,
+}
+
+/// Update checks. Installing is always a click, never automatic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateSettings {
+    /// Look for a newer release at startup and once a day.
+    pub check: bool,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self { check: true }
+    }
 }
 
 fn default_overlay_toasts() -> bool {
@@ -68,6 +91,9 @@ impl Default for Settings {
             app: AppSettings::default(),
             ui_mode: UiMode::default(),
             overlay_toasts: default_overlay_toasts(),
+            player: PlayerSettings::default(),
+            editor_volume: PlayerSettings::default(),
+            updates: UpdateSettings::default(),
         }
     }
 }
@@ -85,6 +111,31 @@ pub enum UiMode {
 }
 
 impl Settings {
+    /// Highest video bitrate a loaded file may ask for, kbit/s. Sizes the DVR buffer, so an
+    /// absurd value would otherwise ask for terabytes.
+    const MAX_LOADED_BITRATE_KBPS: u32 = 500_000;
+
+    /// Pulls numbers read from a hand-edited or damaged settings file into the ranges
+    /// [`problems`](Self::problems) enforces, so a bad value can't size a buffer from nonsense
+    /// or poison the mix with NaN. The UI never writes such values; the file can.
+    pub fn sanitize_loaded(&mut self) {
+        let video = &mut self.video;
+        video.fps = video.fps.clamp(1, 240);
+        video.max_bitrate_kbps = video.max_bitrate_kbps.clamp(1, Self::MAX_LOADED_BITRATE_KBPS);
+        video.min_bitrate_kbps = video.min_bitrate_kbps.min(video.max_bitrate_kbps);
+        video.keyframe_interval_ms = video.keyframe_interval_ms.clamp(500, 4_000);
+        self.dvr.ram_ceiling_mib = self.dvr.ram_ceiling_mib.max(64);
+        self.storage.write_chunk_mib = self.storage.write_chunk_mib.clamp(1, 64);
+        for gain in [&mut self.audio.mix_gain_db.game, &mut self.audio.mix_gain_db.mic] {
+            // `clamp` passes NaN through, so catch it first.
+            *gain = if gain.is_nan() {
+                0.0
+            } else {
+                gain.clamp(*MIX_GAIN_DB.start(), *MIX_GAIN_DB.end())
+            };
+        }
+    }
+
     /// Problems that should block saving, as sentences for the UI. Empty when the
     /// settings are usable.
     #[must_use]
@@ -178,6 +229,22 @@ pub struct EditorSettings {
     pub finish: FinishChoice,
     /// The audio track the preview plays (0 is Master). Remembered between sessions.
     pub listen_track: u8,
+}
+
+/// Video player playback preferences, remembered across clips and restarts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlayerSettings {
+    /// Output volume percentage (`0..=100`).
+    pub volume: u8,
+    /// Whether playback audio is muted.
+    pub muted: bool,
+}
+
+impl Default for PlayerSettings {
+    fn default() -> Self {
+        Self { volume: 100, muted: false }
+    }
 }
 
 /// What the editor does when you press Done.
@@ -498,6 +565,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn loaded_nonsense_is_pulled_into_range() {
+        let mut s = Settings::default();
+        s.audio.mix_gain_db.game = f32::NAN;
+        s.audio.mix_gain_db.mic = 1e9;
+        s.video.max_bitrate_kbps = u32::MAX;
+        s.video.min_bitrate_kbps = u32::MAX;
+        s.video.fps = 0;
+        s.sanitize_loaded();
+        assert!(s.problems().is_empty(), "{:?}", s.problems());
+        assert_eq!(s.audio.mix_gain_db.game, 0.0);
+        assert_eq!(s.audio.mix_gain_db.mic, 12.0);
+    }
+
+    #[test]
     fn defaults_follow_the_design_doc() {
         let s = Settings::default();
         assert_eq!(s.video.max_bitrate_kbps, 20_000);
@@ -678,5 +759,14 @@ storage = \"disk\"
         assert!(problems.iter().any(|p| p == "Every app track needs a label."));
         assert!(problems.iter().any(|p| p.contains("\"Spotify\" needs an executable name")));
         assert_eq!(problems.len(), 2, "{problems:#?}");
+    }
+
+    #[test]
+    fn player_settings_default_and_round_trip() {
+        assert_eq!(Settings::default().player, PlayerSettings { volume: 100, muted: false });
+        let older: Settings = toml::from_str("[video]\nfps = 60\n").unwrap();
+        assert_eq!(older.player, PlayerSettings { volume: 100, muted: false });
+        let saved: Settings = toml::from_str("[player]\nvolume = 65\nmuted = true\n").unwrap();
+        assert_eq!(saved.player, PlayerSettings { volume: 65, muted: true });
     }
 }
