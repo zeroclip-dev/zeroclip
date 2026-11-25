@@ -216,6 +216,53 @@ pub fn download(release: &Release) -> anyhow::Result<PathBuf> {
     Ok(staged)
 }
 
+/// The release asset holding `ffmpeg.exe`, `ffprobe.exe`, `ffplay.exe` (preview sound) and ffmpeg's licence (a pinned gyan.dev
+/// build repacked by the release workflow).
+pub const FFMPEG_ASSET: &str = "ffmpeg-windows-x64.zip";
+
+/// Puts ffmpeg and ffprobe beside the running exe, where `Ffmpeg::locate` looks first. Downloads
+/// [`FFMPEG_ASSET`] from this version's own release, checks it against that release's
+/// `SHA256SUMS.txt`, and unpacks it with Windows' `tar.exe` into a folder first, so a failed
+/// unpack never leaves a half-written `ffmpeg.exe` in place.
+pub fn install_ffmpeg() -> anyhow::Result<()> {
+    use std::os::windows::process::CommandExt as _;
+    let exe = std::env::current_exe()?;
+    let dir = exe.parent().context("the app has no folder")?;
+    let base = format!("{DOWNLOAD_PREFIX}v{}/", current_version());
+    let zip = dir.join("ffmpeg-download.zip");
+    let unpack = dir.join("ffmpeg-download");
+    let sums = curl(&format!("{base}{SUMS_NAME}"), None, 20, 1 << 20)?;
+    let result = curl(&format!("{base}{FFMPEG_ASSET}"), Some(&zip), 900, 512 << 20)
+        .and_then(|_| Ok(sha256_file(&zip)?))
+        .and_then(|hash| verify_hash(&String::from_utf8_lossy(&sums), FFMPEG_ASSET, &hash))
+        .and_then(|()| {
+            let _ = std::fs::remove_dir_all(&unpack);
+            std::fs::create_dir_all(&unpack)?;
+            let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+            let status = Command::new(Path::new(&root).join("System32").join("tar.exe"))
+                .arg("-xf")
+                .arg(&zip)
+                .arg("-C")
+                .arg(&unpack)
+                .stdin(Stdio::null())
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW, as in `curl`
+                .status()
+                .context("couldn't run tar.exe")?;
+            if !status.success() {
+                bail!("couldn't unpack {FFMPEG_ASSET}");
+            }
+            // ffmpeg.exe last: `locate` keys on it, so it only appears once the others are there.
+            for name in ["LICENSE-ffmpeg.txt", "ffprobe.exe", "ffplay.exe", "ffmpeg.exe"] {
+                std::fs::rename(unpack.join(name), dir.join(name))
+                    .with_context(|| format!("couldn't move {name} into place"))?;
+            }
+            Ok(())
+        });
+    let _ = std::fs::remove_file(&zip);
+    let _ = std::fs::remove_dir_all(&unpack);
+    result
+}
+
 /// Swaps the staged exe in and starts it. Windows lets a running exe be renamed but not
 /// overwritten, so: running exe -> `.old`, staged -> exe, spawn. The caller then quits; the new
 /// copy retries the single-instance mutex until this one has gone. On failure the old exe is put back.

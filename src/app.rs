@@ -236,6 +236,29 @@ impl ZeroClipApp {
         })
         .detach();
 
+        // No ffmpeg anywhere and none configured: fetch it beside the exe, so the editor,
+        // thumbnails and smooth-seeking clips work without a separate install.
+        if settings.editor.ffmpeg_path.is_none() && zc_editor::ffmpeg::Ffmpeg::locate(None).is_err()
+        {
+            cx.spawn(async move |this, cx| {
+                let done = cx.background_executor().spawn(async { update::install_ffmpeg() }).await;
+                let _ = this.update(cx, |app, cx| {
+                    match done {
+                        Ok(()) => app.notify(
+                            NoticeLevel::Info,
+                            "ffmpeg is installed, so the editor and thumbnails are ready.",
+                        ),
+                        // Offline is normal; the editor still says ffmpeg is missing.
+                        Err(error) => {
+                            tracing::warn!(error = %format!("{error:#}"), "ffmpeg install failed")
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+
         let store = match open_store(&paths.db_file) {
             Ok(store) => Some(Arc::new(Mutex::new(store))),
             Err(error) => {
@@ -340,7 +363,7 @@ impl ZeroClipApp {
         let ffmpeg = self.settings.editor.ffmpeg_path.clone();
         let store = self.store.clone();
         let bitrate_bps = self.settings.audio.bitrate_kbps.saturating_mul(1_000);
-        let prefs = (self.settings.editor.finish, usize::from(self.settings.editor.listen_track));
+        let prefs = self.settings.editor.finish;
         self.screens.editor().update(cx, |editor, cx| {
             editor.open(path, watch, Some(prefs), ffmpeg, store, bitrate_bps, cx)
         });

@@ -28,10 +28,12 @@ use image::{Frame, Rgba, RgbaImage};
 use zc_core::Hns;
 use zc_editor::ffmpeg::{EnvelopePoint, Ffmpeg, SILENT_DB, frames_args};
 
-/// Size every frame is made at. Small, because it is only a preview.
-const WIDTH: u32 = 960;
-const HEIGHT: u32 = 540;
-const FPS: u32 = 24;
+/// Size every frame is made at: full HD at 60 fps, so the editor and clip viewer show what was
+/// recorded. Larger sources are scaled down to fit.
+// ponytail: raw BGRA over a pipe is ~500 MB/s at this size; decode on the GPU if it shows in profiles.
+const WIDTH: u32 = 1920;
+const HEIGHT: u32 = 1080;
+const FPS: u32 = 60;
 /// Frames that may wait between the reader thread and the screen.
 const BACKLOG: usize = 6;
 
@@ -615,7 +617,7 @@ impl Drop for Player {
 /// Stops `ffplay` (and its process tree, in case `ffplay.exe` is a Chocolatey/Scoop shim) plus
 /// any per-track `ffmpeg` decoder processes on a background thread so pausing never stalls the UI.
 /// <https://learn.microsoft.com/windows-server/administration/windows-commands/taskkill>
-fn stop_audio_tree(mut sink: Child, mut decoders: Vec<Child>) {
+pub(crate) fn stop_audio_tree(mut sink: Child, mut decoders: Vec<Child>) {
     #[cfg(windows)]
     let tree = {
         let mut cmd = Command::new("taskkill");
@@ -626,12 +628,14 @@ fn stop_audio_tree(mut sink: Child, mut decoders: Vec<Child>) {
         no_window(&mut cmd);
         cmd.spawn().ok()
     };
-    // Killed on this thread (it is quick), so quitting right after never leaves a process behind;
-    // only the waiting is left to a thread.
     for dec in &mut decoders {
         let _ = dec.kill();
     }
-    let _ = sink.kill();
+    // `sink` is killed only after taskkill is done. A shim (Chocolatey's `ffplay.exe`) runs the
+    // real ffplay as its child: killing the shim first orphans that child before taskkill can find
+    // it through its parent, and the orphan plays on through its read-ahead buffer (seconds of
+    // sound after a pause or a speed change). taskkill is its own process, so it still finishes
+    // if the app quits right after.
     std::thread::spawn(move || {
         for dec in &mut decoders {
             let _ = dec.wait();
@@ -640,6 +644,7 @@ fn stop_audio_tree(mut sink: Child, mut decoders: Vec<Child>) {
         if let Some(mut tree) = tree {
             let _ = tree.wait();
         }
+        let _ = sink.kill();
         let _ = sink.wait();
     });
 }

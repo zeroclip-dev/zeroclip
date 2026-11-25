@@ -34,7 +34,7 @@ use zc_editor::ffmpeg::{AudioEdit, Ffmpeg, FfmpegError, ProbeInfo};
 use zc_editor::waveform::{file_key, rms_peaks};
 use zc_store::Store;
 
-use self::model::{Piece, PiecePlan, Timeline, TimelineTool, TrackEdit};
+use self::model::{Piece, PiecePlan, Timeline, TimelineTool, TrackEdit, TrackMix, mixed_tracks};
 use self::player::{
     Item, Player, Sound, clamp_volume, pause_on_focus_loss, step_volume, volume_gain, volume_icon,
 };
@@ -89,6 +89,11 @@ const SNAP_PX: f32 = 6.0;
 const VOLUME_STEP: i32 = 5;
 /// How long after the last volume change the setting is written to disk.
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(200);
+/// How long after the last mixer change playback restarts to apply it (a fader drag restarts once).
+const MIX_SETTLE: Duration = Duration::from_millis(150);
+/// The range of a track's gain slider in the lane header.
+const MIX_MIN_DB: f64 = -30.0;
+const MIX_MAX_DB: f64 = 12.0;
 
 /// A clip on the timeline's list of sources.
 struct Source {
@@ -144,10 +149,14 @@ pub struct EditorView {
     remember: bool,
     /// The remembered choice for Done.
     finish: FinishChoice,
-    /// Soloed audio track index while editing tracks separately (`None` = play mixed tracks `1..`).
+    /// Soloed audio track (`None` = play the mix of tracks `1..`, or Master on a one-track clip).
     solo: Option<usize>,
-    /// Every audio track is shown and editable; otherwise only Master.
-    tracks_open: bool,
+    /// The mixer: each audio track's mute and gain, applied on top of every piece's own edits.
+    mix: Vec<TrackMix>,
+    /// One per track's gain slider in the lane headers.
+    mix_sliders: Vec<SliderState>,
+    /// Bumped on every mixer change, so a slider drag restarts playback once it settles.
+    mix_gen: u64,
     /// Active timeline pointer tool (`V` = Select, `S` = Split).
     tool: TimelineTool,
     /// Bounded LRU cache of timeline thumbnails keyed by `(source path, quantized timestamp)`.
@@ -271,7 +280,9 @@ impl EditorView {
             remember: false,
             finish: FinishChoice::Ask,
             solo: None,
-            tracks_open: false,
+            mix: Vec::new(),
+            mix_sliders: Vec::new(),
+            mix_gen: 0,
             tool: TimelineTool::Select,
             thumb_cache: ThumbCache::default(),
             thumb_in_flight: HashSet::new(),
@@ -301,7 +312,7 @@ impl EditorView {
         &mut self,
         path: PathBuf,
         watch: bool,
-        prefs: Option<(FinishChoice, usize)>,
+        prefs: Option<FinishChoice>,
         ffmpeg_path: Option<PathBuf>,
         store: Option<Arc<Mutex<Store>>>,
         bitrate_bps: u32,
@@ -314,7 +325,7 @@ impl EditorView {
         self.editing = !watch;
         // The app hands its saved choices in: reading it from here would panic when it is the one
         // calling (it is being updated).
-        if let Some((finish, _listen)) = prefs {
+        if let Some(finish) = prefs {
             self.finish = finish;
         }
         self.add_clip(path, cx);
@@ -327,6 +338,8 @@ impl EditorView {
         self.player.pause();
         self.sources.clear();
         self.timeline = Timeline::default();
+        self.mix.clear();
+        self.solo = None;
         self.undo.clear();
         self.redo.clear();
         self.drag = None;
@@ -417,13 +430,36 @@ impl EditorView {
                     return;
                 }
                 let own = usize::from(info.stream.audio_tracks);
-                let tracks = self.timeline.pieces.first().map_or(own, |p| p.tracks.len().min(own));
-                if tracks < own
-                    || self.timeline.pieces.first().is_some_and(|p| p.tracks.len() > tracks)
-                {
+                // Tracks are joined by position, so keep only the leading run whose names match:
+                // a clip recorded without Mic must not put its Discord track in the Mic lane.
+                let new_names: Vec<String> = (0..own)
+                    .map(|t| match info.audio_names.get(t) {
+                        Some(n) if !n.is_empty() => n.clone(),
+                        _ => track_name(t),
+                    })
+                    .collect();
+                let old_names: Option<Vec<String>> = self.timeline.pieces.first().map(|p| {
+                    (0..p.tracks.len()).map(|t| track_label(&self.sources[p.source], t)).collect()
+                });
+                let tracks = old_names.as_ref().map_or(own, |old| {
+                    old.iter().zip(&new_names).take_while(|(a, b)| a == b).count()
+                });
+                if let Some(old) = old_names.as_ref().filter(|o| o.len() > tracks || own > tracks) {
+                    let mut dropped: Vec<&str> = old[tracks..]
+                        .iter()
+                        .chain(&new_names[tracks..])
+                        .map(String::as_str)
+                        .collect();
+                    dropped.sort_unstable();
+                    dropped.dedup();
                     self.problem = Some(format!(
-                        "The clips have different numbers of audio tracks, so the joined video keeps                          the first {tracks} of each."
+                        "The clips' audio tracks don't all match, so the joined video keeps only the                          ones they share ({}) and drops {}.",
+                        old[..tracks].join(", "),
+                        dropped.join(", ")
                     ));
+                }
+                if self.mix_sliders.len() < own {
+                    self.mix_sliders.resize_with(own, SliderState::default);
                 }
                 let index = self.sources.len();
                 let name =
@@ -774,8 +810,8 @@ impl EditorView {
                 if piece.gap {
                     return Item::gap(from, piece.b);
                 }
-                let (sounds, solo) =
-                    build_piece_sounds(&piece.tracks, from - piece.a, self.tracks_open, self.solo);
+                let tracks = mixed_tracks(&piece.tracks, &self.mix);
+                let (sounds, solo) = build_piece_sounds(&tracks, from - piece.a, self.solo);
                 Item {
                     path: self.sources[piece.source].path.clone(),
                     from,
@@ -1393,10 +1429,114 @@ impl EditorView {
     /// Solos `track` in preview (`None` returns to the full mix of individual tracks).
     fn set_solo(&mut self, track: Option<usize>, cx: &mut Context<Self>) {
         self.solo = track;
-        let saved = u8::try_from(track.unwrap_or(0)).unwrap_or(0);
-        self.remember_prefs(cx, move |e| e.listen_track = saved);
         self.restart_if_playing(cx);
         cx.notify();
+    }
+
+    /// Changes track `t`'s mixer settings; playback picks them up once they settle.
+    fn edit_mix(&mut self, t: usize, cx: &mut Context<Self>, f: impl FnOnce(&mut TrackMix)) {
+        if self.mix.len() <= t {
+            self.mix.resize(t + 1, TrackMix::default());
+        }
+        f(&mut self.mix[t]);
+        self.mix_gen = self.mix_gen.wrapping_add(1);
+        let generation = self.mix_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(MIX_SETTLE).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.mix_gen == generation {
+                    this.restart_if_playing(cx);
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// A lane header's mixer: Mute and Solo for the whole track, and its gain (click the dB
+    /// readout to reset it).
+    fn track_controls(&self, t: usize, name: String, cx: &mut Context<Self>) -> gpui::Div {
+        let m = self.mix.get(t).copied().unwrap_or_default();
+        let soloed = self.solo == Some(t);
+        let pill = |id: &'static str, label: &'static str, glyph: &'static str, on: bool| {
+            div()
+                .id((id, t))
+                .tab_stop(true)
+                .role(Role::Button)
+                .h(px(24.))
+                .px(px(8.))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.))
+                .rounded(px(theme::RADIUS_MD))
+                .border_1()
+                .bg(rgb(if on { theme::BRAND_SOFT } else { theme::SURFACE_INSET }))
+                .border_color(rgb(if on { theme::BRAND_BORDER } else { theme::BORDER_SUBTLE }))
+                .focus_visible(|s| s.border_color(rgb(theme::RING)))
+                .text_size(px(theme::TEXT_CAPTION))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(if on { theme::BRAND } else { theme::FG_SOFT }))
+                .cursor_pointer()
+                .hover(|s| s.border_color(rgb(theme::BORDER_STRONG)))
+                .active(|s| s.opacity(0.85))
+                .child(icon(glyph, if on { theme::BRAND } else { theme::FG_SOFT }).size(px(12.)))
+                .child(label)
+        };
+        let mute = pill("track-mute", "Mute", "volume-x", m.mute)
+            .aria_label(SharedString::from(format!("Mute {name} for the whole clip")))
+            .on_click(
+                cx.listener(move |this, _, _, cx| this.edit_mix(t, cx, |m| m.mute = !m.mute)),
+            );
+        let solo = pill("track-solo", "Solo", "headphones", soloed)
+            .aria_label(SharedString::from(format!("Hear only {name} in the preview")))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.set_solo(if this.solo == Some(t) { None } else { Some(t) }, cx);
+            }));
+        let readout =
+            if m.gain_db == 0.0 { "0 dB".to_owned() } else { format!("{:+.1} dB", m.gain_db) };
+        let view = cx.entity().downgrade();
+        let gain = self.mix_sliders.get(t).map(|state| {
+            slider(
+                format!("track-gain-{t}"),
+                ((m.gain_db - MIX_MIN_DB) / (MIX_MAX_DB - MIX_MIN_DB)) as f32,
+                state,
+                move |f, _, cx| {
+                    let db = MIX_MIN_DB + f64::from(f) * (MIX_MAX_DB - MIX_MIN_DB);
+                    // Half-dB steps, and a catch at 0 dB so the original level is easy to find.
+                    let db = if db.abs() < 0.75 { 0.0 } else { (db * 2.0).round() / 2.0 };
+                    let _ = view.update(cx, |this, cx| this.edit_mix(t, cx, |m| m.gain_db = db));
+                },
+            )
+            .w(px(120.))
+            .min_w(px(80.))
+            .flex_none()
+            .role(Role::Slider)
+            .aria_label(SharedString::from(format!("{name} volume, {readout}")))
+        });
+        div()
+            .ml_auto()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(mute)
+            .child(solo)
+            .children(gain)
+            .child(
+                div()
+                    .id(("track-gain-reset", t))
+                    .w(px(56.))
+                    .text_size(px(theme::TEXT_CAPTION))
+                    .text_color(rgb(if m.gain_db == 0.0 { theme::MUTED_FG } else { theme::FG }))
+                    .cursor_pointer()
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.edit_mix(t, cx, |m| m.gain_db = 0.0)
+                        }),
+                    )
+                    .child(readout),
+            )
     }
 
     /// Saves an editor preference now, without touching the Settings screen's unsaved edits.
@@ -1411,12 +1551,12 @@ impl EditorView {
     /// Whether export should rebuild track 0 (Master) from the individually edited tracks `1..`.
     fn should_rebuild_master(&self) -> bool {
         self.timeline.pieces.first().is_some_and(|p| p.tracks.len() > 1)
-            && (self.tracks_open
-                || self
-                    .timeline
-                    .pieces
+            && self.timeline.pieces.iter().any(|p| {
+                mixed_tracks(&p.tracks, &self.mix)
                     .iter()
-                    .any(|p| p.tracks.iter().skip(1).any(|t| t.audio_edit() != AudioEdit::Keep)))
+                    .skip(1)
+                    .any(|t| t.audio_edit() != AudioEdit::Keep)
+            })
     }
 
     /// The plans for pieces `which`, or a message for the first that can't be made.
@@ -1427,8 +1567,10 @@ impl EditorView {
             .map(|&i| {
                 let piece = self.timeline.pieces.get(i).ok_or("That piece is gone.")?;
                 let info = &self.sources[piece.source].info;
+                let mixed =
+                    Piece { tracks: mixed_tracks(&piece.tracks, &self.mix), ..piece.clone() };
                 model::plan_piece(
-                    piece,
+                    &mixed,
                     info.duration,
                     &info.keyframes,
                     self.bitrate_bps,
@@ -1607,6 +1749,11 @@ impl EditorView {
                 self.sel_anchor = None;
                 cx.notify();
             }
+            "escape" if plain && self.range.is_some() => {
+                self.range = None;
+                self.ranging = false;
+                cx.notify();
+            }
             "escape" if plain && self.tool != TimelineTool::Select => {
                 self.set_tool(TimelineTool::Select, cx);
             }
@@ -1631,15 +1778,14 @@ impl EditorView {
 
 /// Converts a piece's track edits into preview [`Sound`] entries and optional solo track id.
 ///
-/// - Simple mode (`!separate_tracks`, or single-track clips): plays track 0 (Master).
-/// - Separate-tracks mode (`separate_tracks && tracks.len() > 1`):
-///   - With `solo = Some(t)`: plays only track `t`.
-///   - With `solo = None`: excludes Master (track 0) and mixes all individual tracks `1..` so
-///     muting, silencing, or adjusting volume on any track is heard accurately.
+/// `tracks` already have the mixer applied ([`mixed_tracks`]).
+///
+/// - A one-track clip plays track 0 (Master).
+/// - Otherwise, with `solo = Some(t)`, only track `t`; with `None`, the individual tracks `1..`
+///   mixed (not Master), so every edit to them is heard, as the export rebuilds Master from them.
 fn build_piece_sounds(
     tracks: &[TrackEdit],
     from_offset: Hns,
-    separate_tracks: bool,
     solo: Option<usize>,
 ) -> (Vec<Sound>, Option<usize>) {
     if tracks.is_empty() {
@@ -1652,7 +1798,7 @@ fn build_piece_sounds(
         line: edit.line_from(from_offset),
         silence_ranges: Vec::new(),
     };
-    if !separate_tracks || tracks.len() <= 1 {
+    if tracks.len() <= 1 {
         return (vec![to_sound(0, &tracks[0])], None);
     }
     if let Some(solo_idx) = solo.filter(|&i| i < tracks.len()) {
@@ -1809,7 +1955,8 @@ impl Render for EditorView {
 
         let empty = self.timeline.pieces.is_empty() && self.loading.is_empty();
         let tracks = self.timeline.pieces.first().map_or(0, |p| p.tracks.len());
-        let shown_tracks = if self.tracks_open { tracks } else { tracks.min(1) };
+        // A multi-track clip shows its own tracks, not Master (which export rebuilds from them).
+        let shown_tracks = if tracks > 1 { tracks - 1 } else { tracks };
         // Shell chrome: 48 px top bar + 28 px status bar.
         let available_h = (vp_h - 76.0).max(0.0);
         let extra_h = (if self.problem.is_some() { 48.0 } else { 0.0 })
@@ -3292,17 +3439,20 @@ impl EditorView {
         }
 
         let mut lanes = Vec::new();
-        let shown = if self.tracks_open { tracks } else { tracks.min(1) };
+        // A multi-track clip shows its own tracks; Master is rebuilt from them on export.
+        let first_lane = usize::from(tracks > 1);
         let track_audible = |t: usize| -> bool {
-            if !self.tracks_open || tracks <= 1 {
+            if tracks <= 1 {
                 t == 0
             } else if let Some(s) = self.solo {
                 t == s
             } else {
-                t > 0
+                !self.mix.get(t).is_some_and(|m| m.mute)
             }
         };
-        for t in 0..shown {
+        let lane_source = self.timeline.pieces.first().and_then(|p| self.sources.get(p.source));
+        for t in first_lane..tracks {
+            let lane_name = lane_source.map_or_else(|| track_name(t), |s| track_label(s, t));
             let audible = track_audible(t);
             let mut lane = div()
                 .relative()
@@ -3559,30 +3709,38 @@ impl EditorView {
                                     } else {
                                         theme::FG_SOFT
                                     }))
-                                    .child(
-                                        self.sources
-                                            .first()
-                                            .map_or_else(|| track_name(t), |s| track_label(s, t)),
-                                    ),
+                                    .child(lane_name.clone()),
                             )
-                            .children((t == 0).then(|| {
-                                let hint = if !self.tracks_open || tracks <= 1 {
-                                    "whole mix, plays by default"
-                                } else if self.solo == Some(0) {
-                                    "soloed \u{00b7} original mix"
-                                } else {
-                                    "bypassed in preview \u{00b7} rebuilt on export"
-                                };
-                                div().text_color(rgb(theme::MUTED_FG)).child(hint)
-                            })),
+                            .children(
+                                (tracks > 1).then(|| self.track_controls(t, lane_name.clone(), cx)),
+                            ),
                     )
                     .child(lane),
             );
         }
 
         let ph_x = x_of(self.player.playhead);
-        let playhead_line =
-            div().absolute().top_0().h_full().left(px(ph_x - 1.0)).w(px(2.)).bg(rgb(theme::FG));
+        // A 10 px grab area around the 2 px line: press and drag it to scrub (the strip's move
+        // handler follows `scrubbing`), instead of the press reordering the piece under it.
+        let playhead_line = div()
+            .absolute()
+            .top_0()
+            .h_full()
+            .left(px(ph_x - 5.0))
+            .w(px(10.))
+            .flex()
+            .justify_center()
+            .cursor_col_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.moving = None;
+                    this.scrubbing = true;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .child(div().w(px(2.)).h_full().bg(rgb(theme::FG)));
         let playhead_cap = div()
             .absolute()
             .top(px(-3.))
@@ -3798,27 +3956,6 @@ impl EditorView {
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.release(cx)))
             .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, cx| this.release(cx)));
 
-        let toggle = (tracks > 1).then(|| {
-            button_ghost(
-                "tracks-toggle",
-                if self.tracks_open {
-                    "Hide other tracks".to_owned()
-                } else {
-                    format!("Edit {} tracks separately", tracks - 1)
-                },
-            )
-            .text_size(px(theme::TEXT_CAPTION))
-            .child(icon("sliders-horizontal", theme::FG_SOFT).size(px(14.)))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.tracks_open = !this.tracks_open;
-                // Entering separate-tracks mode plays all individual tracks mixed together (not
-                // Master); clear any prior solo so the mix is heard immediately.
-                this.solo = None;
-                this.restart_if_playing(cx);
-                cx.notify();
-            }))
-        });
-
         let shortcut_hint = |key: &'static str, action: &'static str| {
             div().flex().flex_row().items_center().gap_1().child(kbd(key)).child(
                 div()
@@ -3860,9 +3997,7 @@ impl EditorView {
                             .child(shortcut_hint("J", "Join"))
                             .child(shortcut_hint("Alt+\u{2190}\u{2192}", "Move"))
                             .child(shortcut_hint("Ctrl+Z", "Undo")),
-                    )
-                    .child(div().flex_1())
-                    .children(toggle),
+                    ),
             )
             .child(head)
             .child(strip)
@@ -3872,7 +4007,7 @@ impl EditorView {
                     .line_height(px(17.))
                     .text_color(rgb(theme::MUTED_FG))
                     .child(
-                        "Drag a piece to reorder it (Shift+drag scrubs) \u{00b7} Alt+drag picks a range: Delete cuts it, G makes it a gap \u{00b7} Drag a lane and press Delete to silence a stretch \u{00b7} Click the volume line to add a point",
+                        "Drag the playhead (or Shift+drag) to scrub \u{00b7} Drag a piece to reorder it \u{00b7} Alt+drag picks a range: Delete cuts it, G makes it a gap \u{00b7} Drag a lane and press Delete to silence a stretch \u{00b7} Click the volume line to add a point",
                     ),
             )
     }
@@ -4021,13 +4156,7 @@ impl EditorView {
             })
             .child(div().h(px(1.)).w_full().bg(rgb(theme::BORDER_SUBTLE)));
 
-        let shown = if piece.gap {
-            0
-        } else if self.tracks_open {
-            piece.tracks.len()
-        } else {
-            piece.tracks.len().min(1)
-        };
+        let shown = if piece.gap { 0 } else { piece.tracks.len() };
         if shown > 0 {
             list = list.child(
                 div()
@@ -4037,14 +4166,12 @@ impl EditorView {
                     .child("Audio"),
             );
         }
-        let multi_track = self.tracks_open && piece.tracks.len() > 1;
-        for (t, edit) in piece.tracks.iter().enumerate().take(shown) {
-            let soloed = multi_track && self.solo == Some(t);
-            let in_mix = if multi_track {
-                self.solo.is_none() && t > 0 && !edit.mute
-            } else {
-                t == 0 && !edit.mute
-            };
+        // Master is rebuilt from the other tracks, so a multi-track clip edits those.
+        let first = usize::from(piece.tracks.len() > 1);
+        for (t, edit) in piece.tracks.iter().enumerate().take(shown).skip(first) {
+            let in_mix = !edit.mute
+                && !self.mix.get(t).is_some_and(|m| m.mute)
+                && self.solo.is_none_or(|s| s == t);
             list = list.child(
                 div()
                     .flex()
@@ -4054,72 +4181,18 @@ impl EditorView {
                     .rounded(px(theme::RADIUS_MD))
                     .bg(rgb(theme::SURFACE_INSET))
                     .border_1()
-                    .border_color(rgb(if soloed {
-                        theme::BRAND_BORDER
-                    } else {
-                        theme::BORDER_SUBTLE
-                    }))
+                    .border_color(rgb(theme::BORDER_SUBTLE))
                     .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(theme::TEXT_BODY))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(if soloed || in_mix {
-                                        theme::FG
-                                    } else {
-                                        theme::MUTED_FG
-                                    }))
-                                    .child(track_label(source, t)),
-                            )
-                            .children(multi_track.then(|| {
-                                if soloed {
-                                    div()
-                                        .id(("listen-solo", t))
-                                        .tab_stop(true)
-                                        .role(Role::Button)
-                                        .aria_label("Stop soloing track")
-                                        .h(px(theme::CONTROL_H))
-                                        .px(px(10.))
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(6.))
-                                        .rounded(px(theme::RADIUS_MD))
-                                        .bg(rgb(theme::BRAND_SOFT))
-                                        .border_1()
-                                        .border_color(rgb(theme::BRAND_BORDER))
-                                        .focus_visible(|s| s.border_color(rgb(theme::RING)))
-                                        .text_size(px(theme::TEXT_CAPTION))
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(rgb(theme::BRAND))
-                                        .cursor_pointer()
-                                        .hover(|s| s.border_color(rgb(theme::BRAND)))
-                                        .active(|s| s.opacity(0.85))
-                                        .child(icon("headphones", theme::BRAND).size(px(14.)))
-                                        .child("Listening")
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.set_solo(None, cx)),
-                                        )
-                                        .into_any_element()
-                                } else {
-                                    button_ghost(("listen", t), "Listen")
-                                        .px(px(10.))
-                                        .text_size(px(theme::TEXT_CAPTION))
-                                        .child(icon("headphones", theme::FG_SOFT).size(px(14.)))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.set_solo(Some(t), cx)
-                                        }))
-                                        .into_any_element()
-                                }
-                            })),
+                        div().flex().flex_row().items_center().gap_2().child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(theme::TEXT_BODY))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(if in_mix { theme::FG } else { theme::MUTED_FG }))
+                                .child(track_label(source, t)),
+                        ),
                     )
                     .child(
                         div()
@@ -4131,7 +4204,7 @@ impl EditorView {
                             .gap_2()
                             .child(number_stepper(
                                 format!("gain-{t}"),
-                                edit.gain_db,
+                                edit.level(),
                                 Stepper {
                                     min: -30.0,
                                     max: 12.0,
@@ -4141,7 +4214,7 @@ impl EditorView {
                                 },
                                 cx.listener(move |this, v: &f64, _, cx| {
                                     let v = *v;
-                                    this.edit_track(i, t, cx, |e| e.gain_db = v);
+                                    this.edit_track(i, t, cx, |e| e.set_piece_level(v));
                                 }),
                             ))
                             .child(labeled_toggle(
@@ -4166,7 +4239,7 @@ impl EditorView {
                     .child(if piece.gap {
                         "Drag the gap's edges on the timeline to change its length."
                     } else {
-                        "Muting here applies to this piece only."
+                        "These apply to this piece only. The controls above each lane apply to the whole track."
                     }),
             )
             .into_any_element(),
@@ -4409,19 +4482,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn separate_tracks_preview_excludes_master_and_mixes_individual_tracks() {
+    fn preview_mixes_individual_tracks_not_master() {
         let mut tracks = vec![TrackEdit::default(); 3];
         tracks[1].gain_db = -3.0;
         tracks[2].mute = true;
 
-        // Simple mode plays Master (track 0) only.
-        let (simple, solo) = build_piece_sounds(&tracks, Hns::ZERO, false, None);
+        // A one-track clip plays Master (track 0).
+        let (simple, solo) = build_piece_sounds(&tracks[..1], Hns::ZERO, None);
         assert_eq!(solo, None);
         assert_eq!(simple.len(), 1);
         assert_eq!(simple[0].track, 0);
 
-        // Separate-tracks mode without solo excludes Master (track 0) and returns tracks 1..
-        let (mixed, solo) = build_piece_sounds(&tracks, Hns::ZERO, true, None);
+        // A multi-track clip mixes tracks 1.., never Master.
+        let (mixed, solo) = build_piece_sounds(&tracks, Hns::ZERO, None);
         assert_eq!(solo, None);
         assert_eq!(mixed.len(), 2);
         assert_eq!(mixed[0].track, 1);
@@ -4431,7 +4504,7 @@ mod tests {
         assert!(mixed[1].mute);
 
         // Solo plays only the soloed track.
-        let (solo_sounds, solo) = build_piece_sounds(&tracks, Hns::ZERO, true, Some(1));
+        let (solo_sounds, solo) = build_piece_sounds(&tracks, Hns::ZERO, Some(1));
         assert_eq!(solo, Some(1));
         assert_eq!(solo_sounds.len(), 1);
         assert_eq!(solo_sounds[0].track, 1);

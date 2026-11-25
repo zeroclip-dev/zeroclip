@@ -32,7 +32,7 @@ use super::components::{
     slider::{SliderState, slider},
     status_dot::status_dot,
 };
-use super::editor::player::{Item, Player, Sound, pause_on_focus_loss};
+use super::editor::player::{Item, Player, Sound, pause_on_focus_loss, stop_audio_tree};
 use super::icons::icon;
 use super::theme;
 use crate::app::ZeroClipApp;
@@ -746,7 +746,7 @@ impl LiveAudio {
             return None;
         };
         let Some(mut sink_in) = sink.stdin.take() else {
-            stop_live_audio(sink, decoder);
+            stop_audio_tree(sink, vec![decoder]);
             return None;
         };
 
@@ -798,7 +798,7 @@ impl LiveAudio {
 
     fn shutdown(self) {
         self.stop.store(true, Ordering::Relaxed);
-        stop_live_audio(self.sink, self.decoder);
+        stop_audio_tree(self.sink, vec![self.decoder]);
     }
 }
 
@@ -812,34 +812,6 @@ fn no_window(cmd: &mut Command) {
     }
     #[cfg(not(windows))]
     let _ = cmd;
-}
-
-/// Kills the `ffplay` process tree (handles Chocolatey/Scoop shims) and the `ffmpeg` decoder on a
-/// background thread so pausing or closing never stalls the UI thread.
-/// <https://learn.microsoft.com/windows-server/administration/windows-commands/taskkill>
-fn stop_live_audio(mut sink: Child, mut decoder: Child) {
-    #[cfg(windows)]
-    let tree = {
-        let mut cmd = Command::new("taskkill");
-        cmd.args(["/F", "/T", "/PID", &sink.id().to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        no_window(&mut cmd);
-        cmd.spawn().ok()
-    };
-    // Killed here (quick), so quitting right after never leaves a process behind; only the waiting
-    // is left to a thread.
-    let _ = decoder.kill();
-    let _ = sink.kill();
-    std::thread::spawn(move || {
-        let _ = decoder.wait();
-        #[cfg(windows)]
-        if let Some(mut tree) = tree {
-            let _ = tree.wait();
-        }
-        let _ = sink.wait();
-    });
 }
 
 fn read_chunk(reader: &mut impl Read, buf: &mut [u8]) -> usize {
