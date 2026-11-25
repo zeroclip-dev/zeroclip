@@ -61,7 +61,6 @@ pub fn button_primary(
 }
 
 /// Larger 36 px primary CTA reserved for hero-level actions.
-#[allow(dead_code)]
 pub fn button_hero(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
@@ -81,7 +80,6 @@ pub fn button_ghost(
 }
 
 /// Destructive action (delete, discard, stop-and-erase). Red is reserved for recording and danger.
-#[allow(dead_code)]
 pub fn button_danger(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
