@@ -93,10 +93,28 @@ pub fn storage_line(minutes: u32, bitrate_bps: u64, free: Option<u64>) -> Storag
 }
 
 /// Free bytes on the drive that will hold the clips. The output folder may not exist yet, so
-/// the nearest folder that does is asked instead.
+/// the nearest folder that does is asked instead. Called while drawing, so the answer is kept
+/// for a few seconds instead of asking the disk on every frame.
 pub fn free_space(dir: &Path) -> Option<u64> {
-    let existing = dir.ancestors().find(|p| p.exists())?;
-    zc_win::drive::free_bytes(existing).ok()
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static LAST: Mutex<Option<(std::path::PathBuf, Instant, Option<u64>)>> = Mutex::new(None);
+    const KEEP: Duration = Duration::from_secs(5);
+    if let Ok(last) = LAST.lock()
+        && let Some((path, at, free)) = last.as_ref()
+        && path == dir
+        && at.elapsed() < KEEP
+    {
+        return *free;
+    }
+    let free = dir
+        .ancestors()
+        .find(|p| p.exists())
+        .and_then(|existing| zc_win::drive::free_bytes(existing).ok());
+    if let Ok(mut last) = LAST.lock() {
+        *last = Some((dir.to_path_buf(), Instant::now(), free));
+    }
+    free
 }
 
 #[cfg(test)]
