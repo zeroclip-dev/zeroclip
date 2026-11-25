@@ -41,6 +41,8 @@ pub struct Release {
 pub enum UpdateState {
     #[default]
     None,
+    /// "Check now" was clicked; the release query is running.
+    Checking,
     Available(Release),
     Downloading(Release),
     /// Downloaded and verified; waiting for a safe moment (not recording or saving) and a click.

@@ -55,6 +55,8 @@ pub struct VideoStart {
     pub keyframe_interval: Hns,
     /// Draw the mouse cursor into the capture (WGC `IsCursorCaptureEnabled`).
     pub capture_cursor: bool,
+    /// Encode height; the size is picked from the capture size when capture starts.
+    pub resolution: crate::settings::OutputResolution,
 }
 
 /// Parameters for starting an audio source.

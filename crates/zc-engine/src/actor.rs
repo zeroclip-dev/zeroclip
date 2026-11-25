@@ -573,6 +573,7 @@ fn video_start(settings: &Settings, target: CaptureTarget) -> VideoStart {
         max_bitrate_bps: v.max_bitrate_kbps.saturating_mul(1_000),
         keyframe_interval: v.keyframe_interval(),
         capture_cursor: v.capture_cursor,
+        resolution: v.resolution,
     }
 }
 

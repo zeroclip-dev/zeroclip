@@ -350,6 +350,40 @@ impl ZeroClipApp {
         }
     }
 
+    /// Settings' "Check now": asks for the latest release right away and, when there is a newer
+    /// one, downloads and installs it as if "Update" had been clicked.
+    pub fn check_update_now(&mut self, cx: &mut Context<Self>) {
+        match self.update {
+            UpdateState::None => {}
+            UpdateState::Available(_) => return self.start_update(cx),
+            UpdateState::Ready { .. } => return self.install_update(cx),
+            UpdateState::Checking | UpdateState::Downloading(_) => return,
+        }
+        self.update = UpdateState::Checking;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let found = cx.background_executor().spawn(async { update::check_latest() }).await;
+            let _ = this.update(cx, |app, cx| {
+                app.update = UpdateState::None;
+                match found {
+                    Ok(Some(release)) => {
+                        app.update = UpdateState::Available(release);
+                        app.start_update(cx);
+                    }
+                    Ok(None) => app.notify(
+                        NoticeLevel::Info,
+                        format!("ZeroClip v{} is up to date.", env!("CARGO_PKG_VERSION")),
+                    ),
+                    Err(error) => {
+                        app.notify(NoticeLevel::Error, format!("Update check failed: {error:#}"))
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Hides the update strip until the next check.
     pub fn dismiss_update(&mut self) {
         if let UpdateState::Available(_) = self.update {

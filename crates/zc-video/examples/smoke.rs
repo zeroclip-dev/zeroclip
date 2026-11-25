@@ -60,6 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_bitrate_bps: 20_000_000,
         keyframe_interval: Hns::from_secs(1),
         capture_cursor: true,
+        resolution: Default::default(),
     };
 
     let mut source = GpuVideoSource::new();

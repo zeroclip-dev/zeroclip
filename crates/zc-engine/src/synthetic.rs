@@ -315,6 +315,7 @@ mod tests {
             max_bitrate_bps: 0,
             keyframe_interval: Hns::from_secs(1),
             capture_cursor: false,
+            resolution: Default::default(),
         };
 
         source.start(&config, sink.clone(), health).expect("the synthetic source starts");
@@ -352,6 +353,7 @@ mod tests {
             max_bitrate_bps: 0,
             keyframe_interval: Hns::from_secs(1),
             capture_cursor: false,
+            resolution: Default::default(),
         };
         let mut source = SyntheticVideoSource::new();
         source.start(&config, sink.clone(), health).expect("the synthetic source starts");
