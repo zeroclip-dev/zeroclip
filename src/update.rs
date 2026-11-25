@@ -216,7 +216,7 @@ pub fn download(release: &Release) -> anyhow::Result<PathBuf> {
     Ok(staged)
 }
 
-/// The release asset holding `ffmpeg.exe`, `ffprobe.exe` and ffmpeg's licence (a pinned gyan.dev
+/// The release asset holding `ffmpeg.exe`, `ffprobe.exe`, `ffplay.exe` (preview sound) and ffmpeg's licence (a pinned gyan.dev
 /// build repacked by the release workflow).
 pub const FFMPEG_ASSET: &str = "ffmpeg-windows-x64.zip";
 
@@ -251,8 +251,8 @@ pub fn install_ffmpeg() -> anyhow::Result<()> {
             if !status.success() {
                 bail!("couldn't unpack {FFMPEG_ASSET}");
             }
-            // ffprobe first: `locate` keys on ffmpeg.exe, so it only appears once both are there.
-            for name in ["LICENSE-ffmpeg.txt", "ffprobe.exe", "ffmpeg.exe"] {
+            // ffmpeg.exe last: `locate` keys on it, so it only appears once the others are there.
+            for name in ["LICENSE-ffmpeg.txt", "ffprobe.exe", "ffplay.exe", "ffmpeg.exe"] {
                 std::fs::rename(unpack.join(name), dir.join(name))
                     .with_context(|| format!("couldn't move {name} into place"))?;
             }

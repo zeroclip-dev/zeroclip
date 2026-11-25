@@ -82,7 +82,7 @@ jobs:
           $bin = (Get-ChildItem ffmpeg-src -Recurse -Filter ffmpeg.exe | Select-Object -First 1).DirectoryName
           $license = Get-ChildItem ffmpeg-src -Recurse -Filter LICENSE | Select-Object -First 1
           New-Item -ItemType Directory -Force ffmpeg | Out-Null
-          Copy-Item "$bin/ffmpeg.exe", "$bin/ffprobe.exe" ffmpeg/
+          Copy-Item "$bin/ffmpeg.exe", "$bin/ffprobe.exe", "$bin/ffplay.exe" ffmpeg/
           $source = "ffmpeg 9.1 essentials build by gyan.dev, licensed GPL v3.`nBuild: $env:FFMPEG_URL`nSource: https://ffmpeg.org/releases/ffmpeg-9.1.tar.xz and https://www.gyan.dev/ffmpeg/builds/`n`n"
           [IO.File]::WriteAllText("$PWD/ffmpeg/LICENSE-ffmpeg.txt", $source + (Get-Content $license.FullName -Raw))
 

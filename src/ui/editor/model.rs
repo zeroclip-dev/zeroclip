@@ -412,6 +412,60 @@ impl TrackEdit {
     }
 }
 
+impl TrackEdit {
+    /// The level the piece's dB control shows: the flat level, or the line's loudest point.
+    pub fn level(&self) -> f64 {
+        if self.has_line() {
+            self.points.iter().map(|p| p.db).fold(f64::MIN, f64::max)
+        } else {
+            self.gain_db
+        }
+    }
+
+    /// Sets [`Self::level`] to `db`. A line moves up or down as a whole, keeping its shape (a flat
+    /// `gain_db` is ignored while a line exists, so changing only that would do nothing).
+    pub fn set_piece_level(&mut self, db: f64) {
+        if self.has_line() {
+            let by = db - self.level();
+            for p in &mut self.points {
+                p.db += by;
+            }
+        } else {
+            self.gain_db = db;
+        }
+    }
+}
+
+/// A whole audio track's settings in the editor's mixer, on top of every piece's own edits.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TrackMix {
+    pub mute: bool,
+    pub gain_db: f64,
+}
+
+/// A piece's track edits as they sound with the mixer applied: a muted track mutes every piece,
+/// and the track's gain raises or lowers each piece's level or line. Preview and export both use
+/// this, so they always agree.
+pub fn mixed_tracks(tracks: &[TrackEdit], mix: &[TrackMix]) -> Vec<TrackEdit> {
+    tracks
+        .iter()
+        .enumerate()
+        .map(|(t, edit)| {
+            let m = mix.get(t).copied().unwrap_or_default();
+            let mut out = edit.clone();
+            out.mute |= m.mute;
+            if out.points.len() >= 2 {
+                for p in &mut out.points {
+                    p.db += m.gain_db;
+                }
+            } else {
+                out.gain_db += m.gain_db;
+            }
+            out
+        })
+        .collect()
+}
+
 /// A range `[a, b)` of source clip `source`, with its own audio edits.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Piece {
@@ -1312,6 +1366,42 @@ mod tests {
         assert!(!seam_joinable(&mk(0, 0, 5_000), &mk(1, 5_000, 10_000), secs(10), 1000.0));
         // Reordered / overlapping pieces -> never joinable.
         assert!(!seam_joinable(&mk(0, 5_000, 10_000), &mk(0, 0, 5_000), secs(10), 1000.0));
+    }
+
+    #[test]
+    fn mixer_applies_on_top_of_piece_edits() {
+        let line = TrackEdit {
+            points: vec![
+                EnvPoint { at: Hns::ZERO, db: -6.0 },
+                EnvPoint { at: Hns::from_secs(2), db: 0.0 },
+            ],
+            ..TrackEdit::default()
+        };
+        let flat = TrackEdit { gain_db: 3.0, ..TrackEdit::default() };
+        let mix = [TrackMix::default(), TrackMix { mute: false, gain_db: -4.0 }];
+        let out = mixed_tracks(&[flat.clone(), line.clone(), flat.clone()], &mix);
+        assert_eq!(out[0], flat, "a track with no mixer entry is untouched");
+        assert_eq!(out[1].points.iter().map(|p| p.db).collect::<Vec<_>>(), [-10.0, -4.0]);
+        assert_eq!(out[2].gain_db, 3.0);
+        let muted = mixed_tracks(&[flat], &[TrackMix { mute: true, gain_db: 0.0 }]);
+        assert_eq!(muted[0].audio_edit(), AudioEdit::Mute);
+    }
+
+    #[test]
+    fn piece_level_moves_a_line_as_a_whole() {
+        let mut e = TrackEdit {
+            points: vec![
+                EnvPoint { at: Hns::ZERO, db: -6.0 },
+                EnvPoint { at: Hns::from_secs(2), db: 0.0 },
+            ],
+            ..TrackEdit::default()
+        };
+        assert_eq!(e.level(), 0.0);
+        e.set_piece_level(3.0);
+        assert_eq!(e.points.iter().map(|p| p.db).collect::<Vec<_>>(), [-3.0, 3.0]);
+        let mut flat = TrackEdit::default();
+        flat.set_piece_level(-5.0);
+        assert_eq!((flat.level(), flat.gain_db), (-5.0, -5.0));
     }
 
     #[test]
