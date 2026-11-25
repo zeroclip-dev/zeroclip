@@ -373,8 +373,29 @@ impl WgcCapture {
                 let closed = frame.Close();
                 handled.and(closed)
             });
-        let token = pool.FrameArrived(&handler).map_err(err("FrameArrived"))?;
-        let session = pool.CreateCaptureSession(item).map_err(err("CreateCaptureSession"))?;
+        let token = pool.FrameArrived(&handler).map_err(|e| {
+            let _ = pool.Close();
+            capture_error("FrameArrived", &e)
+        })?;
+        // Past this point a failure must undo what exists so far, or the pool and its
+        // FrameArrived handler (which owns the frame callback) outlive the failed start.
+        let undo = |session: Option<&GraphicsCaptureSession>, closed_token: Option<i64>| {
+            if let Some(closed_token) = closed_token {
+                let _ = item.RemoveClosed(closed_token);
+            }
+            let _ = pool.RemoveFrameArrived(token);
+            if let Some(session) = session {
+                let _ = session.Close();
+            }
+            let _ = pool.Close();
+        };
+        let session = match pool.CreateCaptureSession(item) {
+            Ok(session) => session,
+            Err(e) => {
+                undo(None, None);
+                return Err(capture_error("CreateCaptureSession", &e));
+            }
+        };
         // Windows 11 only; older systems keep the yellow border.
         if let Err(e) = session.SetIsBorderRequired(false) {
             tracing::debug!(%e, "can't hide the capture border");
@@ -390,13 +411,22 @@ impl WgcCapture {
         }
         let closed = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&closed);
-        let closed_token = item
-            .Closed(&TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(move |_, _| {
+        let closed_token = match item.Closed(
+            &TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(move |_, _| {
                 flag.store(true, Ordering::Release);
                 Ok(())
-            }))
-            .map_err(err("GraphicsCaptureItem::Closed"))?;
-        session.StartCapture().map_err(err("StartCapture"))?;
+            }),
+        ) {
+            Ok(token) => token,
+            Err(e) => {
+                undo(Some(&session), None);
+                return Err(capture_error("GraphicsCaptureItem::Closed", &e));
+            }
+        };
+        if let Err(e) = session.StartCapture() {
+            undo(Some(&session), Some(closed_token));
+            return Err(capture_error("StartCapture", &e));
+        }
         Ok(Self { pool, session, item: item.clone(), token, closed_token, closed })
     }
 
