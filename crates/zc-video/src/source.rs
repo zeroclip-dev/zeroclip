@@ -186,9 +186,15 @@ impl VideoSource for GpuVideoSource {
         *self.shared.screenshot.lock().map_err(|_| SourceError::Other("poisoned lock".into()))? =
             Some(tx);
         self.shared.screenshot_wanted.store(true, Ordering::Release);
-        let (staging, size) = rx
-            .recv_timeout(Duration::from_secs(2))
-            .map_err(|_| SourceError::Other("no frame captured yet".into()))??;
+        let Ok(shot) = rx.recv_timeout(Duration::from_secs(2)) else {
+            // Withdraw the request, or a late frame would take a screenshot nobody waits for.
+            self.shared.screenshot_wanted.store(false, Ordering::Release);
+            if let Ok(mut slot) = self.shared.screenshot.lock() {
+                *slot = None;
+            }
+            return Err(SourceError::Other("no frame captured yet".into()));
+        };
+        let (staging, size) = shot?;
         save_png(context, &staging, size, path)
     }
 }
