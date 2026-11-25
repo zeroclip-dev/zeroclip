@@ -518,6 +518,9 @@ fn renamed_path(path: &Path, stem: &str) -> Result<PathBuf, String> {
     if stem.ends_with('.') {
         return Err("A name can't end with a dot.".into());
     }
+    if zc_core::fs_name::is_reserved_name(stem) {
+        return Err("Windows reserves that name.".into());
+    }
     let name = match path.extension().and_then(|e| e.to_str()) {
         Some(ext) => format!("{stem}.{ext}"),
         None => stem.to_owned(),
@@ -1586,6 +1589,7 @@ mod tests {
         assert!(renamed_path(path, "a/b").is_err());
         assert!(renamed_path(path, "what?").is_err());
         assert!(renamed_path(path, "dots.").is_err());
+        assert!(renamed_path(path, "NUL").is_err());
         assert!(renamed_path(path, "old").is_err(), "the same name is refused");
     }
 

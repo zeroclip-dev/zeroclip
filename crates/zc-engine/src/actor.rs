@@ -1561,14 +1561,9 @@ impl Actor {
 
     /// Where a `kind` file ("Clips", "Recordings", "Screenshots") goes under the chosen layout.
     fn media_dir(&self, kind: &str) -> PathBuf {
-        let game = self.status.game.as_deref().map(|g| g.strip_suffix(".exe").unwrap_or(g));
-        match (self.settings.recording.layout, game) {
+        match (self.settings.recording.layout, self.status.game.as_deref()) {
             (StorageLayout::PerGame, Some(game)) => {
-                let safe: String = game
-                    .chars()
-                    .map(|c| if r#"<>:"/\|?*"#.contains(c) || c.is_control() { '_' } else { c })
-                    .collect();
-                self.output_dir.join(safe.trim()).join(kind)
+                self.output_dir.join(zc_core::fs_name::safe_folder_name(game)).join(kind)
             }
             _ => self.output_dir.clone(),
         }
