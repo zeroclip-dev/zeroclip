@@ -167,6 +167,8 @@ pub struct EditorView {
     thumb_cache: ThumbCache<Arc<RenderImage>>,
     /// Keys currently being decoded on a background thread so we never spawn duplicates.
     thumb_in_flight: HashSet<ThumbKey>,
+    /// Thumbnails ffmpeg gave nothing for: not asked again (cleared with the project).
+    thumb_failed: HashSet<ThumbKey>,
     focus: Option<FocusHandle>,
     /// Subscription pausing playback when the OS window loses focus or is minimised.
     window_activation_sub: Option<gpui::Subscription>,
@@ -292,6 +294,7 @@ impl EditorView {
             tool: TimelineTool::Select,
             thumb_cache: ThumbCache::default(),
             thumb_in_flight: HashSet::new(),
+            thumb_failed: HashSet::new(),
             focus: None,
             window_activation_sub: None,
             window_active: true,
@@ -370,6 +373,7 @@ impl EditorView {
         self.tool = TimelineTool::Select;
         self.paused_on_blur = false;
         self.thumb_in_flight.clear();
+        self.thumb_failed.clear();
     }
 
     /// Reads `path` in the background, then puts it at the end of the timeline.
@@ -425,8 +429,9 @@ impl EditorView {
                 let same_audio = |s: StreamInfo| StreamInfo { audio_tracks: 0, ..s };
                 // Compare with a clip still on the timeline: a deleted clip stays in `sources`
                 // for undo, but must not block a clip that only has to match what is left.
-                if let Some(first) =
-                    self.timeline.pieces.first().and_then(|p| self.sources.get(p.source))
+                // A gap only borrows a clip's layout and may name a deleted one: skip it.
+                let first_piece = self.timeline.pieces.iter().find(|p| !p.gap);
+                if let Some(first) = first_piece.and_then(|p| self.sources.get(p.source))
                     && let Err(error) = zc_editor::concat::check_compatible(&[
                         same_audio(first.info.stream),
                         same_audio(info.stream),
@@ -447,7 +452,7 @@ impl EditorView {
                         _ => track_name(t),
                     })
                     .collect();
-                let old_names: Option<Vec<String>> = self.timeline.pieces.first().map(|p| {
+                let old_names: Option<Vec<String>> = first_piece.map(|p| {
                     (0..p.tracks.len()).map(|t| track_label(&self.sources[p.source], t)).collect()
                 });
                 let tracks = old_names.as_ref().map_or(own, |old| {
@@ -590,19 +595,27 @@ impl EditorView {
     ) {
         let mut pending = Vec::new();
         for key in keys {
-            if self.thumb_cache.get(&key).is_some() {
+            if self.thumb_cache.get(&key).is_some() || self.thumb_failed.contains(&key) {
                 continue;
             }
             if self.thumb_in_flight.insert(key.clone()) {
-                pending.push(key);
+                // Rounding to a bucket can land past the end of the clip, where ffmpeg has no frame.
+                let last = self
+                    .sources
+                    .iter()
+                    .find(|s| s.path == key.path)
+                    .map_or(Hns::from_ticks(i64::MAX), |s| {
+                        (s.info.duration - Hns::from_millis(100)).max(Hns::ZERO)
+                    });
+                pending.push((key.timestamp().min(last), key));
             }
         }
         if pending.is_empty() {
             return;
         }
         cx.spawn(async move |this, cx| {
-            for key in pending {
-                let (ffmpeg_c, path, at) = (ffmpeg.clone(), key.path.clone(), key.timestamp());
+            for (at, key) in pending {
+                let (ffmpeg_c, path) = (ffmpeg.clone(), key.path.clone());
                 let image = cx
                     .background_executor()
                     .spawn(async move {
@@ -610,14 +623,20 @@ impl EditorView {
                     })
                     .await;
                 let alive = this.update(cx, |this, cx| {
+                    // A new project cleared the bookkeeping; this answer is for the old one.
+                    if generation != this.generation {
+                        return false;
+                    }
                     this.thumb_in_flight.remove(&key);
                     if let Some(image) = image {
                         if let Some(evicted) = this.thumb_cache.insert(key, image) {
                             this.player.spent.push(evicted);
                         }
                         cx.notify();
+                    } else {
+                        this.thumb_failed.insert(key);
                     }
-                    generation == this.generation
+                    true
                 });
                 if !alive.unwrap_or(false) {
                     break;
@@ -650,6 +669,7 @@ impl EditorView {
                 let key = ThumbKey::new(source.path.clone(), target);
                 if self.thumb_cache.get(&key).is_none()
                     && !self.thumb_in_flight.contains(&key)
+                    && !self.thumb_failed.contains(&key)
                     && missing.len() < 24
                 {
                     missing.push(key);
@@ -1011,7 +1031,12 @@ impl EditorView {
             self.commit_move(m.from, m.target, cx);
         }
         let edited_audio = self.drag.is_some();
-        self.trim = None;
+        let trimmed = self.trim.take().is_some();
+        if trimmed {
+            // The trim may have shortened the timeline under the playhead.
+            self.player.playhead = self.player.playhead.min(self.timeline.total());
+            self.restart_if_playing(cx);
+        }
         self.end_scrub(cx);
         self.drag = None;
         self.ranging = false;
@@ -1412,6 +1437,14 @@ impl EditorView {
         model::join_gap_limit(self.disp_total(), width)
     }
 
+    /// After a split or join: a picked range or selection no longer matches the pieces (Delete
+    /// would silence a stretch past a piece's end), and playback has to pick up the new pieces.
+    fn structure_changed(&mut self, cx: &mut Context<Self>) {
+        self.range = None;
+        self.sel = None;
+        self.restart_if_playing(cx);
+    }
+
     /// Joins piece `i` and `i + 1`. Shared by the `J` shortcut and the seam join button.
     fn join_at(&mut self, i: usize, cx: &mut Context<Self>) {
         let max_gap = self.current_join_limit();
@@ -1420,6 +1453,7 @@ impl EditorView {
             Ok(j) => {
                 self.problem = None;
                 self.selected = Some(j);
+                self.structure_changed(cx);
             }
             Err(message) => {
                 self.undo.pop();
@@ -1455,6 +1489,7 @@ impl EditorView {
                 self.redo.clear();
                 self.problem = None;
                 self.selected = Some(new);
+                self.structure_changed(cx);
             }
             Err(message) => self.problem = Some(message),
         }
@@ -1472,6 +1507,8 @@ impl EditorView {
         let at = self.timeline.start_of(i);
         self.checkpoint();
         self.timeline.delete(i);
+        self.range = None;
+        self.sel = None;
         self.problem = None;
         self.seek(at, cx);
         if self.timeline.pieces.is_empty() {
@@ -1759,6 +1796,7 @@ impl EditorView {
         let sources: Vec<PathBuf> = self.sources.iter().map(|s| s.path.clone()).collect();
         let infos: Vec<StreamInfo> = self.sources.iter().map(|s| s.info.stream).collect();
         self.export = Export::Running(label.to_owned());
+        let generation = self.generation;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -1774,11 +1812,16 @@ impl EditorView {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.export = match result {
+                let export = match result {
                     Ok((files, took)) => Export::Done { files, took },
                     Err(error) => Export::Failed(format!("{error:#}")),
                 };
-                this.report_export(cx);
+                // The result of a project that was closed since: still announced and the Clips
+                // list refreshed, but the new project's export state is not its to set.
+                this.report_export(&export, cx);
+                if generation == this.generation {
+                    this.export = export;
+                }
                 cx.notify();
             });
         })
@@ -1786,8 +1829,8 @@ impl EditorView {
     }
 
     /// Mirrors the export result into the activity feed and refreshes the Clips list.
-    fn report_export(&mut self, cx: &mut Context<Self>) {
-        let (level, text) = match &self.export {
+    fn report_export(&self, export: &Export, cx: &mut Context<Self>) {
+        let (level, text) = match export {
             Export::Done { files, took } => (
                 NoticeLevel::Info,
                 format!(
