@@ -25,19 +25,20 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, S
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
     CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection, CreateFontW,
-    CreateSolidBrush, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, Ellipse, FillRect, GdiFlush,
-    GetDC, HBITMAP, HDC, HGDIOBJ, OUT_DEFAULT_PRECIS, ReleaseDC, SelectObject, SetBkMode,
+    CreateSolidBrush, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
+    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, Ellipse, FillRect,
+    GdiFlush, GetDC, HBITMAP, HDC, HGDIOBJ, OUT_DEFAULT_PRECIS, ReleaseDC, SelectObject, SetBkMode,
     SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, HWND_TOPMOST, KillTimer, MSG,
-    PostMessageW, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SetTimer, SetWindowDisplayAffinity, SetWindowPos, ShowWindow, TranslateMessage,
-    ULW_ALPHA, UpdateLayeredWindow, WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_TIMER, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GWL_EXSTYLE, GetMessageW, GetWindowLongPtrW,
+    HWND_TOPMOST, KillTimer, MSG, PostMessageW, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetTimer, SetWindowDisplayAffinity, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow,
+    WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_LBUTTONDOWN, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::w;
 
@@ -46,6 +47,10 @@ const CARD_W: f32 = 300.0;
 const CARD_H: f32 = 60.0;
 const RADIUS: f32 = 10.0;
 const MARGIN: f32 = 24.0;
+/// The alert popup is larger than the card, and has a close button in its top-right corner.
+const ALERT_W: f32 = 360.0;
+const ALERT_H: f32 = 92.0;
+const CLOSE_SIZE: f32 = 36.0;
 
 const WM_SHOW: u32 = WM_APP + 1;
 const TICK: usize = 1;
@@ -73,6 +78,9 @@ pub struct Toast {
     pub hold: Duration,
     /// Fade-in and fade-out, each. Zero shows and hides it at once.
     pub fade: Duration,
+    /// A failure popup: larger, an alert icon, and a close (x) button. It takes clicks (the card
+    /// does not), and a plain card can't replace it while it is up.
+    pub alert: bool,
 }
 
 /// The toast waiting for the window thread to pick it up. A newer one replaces it.
@@ -90,6 +98,11 @@ pub fn show(toast: Toast) -> Result<(), String> {
     // SAFETY: the window belongs to a thread that runs for the life of the process.
     unsafe { PostMessageW(Some(HWND(*hwnd as *mut c_void)), WM_SHOW, WPARAM(0), LPARAM(0)) }
         .map_err(|e| e.to_string())
+}
+
+/// The overlay window, if it has been made. Other Win32 helpers use it as an owner window.
+pub(crate) fn window() -> Option<HWND> {
+    WINDOW.get()?.as_ref().ok().map(|h| HWND(*h as *mut c_void))
 }
 
 /// Starts the window thread and waits for it to say whether the window exists.
@@ -164,6 +177,9 @@ struct Live {
     hold: Duration,
     fade: Duration,
     ticks: u32,
+    /// The close button's hit area in window pixels, for an alert.
+    close: Option<RECT>,
+    alert: bool,
 }
 
 impl Live {
@@ -205,7 +221,8 @@ fn colorref(rgb: u32) -> COLORREF {
 
 /// Draws the card into a new bitmap.
 fn render(toast: &Toast, scale: f32) -> Option<Live> {
-    let (w, h) = ((CARD_W * scale).round() as i32, (CARD_H * scale).round() as i32);
+    let (cw, ch) = if toast.alert { (ALERT_W, ALERT_H) } else { (CARD_W, CARD_H) };
+    let (w, h) = ((cw * scale).round() as i32, (ch * scale).round() as i32);
     // SAFETY: GDI calls on handles made here; the bitmap's pixels are read and written only
     // between `CreateDIBSection` and `DeleteObject`, within its `w * h` size.
     unsafe {
@@ -240,8 +257,8 @@ fn render(toast: &Toast, scale: f32) -> Option<Live> {
         fill(RECT { left: 0, top: 0, right: w, bottom: h }, toast.border);
         fill(RECT { left: 1, top: 1, right: w - 1, bottom: h - 1 }, toast.background);
 
-        // The status dot.
-        let dot = (10.0 * scale).round() as i32;
+        // The status dot, or for an alert a larger disc with a "!" in it.
+        let dot = ((if toast.alert { 28.0 } else { 10.0 }) * scale).round() as i32;
         let (dx, dy) = ((16.0 * scale).round() as i32, (h - dot) / 2);
         let brush = CreateSolidBrush(colorref(toast.accent));
         let before = SelectObject(dc, brush.into());
@@ -249,11 +266,9 @@ fn render(toast: &Toast, scale: f32) -> Option<Live> {
         SelectObject(dc, before);
         let _ = DeleteObject(brush.into());
 
-        // The text: a semibold title, and a smaller muted line under it.
         SetBkMode(dc, TRANSPARENT);
-        let left = dx + dot + (12.0 * scale).round() as i32;
-        let line = |dc: HDC, text: &str, px: f32, weight: i32, rgb: u32, top: i32, bottom: i32| {
-            let font = CreateFontW(
+        let font_for = |px: f32, weight: i32| {
+            CreateFontW(
                 -((px * scale).round() as i32),
                 0,
                 0,
@@ -268,10 +283,41 @@ fn render(toast: &Toast, scale: f32) -> Option<Live> {
                 CLEARTYPE_QUALITY,
                 0,
                 w!("Segoe UI"),
-            );
+            )
+        };
+        let centered = |dc: HDC, text: &str, px: f32, rgb: u32, mut rect: RECT| {
+            let font = font_for(px, 700);
             let before = SelectObject(dc, font.into());
             SetTextColor(dc, colorref(rgb));
-            let mut rect = RECT { left, top, right: w - (12.0 * scale).round() as i32, bottom };
+            let mut wide: Vec<u16> = text.encode_utf16().collect();
+            DrawTextW(
+                dc,
+                &mut wide,
+                &mut rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            SelectObject(dc, before);
+            let _ = DeleteObject(font.into());
+        };
+        let mut close = None;
+        let mut right_pad = (12.0 * scale).round() as i32;
+        if toast.alert {
+            let glyph = RECT { left: dx, top: dy, right: dx + dot, bottom: dy + dot };
+            centered(dc, "!", 17.0, toast.background, glyph);
+            let side = (CLOSE_SIZE * scale).round() as i32;
+            let hit = RECT { left: w - side - 4, top: 4, right: w - 4, bottom: 4 + side };
+            centered(dc, "×", 22.0, toast.muted, hit);
+            close = Some(hit);
+            right_pad = side + 8;
+        }
+
+        // The text: a semibold title, and a smaller muted line under it.
+        let left = dx + dot + (12.0 * scale).round() as i32;
+        let line = |dc: HDC, text: &str, px: f32, weight: i32, rgb: u32, top: i32, bottom: i32| {
+            let font = font_for(px, weight);
+            let before = SelectObject(dc, font.into());
+            SetTextColor(dc, colorref(rgb));
+            let mut rect = RECT { left, top, right: w - right_pad, bottom };
             let mut wide: Vec<u16> = text.encode_utf16().collect();
             DrawTextW(
                 dc,
@@ -333,6 +379,8 @@ fn render(toast: &Toast, scale: f32) -> Option<Live> {
             hold: toast.hold,
             fade: toast.fade,
             ticks: 0,
+            close,
+            alert: toast.alert,
         })
     }
 }
@@ -371,6 +419,18 @@ fn raise(hwnd: HWND) {
     };
 }
 
+/// Hides the card and frees its bitmap.
+fn dismiss(hwnd: HWND) {
+    // SAFETY: `hwnd` is our window.
+    unsafe {
+        let _ = KillTimer(Some(hwnd), TICK);
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+    if let Some(old) = LIVE.with_borrow_mut(Option::take) {
+        old.free();
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_SHOW => {
@@ -378,7 +438,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let Some(toast) = toast else { return LRESULT(0) };
             // SAFETY: reads the system DPI; no arguments.
             let scale = unsafe { GetDpiForSystem() } as f32 / 96.0;
+            // A plain card never knocks an alert off the screen.
+            let alert_up =
+                LIVE.with_borrow(|l| l.as_ref().is_some_and(|l| l.alert && l.alpha().is_some()));
+            if alert_up && !toast.alert {
+                return LRESULT(0);
+            }
             let Some(live) = render(&toast, scale) else { return LRESULT(0) };
+            // An alert takes clicks, for its close button; a card passes them through.
+            // SAFETY: reads and writes our own window's extended style.
+            unsafe {
+                let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                let clicks = WS_EX_TRANSPARENT.0 as isize;
+                let ex = if toast.alert { ex & !clicks } else { ex | clicks };
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+            }
             present(hwnd, &live, live.alpha().unwrap_or(255));
             // SAFETY: `hwnd` is our window. SW_SHOWNOACTIVATE shows it without taking focus.
             unsafe {
@@ -408,14 +482,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
             });
             if done {
-                // SAFETY: `hwnd` is our window.
-                unsafe {
-                    let _ = KillTimer(Some(hwnd), TICK);
-                    let _ = ShowWindow(hwnd, SW_HIDE);
-                }
-                if let Some(old) = LIVE.with_borrow_mut(Option::take) {
-                    old.free();
-                }
+                dismiss(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            // The click's position is the low and high words of `lp`, in client pixels.
+            let (x, y) = ((lp.0 & 0xFFFF) as i16 as i32, ((lp.0 >> 16) & 0xFFFF) as i16 as i32);
+            let hit = LIVE.with_borrow(|l| {
+                l.as_ref()
+                    .and_then(|l| l.close)
+                    .is_some_and(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+            });
+            if hit {
+                dismiss(hwnd);
             }
             LRESULT(0)
         }

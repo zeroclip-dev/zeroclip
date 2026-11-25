@@ -3,12 +3,14 @@
 
 use gpui::{
     Context, FontWeight, IntoElement, ParentElement, StatefulInteractiveElement as _, Styled, div,
+    px, rgb,
 };
 use zc_core::control::FocusChoice;
 use zc_core::focus_prompt::is_shell;
 
 use super::components::banner::banner as strip;
-use super::components::button::button;
+use super::components::button::{button, button_ghost, button_primary};
+use super::{icons, theme};
 use crate::app::ZeroClipApp;
 
 /// A focus prompt on screen: the game being clipped, and the app that has focus (file names).
@@ -42,30 +44,58 @@ pub fn banner(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> Option<impl I
     let prompt = app.focus_prompt.as_ref()?;
     Some(
         strip()
+            .px_4()
+            .py_2()
+            .gap_3()
+            .border_color(rgb(theme::WARN_BORDER))
             .child(
-                div().font_weight(FontWeight::SEMIBOLD).child(format!(
-                    "Clipping {}. {} is in focus.",
-                    prompt.current, prompt.candidate
-                )),
+                div()
+                    .flex_1()
+                    .min_w(px(220.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(icons::icon("gamepad-2", theme::WARN))
+                    .child(
+                        div()
+                            .text_size(px(theme::TEXT_BODY))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(theme::FG))
+                            .child(format!(
+                                "Clipping {}. {} is in focus.",
+                                prompt.current, prompt.candidate
+                            )),
+                    ),
             )
-            .child(button("fp-keep", format!("Keep {}", prompt.current)).on_click(cx.listener(
-                |app, _, _, cx| {
-                    app.answer_focus_prompt(FocusChoice::Keep);
-                    cx.notify();
-                },
-            )))
-            .child(button("fp-switch", format!("Switch to {}", prompt.candidate)).on_click(
-                cx.listener(|app, _, _, cx| {
-                    app.answer_focus_prompt(FocusChoice::Switch);
-                    cx.notify();
-                }),
-            ))
-            .child(button("fp-desktop", "Clip desktop").on_click(cx.listener(|app, _, _, cx| {
-                // The tracked game stays as it is; only the capture mode changes.
-                app.answer_focus_prompt(FocusChoice::Keep);
-                app.clip_desktop();
-                cx.notify();
-            }))),
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(button_primary("fp-keep", format!("Keep {}", prompt.current)).on_click(
+                        cx.listener(|app, _, _, cx| {
+                            app.answer_focus_prompt(FocusChoice::Keep);
+                            cx.notify();
+                        }),
+                    ))
+                    .child(button("fp-switch", format!("Switch to {}", prompt.candidate)).on_click(
+                        cx.listener(|app, _, _, cx| {
+                            app.answer_focus_prompt(FocusChoice::Switch);
+                            cx.notify();
+                        }),
+                    ))
+                    .child(button_ghost("fp-desktop", "Clip desktop").on_click(cx.listener(
+                        |app, _, _, cx| {
+                            // The tracked game stays as it is; only the capture mode changes.
+                            app.answer_focus_prompt(FocusChoice::Keep);
+                            app.clip_desktop();
+                            cx.notify();
+                        },
+                    ))),
+            ),
     )
 }
 

@@ -28,6 +28,7 @@ pub mod main_window;
 pub mod memory;
 pub mod message_thread;
 pub mod mf;
+pub mod notify;
 pub mod overlay;
 pub mod process;
 pub mod shell;

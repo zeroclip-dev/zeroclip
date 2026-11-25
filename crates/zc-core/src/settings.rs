@@ -46,6 +46,12 @@ pub struct Settings {
     /// excluded from capture, so they never end up in a recording.
     #[serde(default = "default_overlay_toasts")]
     pub overlay_toasts: bool,
+    /// Video player playback preferences (volume and mute).
+    #[serde(default)]
+    pub player: PlayerSettings,
+    /// The editor preview's volume and mute, kept apart from the clip player's.
+    #[serde(default)]
+    pub editor_volume: PlayerSettings,
 }
 
 fn default_overlay_toasts() -> bool {
@@ -68,6 +74,8 @@ impl Default for Settings {
             app: AppSettings::default(),
             ui_mode: UiMode::default(),
             overlay_toasts: default_overlay_toasts(),
+            player: PlayerSettings::default(),
+            editor_volume: PlayerSettings::default(),
         }
     }
 }
@@ -178,6 +186,22 @@ pub struct EditorSettings {
     pub finish: FinishChoice,
     /// The audio track the preview plays (0 is Master). Remembered between sessions.
     pub listen_track: u8,
+}
+
+/// Video player playback preferences, remembered across clips and restarts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlayerSettings {
+    /// Output volume percentage (`0..=100`).
+    pub volume: u8,
+    /// Whether playback audio is muted.
+    pub muted: bool,
+}
+
+impl Default for PlayerSettings {
+    fn default() -> Self {
+        Self { volume: 100, muted: false }
+    }
 }
 
 /// What the editor does when you press Done.
@@ -678,5 +702,14 @@ storage = \"disk\"
         assert!(problems.iter().any(|p| p == "Every app track needs a label."));
         assert!(problems.iter().any(|p| p.contains("\"Spotify\" needs an executable name")));
         assert_eq!(problems.len(), 2, "{problems:#?}");
+    }
+
+    #[test]
+    fn player_settings_default_and_round_trip() {
+        assert_eq!(Settings::default().player, PlayerSettings { volume: 100, muted: false });
+        let older: Settings = toml::from_str("[video]\nfps = 60\n").unwrap();
+        assert_eq!(older.player, PlayerSettings { volume: 100, muted: false });
+        let saved: Settings = toml::from_str("[player]\nvolume = 65\nmuted = true\n").unwrap();
+        assert_eq!(saved.player, PlayerSettings { volume: 65, muted: true });
     }
 }

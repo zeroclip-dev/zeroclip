@@ -14,6 +14,57 @@ use zc_editor::snap::snap_in_point;
 /// The shortest piece a split may leave.
 pub const MIN_PIECE: Hns = Hns::from_millis(100);
 
+/// Active pointer tool on the editor timeline (`V` = Select, `S` = Split).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TimelineTool {
+    /// Default pointer mode: click selects, drags scrub/trim/envelope only.
+    #[default]
+    Select,
+    /// Razor mode: clicking on the timeline splits at the clicked time.
+    Split,
+}
+
+/// How long "Add gap" makes a black, silent piece.
+pub const DEFAULT_GAP: Hns = Hns::from_secs(2);
+
+/// Maximum source-time gap between two adjacent pieces of the same clip that can be joined (`0.25 s`).
+pub const JOIN_GAP_THRESHOLD: Hns = Hns::from_millis(250);
+
+/// Maximum pixel gap at the current timeline zoom under which adjacent same-clip pieces show a
+/// join button on their seam.
+pub const JOIN_SEAM_MAX_PX: f32 = 6.0;
+
+/// Maximum source-time gap permitted for joining at the current timeline zoom: at least
+/// [`JOIN_GAP_THRESHOLD`] (`0.25 s`), or whatever duration spans [`JOIN_SEAM_MAX_PX`] px
+/// (capped at `2.0 s` so extreme zoom-out on long recordings never bridges large deleted cuts).
+#[must_use]
+pub fn join_gap_limit(disp_total: Hns, timeline_width: f32) -> Hns {
+    let px_gap = if disp_total > Hns::ZERO && timeline_width > 0.0 {
+        let secs = disp_total.as_secs_f64() * f64::from(JOIN_SEAM_MAX_PX / timeline_width);
+        Hns::from_secs_f64(secs)
+    } else {
+        Hns::ZERO
+    };
+    JOIN_GAP_THRESHOLD.max(px_gap).min(Hns::from_secs(2))
+}
+
+/// Whether two adjacent timeline pieces (`first` followed by `second`) touch or sit within the
+/// join gap threshold (under `0.25 s` or `6 px` at the current zoom) so a join button should
+/// appear on their seam.
+#[must_use]
+pub fn seam_joinable(first: &Piece, second: &Piece, disp_total: Hns, timeline_width: f32) -> bool {
+    // A black gap is not part of any clip: never offer to join across one.
+    if first.gap || second.gap || first.source != second.source {
+        return false;
+    }
+    // Reject overlapping or reordered pieces (tolerance of 1 ms for keyframe rounding).
+    if second.a + Hns::from_millis(1) < first.b {
+        return false;
+    }
+    let gap = (second.a - first.b).max(Hns::ZERO);
+    gap <= join_gap_limit(disp_total, timeline_width)
+}
+
 /// x offset of `t` on a bar `width` px wide that spans `duration`.
 pub fn time_to_x(t: Hns, duration: Hns, width: f32) -> f32 {
     if duration <= Hns::ZERO {
@@ -348,6 +399,10 @@ pub struct Piece {
     pub b: Hns,
     /// One per audio track of the source.
     pub tracks: Vec<TrackEdit>,
+    /// A black, silent stretch, not a part of a clip. `source` then only names a clip whose
+    /// picture size, frame rate and audio layout the exported gap copies; `a..b` is just its
+    /// length (it has no source to run past, so it can be any length).
+    pub gap: bool,
 }
 
 impl Piece {
@@ -355,14 +410,40 @@ impl Piece {
         self.b - self.a
     }
 
+    /// A black, silent gap `len` long that matches clip `source` and its `tracks` audio tracks.
+    pub fn new_gap(source: usize, len: Hns, tracks: usize) -> Self {
+        Self {
+            source,
+            a: Hns::ZERO,
+            b: len.max(MIN_PIECE),
+            tracks: vec![TrackEdit::default(); tracks],
+            gap: true,
+        }
+    }
+
+    /// The stretch `from..to` into this piece (offsets from its start) as a piece of its own. The
+    /// audio edits keep their place in the sound, as in [`Self::trimmed`].
+    pub fn part(&self, from: Hns, to: Hns) -> Self {
+        if self.gap {
+            return Self { a: Hns::ZERO, b: to - from, ..self.clone() };
+        }
+        let tracks = self.tracks.iter().map(|t| t.resized(from, to - from)).collect();
+        Self { source: self.source, a: self.a + from, b: self.a + to, tracks, gap: false }
+    }
+
     /// This piece with its range changed to `a..b` of a source `duration` long (kept inside it and
     /// at least `MIN_PIECE` long). The audio edits keep their place in the sound.
     pub fn trimmed(&self, a: Hns, b: Hns, duration: Hns) -> Self {
+        if self.gap {
+            // A gap has no clip to stay inside: only its length is limited.
+            let a = a.min(b - MIN_PIECE);
+            return Self { a, b, ..self.clone() };
+        }
         let a = a.clamp(Hns::ZERO, (b - MIN_PIECE).max(Hns::ZERO));
         let b = b.clamp(a + MIN_PIECE, duration.max(a + MIN_PIECE));
         let (shift, span) = (a - self.a, b - a);
         let tracks = self.tracks.iter().map(|t| t.resized(shift, span)).collect();
-        Self { source: self.source, a, b, tracks }
+        Self { source: self.source, a, b, tracks, gap: false }
     }
 }
 
@@ -405,6 +486,9 @@ impl Timeline {
     pub fn split(&mut self, t: Hns, keyframes: &[Hns]) -> Result<usize, String> {
         let (i, at) = self.locate(t).ok_or("There is nothing to split.")?;
         let piece = &self.pieces[i];
+        if piece.gap {
+            return Err("A gap can't be split. Resize it by its edges instead.".to_owned());
+        }
         // A stream copy can only start on a keyframe, so the cut goes on the keyframe nearest the
         // playhead (before or after it) that leaves both pieces long enough.
         let distance = |k: Hns| (k.as_secs_f64() - at.as_secs_f64()).abs();
@@ -427,25 +511,36 @@ impl Timeline {
     }
 
     /// Joins piece `i` and the one after it back into one, when they are neighbours in the same
-    /// clip (what a split made). Returns the joined piece's index.
+    /// clip within [`JOIN_GAP_THRESHOLD`]. Returns the joined piece's index.
+    #[cfg(test)]
     pub fn join(&mut self, i: usize) -> Result<usize, String> {
+        self.join_within(i, JOIN_GAP_THRESHOLD)
+    }
+
+    /// Like [`Self::join`], allowing a source-time gap up to `max_gap` between `pieces[i].b` and
+    /// `pieces[i + 1].a` (matching [`seam_joinable`] at the current zoom).
+    pub fn join_within(&mut self, i: usize, max_gap: Hns) -> Result<usize, String> {
         let (Some(first), Some(second)) = (self.pieces.get(i), self.pieces.get(i + 1)) else {
             return Err("There is no piece after this one to join.".to_owned());
         };
-        let gap = (second.a.as_secs_f64() - first.b.as_secs_f64()).abs();
-        if first.source != second.source || gap > 0.001 {
+        if first.gap || second.gap {
+            return Err("A gap can't be joined to a clip.".to_owned());
+        }
+        let overlap_tol = Hns::from_millis(1);
+        let gap = (second.a - first.b).max(Hns::ZERO);
+        if first.source != second.source || second.a + overlap_tol < first.b || gap > max_gap {
             return Err("These two pieces aren't side by side in the same clip, so they can't \
                         be joined. Undo the changes between them, or add the clip again."
                 .to_owned());
         }
-        let (len, next_len) = (first.span(), second.span());
+        let (len, next_len) = (first.span() + gap, second.span());
         let tracks = first
             .tracks
             .iter()
             .zip(&second.tracks)
             .map(|(x, y)| x.joined(len, y, next_len))
             .collect();
-        let joined = Piece { source: first.source, a: first.a, b: second.b, tracks };
+        let joined = Piece { source: first.source, a: first.a, b: second.b, tracks, gap: false };
         self.pieces[i] = joined;
         self.pieces.remove(i + 1);
         Ok(i)
@@ -458,6 +553,134 @@ impl Timeline {
         }
     }
 
+    /// Moves piece `from` so it sits at index `to` (the other pieces keep their order and close
+    /// up around it). Returns the piece's new index, or `None` when `from` is out of range. `to`
+    /// past the end means last.
+    pub fn move_piece(&mut self, from: usize, to: usize) -> Option<usize> {
+        if from >= self.pieces.len() {
+            return None;
+        }
+        let to = to.min(self.pieces.len() - 1);
+        let piece = self.pieces.remove(from);
+        self.pieces.insert(to, piece);
+        Some(to)
+    }
+
+    /// Puts a black, silent gap `len` long at piece boundary `at` (`0` is the very start, `len()`
+    /// the end), matching clip `source` and `tracks` audio tracks. Returns the gap's index.
+    pub fn insert_gap(&mut self, at: usize, len: Hns, source: usize, tracks: usize) -> usize {
+        let at = at.min(self.pieces.len());
+        self.pieces.insert(at, Piece::new_gap(source, len, tracks));
+        at
+    }
+
+    /// Whether a split at timeline time `t` would work: on a clip (not a gap), at least
+    /// [`MIN_PIECE`] from both of its edges, with a keyframe to cut on. Drives the razor preview
+    /// and the click, so the line is dimmed exactly when a click would do nothing.
+    pub fn can_split_at(&self, t: Hns, keyframes: &[Hns]) -> bool {
+        let Some((i, at)) = self.locate(t) else { return false };
+        let p = &self.pieces[i];
+        !p.gap
+            && at >= p.a + MIN_PIECE
+            && at <= p.b - MIN_PIECE
+            && keyframes.iter().any(|&k| k >= p.a + MIN_PIECE && k <= p.b - MIN_PIECE)
+    }
+
+    /// Timeline time `t`, pulled onto the nearest piece boundary (the start, every seam and the
+    /// end) when one is within `within`.
+    pub fn snap_time(&self, t: Hns, within: Hns) -> Hns {
+        (0..=self.pieces.len())
+            .map(|i| self.start_of(i))
+            .filter(|&b| (b - t).ticks().abs() <= within.ticks())
+            .min_by_key(|&b| (b - t).ticks().abs())
+            .unwrap_or(t)
+    }
+
+    /// Cuts `a..b` out and closes the gap (ripple delete): pieces are cut at both ends and
+    /// everything inside goes. A leftover shorter than [`MIN_PIECE`] is removed with the range.
+    /// Returns the range actually removed, or `None` when it is shorter than [`MIN_PIECE`].
+    pub fn cut_range(&mut self, a: Hns, b: Hns) -> Option<(Hns, Hns)> {
+        self.replace_range(a, b, false)
+    }
+
+    /// Like [`Self::cut_range`], but leaves a black, silent gap of the same length where the
+    /// range was, so everything after it keeps its place.
+    pub fn gap_range(&mut self, a: Hns, b: Hns) -> Option<(Hns, Hns)> {
+        self.replace_range(a, b, true)
+    }
+
+    fn replace_range(&mut self, a: Hns, b: Hns, make_gap: bool) -> Option<(Hns, Hns)> {
+        let (mut a, mut b) = clamp_range(a, b, self.total())?;
+        // Absorb slivers: an end that would leave a shorter-than-minimum scrap of a piece moves
+        // out to that piece's edge instead.
+        let mut s = Hns::ZERO;
+        for p in &self.pieces {
+            let e = s + p.span();
+            if s < a && a < e && a - s < MIN_PIECE {
+                a = s;
+            }
+            if s < b && b < e && e - b < MIN_PIECE {
+                b = e;
+            }
+            s = e;
+        }
+        let (source, tracks) = {
+            let (i, _) = self.locate(a)?;
+            (self.pieces[i].source, self.pieces[0].tracks.len())
+        };
+        let mut out = Vec::with_capacity(self.pieces.len() + 2);
+        let mut s = Hns::ZERO;
+        let mut gap_done = !make_gap;
+        for p in std::mem::take(&mut self.pieces) {
+            let e = s + p.span();
+            if e <= a || s >= b {
+                out.push(p);
+            } else {
+                if a > s {
+                    out.push(p.part(Hns::ZERO, a - s));
+                }
+                if !gap_done {
+                    out.push(Piece::new_gap(source, b - a, tracks));
+                    gap_done = true;
+                }
+                if b < e {
+                    out.push(p.part(b - s, e - s));
+                }
+            }
+            s = e;
+        }
+        self.pieces = out;
+        Some((a, b))
+    }
+
+    /// The name of piece `i`: its letter (gaps don't use one up), or "Gap".
+    pub fn label(&self, i: usize) -> String {
+        match self.pieces.get(i) {
+            Some(p) if p.gap => "Gap".to_owned(),
+            _ => piece_label(self.pieces.iter().take(i).filter(|p| !p.gap).count()),
+        }
+    }
+
+    /// "Piece A", or "Gap".
+    pub fn title(&self, i: usize) -> String {
+        match self.pieces.get(i) {
+            Some(p) if p.gap => "Gap".to_owned(),
+            _ => format!("Piece {}", self.label(i)),
+        }
+    }
+
+    /// The piece boundary (`0..=len`) closest to timeline time `t`.
+    pub fn boundary_near(&self, t: Hns) -> usize {
+        let mut best = (0, (t - Hns::ZERO).ticks().abs());
+        for i in 1..=self.pieces.len() {
+            let d = (t - self.start_of(i)).ticks().abs();
+            if d < best.1 {
+                best = (i, d);
+            }
+        }
+        best.0
+    }
+
     /// Moves piece `i` one place left (`-1`) or right (`1`). Returns its new index.
     pub fn shift(&mut self, i: usize, by: isize) -> Option<usize> {
         let j =
@@ -465,6 +688,20 @@ impl Timeline {
         self.pieces.swap(i, j);
         Some(j)
     }
+}
+
+/// A picked range `a..b` put in order and kept inside a timeline `total` long. `None` when it is
+/// shorter than [`MIN_PIECE`], so a click never counts as a range.
+pub fn clamp_range(a: Hns, b: Hns, total: Hns) -> Option<(Hns, Hns)> {
+    let (a, b) = (a.min(b).max(Hns::ZERO), a.max(b).min(total));
+    (b - a >= MIN_PIECE).then_some((a, b))
+}
+
+/// Where a dragged piece would land: among pieces whose displayed middles are `mids` (in
+/// order, `from` being the one dragged), the index it takes when dropped with its pointer at
+/// `x`. That is the number of other pieces whose middle is left of the pointer.
+pub fn move_target(mids: &[f32], from: usize, x: f32) -> usize {
+    mids.iter().enumerate().filter(|&(j, &m)| j != from && m < x).count()
 }
 
 /// "A", "B", ... "Z", "AA", "AB"... for piece `i`.
@@ -497,18 +734,29 @@ pub struct PiecePlan {
     pub range: (Hns, Hns),
     /// The start is not on a keyframe, so the video must be re-encoded to begin exactly there.
     pub reencode: bool,
-    /// One entry per audio track of the source.
+    /// When `true` (and `tracks.len() > 1`), export rebuilds track 0 (Master) as the mix of the
+    /// individually edited tracks `1..` via `edit_audio_rebuilding_master`.
+    pub rebuild_master: bool,
+    /// Audio tracks to export: track 0 only in simple mode, or every track when rebuilding Master.
     pub tracks: Vec<AudioTrack>,
+    /// A black, silent gap made by ffmpeg (as long as `range`), not cut from `source`; the source
+    /// only says which clip's picture size, frame rate and codec it matches.
+    pub gap: bool,
 }
 
 impl PiecePlan {
-    /// Whether any audio track is re-encoded.
+    /// Whether any audio track is re-encoded or Master must be rebuilt from separate tracks.
     pub fn has_audio_edits(&self) -> bool {
-        self.tracks.iter().any(|t| t.edit != AudioEdit::Keep)
+        (self.rebuild_master && self.tracks.len() > 1)
+            || self.tracks.iter().any(|t| t.edit != AudioEdit::Keep)
     }
 }
 
 /// The plan for `piece`, whose source is `duration` long and has `keyframes`.
+///
+/// When `rebuild_master` is `true` and the piece has separate source tracks (`tracks.len() > 1`),
+/// every track is included so export rebuilds track 0 (Master) from the edited `1..` tracks.
+/// Otherwise only track 0 (Master) is exported.
 ///
 /// # Errors
 /// When the piece is empty.
@@ -517,23 +765,48 @@ pub fn plan_piece(
     duration: Hns,
     keyframes: &[Hns],
     bitrate_bps: u32,
+    rebuild_master: bool,
 ) -> Result<PiecePlan, String> {
     // The start stays where the user put it. Off a keyframe it costs a re-encode, not accuracy.
     let start = piece.a;
     if piece.b <= start {
         return Err("A piece is empty.".to_owned());
     }
+    if piece.gap {
+        // Same track count as the clip pieces it is joined to; nothing in it is edited.
+        let count = if rebuild_master { piece.tracks.len() } else { piece.tracks.len().min(1) };
+        return Ok(PiecePlan {
+            source: piece.source,
+            trim: None,
+            range: (Hns::ZERO, piece.span()),
+            reencode: false,
+            rebuild_master: false,
+            tracks: vec![AudioTrack { edit: AudioEdit::Keep, bitrate_bps }; count],
+            gap: true,
+        });
+    }
     let off_keyframe = (snapped_start(keyframes, start).ticks() - start.ticks()).abs() > 10_000;
     let whole = start == Hns::ZERO && piece.b >= duration;
-    let tracks =
-        // Only the Master track (the first) goes into an export; the other tracks are left out.
-        piece.tracks.iter().take(1).map(|t| AudioTrack { edit: t.audio_edit(), bitrate_bps }).collect();
+    let rebuild = rebuild_master && piece.tracks.len() > 1;
+    let tracks = if rebuild {
+        piece.tracks.iter().map(|t| AudioTrack { edit: t.audio_edit(), bitrate_bps }).collect()
+    } else {
+        // Simple mode: only the Master track (the first) goes into an export.
+        piece
+            .tracks
+            .iter()
+            .take(1)
+            .map(|t| AudioTrack { edit: t.audio_edit(), bitrate_bps })
+            .collect()
+    };
     Ok(PiecePlan {
         source: piece.source,
         trim: (!whole).then_some((start, piece.b)),
         range: (start, piece.b),
         reencode: off_keyframe,
+        rebuild_master: rebuild,
         tracks,
+        gap: false,
     })
 }
 
@@ -580,6 +853,7 @@ mod tests {
                 a: Hns::ZERO,
                 b: secs(duration),
                 tracks: vec![TrackEdit::default(); 2],
+                gap: false,
             }],
         }
     }
@@ -712,6 +986,216 @@ mod tests {
         assert_eq!(t.shift(0, -1), None);
     }
 
+    fn three() -> Timeline {
+        let mut t = one(20);
+        t.split(secs(6), &keyframes()).unwrap();
+        t.split(secs(12), &keyframes()).unwrap();
+        t
+    }
+
+    #[test]
+    fn moving_a_piece_reorders_and_keeps_the_rest_in_order() {
+        let mut t = three(); // A 0-6, B 6-12, C 12-20
+        let starts = |t: &Timeline| t.pieces.iter().map(|p| p.a).collect::<Vec<_>>();
+        assert_eq!(t.move_piece(0, 2), Some(2));
+        assert_eq!(starts(&t), [secs(6), secs(12), Hns::ZERO]);
+        assert_eq!(t.move_piece(2, 0), Some(0));
+        assert_eq!(starts(&t), [Hns::ZERO, secs(6), secs(12)]);
+        // Past the end means last; same place changes nothing; a missing piece is refused.
+        assert_eq!(t.move_piece(0, 99), Some(2));
+        assert_eq!(t.move_piece(1, 1), Some(1));
+        assert_eq!(t.move_piece(7, 0), None);
+        assert_eq!(t.total(), secs(20));
+    }
+
+    #[test]
+    fn a_drag_lands_after_the_pieces_whose_middle_it_passed() {
+        let mids = [10.0, 30.0, 50.0];
+        assert_eq!(move_target(&mids, 0, 5.0), 0);
+        assert_eq!(move_target(&mids, 0, 40.0), 1);
+        assert_eq!(move_target(&mids, 0, 90.0), 2);
+        assert_eq!(move_target(&mids, 2, 5.0), 0);
+        assert_eq!(move_target(&mids, 1, 20.0), 1);
+    }
+
+    #[test]
+    fn a_gap_goes_at_a_boundary_and_counts_in_the_totals() {
+        let mut t = three();
+        let at = t.insert_gap(1, DEFAULT_GAP, 0, 2);
+        assert_eq!(at, 1);
+        assert!(t.pieces[1].gap);
+        assert_eq!(t.pieces[1].span(), secs(2));
+        assert_eq!(t.total(), secs(22));
+        assert_eq!(t.start_of(2), secs(8));
+        // Time inside the gap lands in the gap; just after it, in the next piece.
+        assert_eq!(t.locate(secs(7)).map(|l| l.0), Some(1));
+        assert_eq!(t.locate(secs(9)).map(|l| l.0), Some(2));
+        // Past the end clamps to the end.
+        assert_eq!(t.insert_gap(99, secs(1), 0, 2), 4);
+    }
+
+    #[test]
+    fn gaps_do_not_use_up_a_letter() {
+        let mut t = three();
+        t.insert_gap(1, DEFAULT_GAP, 0, 2);
+        let names: Vec<String> = (0..t.pieces.len()).map(|i| t.label(i)).collect();
+        assert_eq!(names, ["A", "Gap", "B", "C"]);
+    }
+
+    #[test]
+    fn the_nearest_boundary_is_found_from_the_playhead() {
+        let t = three(); // boundaries at 0, 6, 12, 20 s
+        assert_eq!(t.boundary_near(secs(1)), 0);
+        assert_eq!(t.boundary_near(secs(5)), 1);
+        assert_eq!(t.boundary_near(secs(13)), 2);
+        assert_eq!(t.boundary_near(secs(19)), 3);
+        assert_eq!(Timeline::default().boundary_near(secs(5)), 0);
+    }
+
+    #[test]
+    fn a_gap_resizes_freely_from_either_edge_down_to_the_minimum() {
+        let gap = Piece::new_gap(0, secs(2), 2);
+        // Right edge out past anything a clip could offer.
+        assert_eq!(gap.trimmed(gap.a, secs(500), secs(20)).span(), secs(500));
+        // Left edge in shortens it; a drag far past the right edge stops at MIN_PIECE.
+        assert_eq!(
+            gap.trimmed(Hns::from_millis(500), gap.b, secs(20)).span(),
+            Hns::from_millis(1_500)
+        );
+        assert_eq!(gap.trimmed(secs(9), gap.b, secs(20)).span(), MIN_PIECE);
+        // Left edge out lengthens it, even before zero.
+        assert_eq!(gap.trimmed(secs(-3), gap.b, secs(20)).span(), secs(5));
+        assert!(gap.trimmed(gap.a, gap.b, secs(20)).gap);
+    }
+
+    #[test]
+    fn a_gap_is_never_joined_split_or_exported_as_a_cut() {
+        let mut t = three();
+        t.insert_gap(1, DEFAULT_GAP, 0, 2);
+        let (before, gap, after) = (t.pieces[0].clone(), t.pieces[1].clone(), t.pieces[2].clone());
+        // Even when the pieces beside it would join, nothing joins across or into the gap.
+        assert!(!seam_joinable(&before, &gap, secs(22), 1000.0));
+        assert!(!seam_joinable(&gap, &after, secs(22), 1000.0));
+        assert!(t.join(0).is_err());
+        assert!(t.join(1).is_err());
+        assert!(t.split(secs(7), &keyframes()).is_err());
+        assert_eq!(t.pieces.len(), 4);
+    }
+
+    #[test]
+    fn a_gap_plans_as_black_silence_with_the_neighbours_track_count() {
+        let t = {
+            let mut t = one(20);
+            t.insert_gap(1, secs(3), 0, 2);
+            t
+        };
+        let simple = plan_piece(&t.pieces[1], secs(20), &keyframes(), 96_000, false).unwrap();
+        assert!(simple.gap && !simple.reencode && !simple.rebuild_master);
+        assert_eq!(simple.trim, None);
+        assert_eq!(simple.range, (Hns::ZERO, secs(3)));
+        assert_eq!(simple.tracks.len(), 1);
+        assert!(!simple.has_audio_edits());
+        let rebuilt = plan_piece(&t.pieces[1], secs(20), &keyframes(), 96_000, true).unwrap();
+        assert_eq!(rebuilt.tracks.len(), 2);
+        assert_eq!(rebuilt.tracks[0].bitrate_bps, 96_000);
+        // The clip beside it is planned as before.
+        assert!(!plan_piece(&t.pieces[0], secs(20), &keyframes(), 96_000, false).unwrap().gap);
+    }
+
+    #[test]
+    fn an_edge_dragged_gap_with_a_shifted_start_still_plans_its_length() {
+        let gap = Piece::new_gap(0, secs(2), 1).trimmed(secs(-1), secs(2), secs(20));
+        let plan = plan_piece(&gap, secs(20), &keyframes(), 96_000, false).unwrap();
+        assert_eq!(plan.range.1, secs(3));
+    }
+
+    fn spans(t: &Timeline) -> Vec<(Hns, Hns, bool)> {
+        t.pieces.iter().map(|p| (p.a, p.b, p.gap)).collect()
+    }
+
+    #[test]
+    fn cutting_a_range_closes_up_across_pieces() {
+        let mut t = three(); // A 0-6, B 6-12, C 12-20
+        assert_eq!(t.cut_range(secs(4), secs(14)), Some((secs(4), secs(14))));
+        assert_eq!(spans(&t), [(Hns::ZERO, secs(4), false), (secs(14), secs(20), false)]);
+        assert_eq!(t.total(), secs(10));
+        // Backwards and over-long ranges are put in order and kept inside.
+        let mut t = three();
+        assert_eq!(t.cut_range(secs(30), secs(18)), Some((secs(18), secs(20))));
+        assert_eq!(t.total(), secs(18));
+    }
+
+    #[test]
+    fn a_cut_leaves_no_sliver_shorter_than_the_minimum() {
+        let mut t = three();
+        // 50 ms into A and 50 ms short of the end of C: both scraps go with the range.
+        let a = Hns::from_millis(50);
+        let b = secs(20) - Hns::from_millis(50);
+        assert_eq!(t.cut_range(a, b), Some((Hns::ZERO, secs(20))));
+        assert!(t.pieces.is_empty());
+        // Too short to be a range at all.
+        assert_eq!(three().cut_range(secs(3), secs(3) + Hns::from_millis(50)), None);
+        let mut t = three();
+        t.cut_range(secs(3), secs(9));
+        assert!(t.pieces.iter().all(|p| p.span() >= MIN_PIECE));
+    }
+
+    #[test]
+    fn a_range_cut_keeps_each_tracks_volume_line() {
+        let mut t = one(20);
+        t.pieces[0].tracks[0].add_point(secs(15), -20.0, secs(20));
+        let before = t.pieces[0].tracks[0].db_at(secs(17));
+        t.cut_range(secs(2), secs(8)); // the dip now sits at 9 s of the 14 s that remain
+        assert_eq!(t.pieces.len(), 2);
+        assert_eq!(t.pieces[1].a, secs(8));
+        assert!((t.pieces[1].tracks[0].db_at(secs(9)) - before).abs() < 1.5);
+    }
+
+    #[test]
+    fn a_range_becomes_a_gap_of_the_same_length() {
+        let mut t = three();
+        assert_eq!(t.gap_range(secs(4), secs(14)), Some((secs(4), secs(14))));
+        assert_eq!(
+            spans(&t),
+            [(Hns::ZERO, secs(4), false), (Hns::ZERO, secs(10), true), (secs(14), secs(20), false)]
+        );
+        assert_eq!(t.total(), secs(20));
+        assert_eq!(t.pieces[1].tracks.len(), 2);
+        // Inside one piece it splits that piece around the gap.
+        let mut t = one(20);
+        t.gap_range(secs(5), secs(7));
+        assert_eq!(t.pieces.len(), 3);
+        assert!(t.pieces[1].gap);
+        assert_eq!(t.total(), secs(20));
+    }
+
+    #[test]
+    fn times_snap_to_piece_boundaries_within_reach() {
+        let t = three(); // boundaries 0, 6, 12, 20
+        let tol = Hns::from_millis(200);
+        assert_eq!(t.snap_time(Hns::from_millis(6_150), tol), secs(6));
+        assert_eq!(t.snap_time(Hns::from_millis(11_700), tol), Hns::from_millis(11_700));
+        assert_eq!(t.snap_time(Hns::from_millis(100), tol), Hns::ZERO);
+        assert_eq!(clamp_range(secs(9), secs(3), secs(20)), Some((secs(3), secs(9))));
+        assert_eq!(clamp_range(secs(3), secs(3), secs(20)), None);
+    }
+
+    #[test]
+    fn splitting_needs_a_clip_room_each_side_and_a_keyframe() {
+        let mut t = three(); // A 0-6, B 6-12, C 12-20
+        let k = keyframes(); // every 2 s
+        assert!(t.can_split_at(secs(4), &k));
+        // Too close to an edge.
+        assert!(!t.can_split_at(secs(6) + Hns::from_millis(50), &k));
+        assert!(!t.can_split_at(secs(12) - Hns::from_millis(50), &k));
+        // No keyframe to cut on inside the piece.
+        assert!(!t.can_split_at(secs(4), &[Hns::ZERO]));
+        // A gap and the space past the end.
+        t.insert_gap(1, secs(2), 0, 2);
+        assert!(!t.can_split_at(secs(7), &k));
+        assert!(!t.can_split_at(secs(99), &k));
+    }
+
     #[test]
     fn labels_run_a_to_z_then_aa() {
         assert_eq!(piece_label(0), "A");
@@ -723,8 +1207,9 @@ mod tests {
 
     #[test]
     fn an_untouched_whole_piece_is_neither_trimmed_nor_re_encoded() {
-        let plan = plan_piece(&one(20).pieces[0], secs(20), &keyframes(), 160_000).unwrap();
+        let plan = plan_piece(&one(20).pieces[0], secs(20), &keyframes(), 160_000, false).unwrap();
         assert_eq!(plan.trim, None);
+        assert!(!plan.rebuild_master);
         assert!(!plan.has_audio_edits());
     }
 
@@ -734,23 +1219,97 @@ mod tests {
         t.split(secs(6), &keyframes()).unwrap();
         t.pieces[1].tracks[1].mute = true;
         t.pieces[1].tracks[0].gain_db = 3.0;
-        let plan = plan_piece(&t.pieces[1], secs(20), &keyframes(), 96_000).unwrap();
+        let plan = plan_piece(&t.pieces[1], secs(20), &keyframes(), 96_000, false).unwrap();
         assert_eq!(plan.trim, Some((secs(6), secs(20))));
         assert_eq!(plan.tracks[0].edit, AudioEdit::Gain { db: 3.0 });
-        // Only Master is exported, so the muted second track is left out.
+        // Simple mode: only Master is exported, so the muted second track is left out.
         assert_eq!(plan.tracks.len(), 1);
+        assert!(!plan.rebuild_master);
         assert!(plan.has_audio_edits());
+    }
+
+    #[test]
+    fn rebuild_master_plan_keeps_all_tracks_and_triggers_audio_pass() {
+        let mut t = one(20);
+        t.pieces[0].tracks[1].mute = true;
+        let plan = plan_piece(&t.pieces[0], secs(20), &keyframes(), 160_000, true).unwrap();
+        assert!(plan.rebuild_master);
+        assert_eq!(plan.tracks.len(), 2);
+        assert_eq!(plan.tracks[1].edit, AudioEdit::Mute);
+        assert!(plan.has_audio_edits());
+
+        // Single-track clip has nothing to rebuild from.
+        let single = Piece {
+            source: 0,
+            a: Hns::ZERO,
+            b: secs(20),
+            tracks: vec![TrackEdit::default()],
+            gap: false,
+        };
+        let plan_single = plan_piece(&single, secs(20), &keyframes(), 160_000, true).unwrap();
+        assert!(!plan_single.rebuild_master);
+        assert_eq!(plan_single.tracks.len(), 1);
     }
 
     #[test]
     fn a_start_between_keyframes_is_kept_and_asks_for_a_re_encode() {
         let t = one(20);
         let piece = t.pieces[0].trimmed(Hns::from_millis(7_300), secs(20), secs(20));
-        let plan = plan_piece(&piece, secs(20), &keyframes(), 160_000).unwrap();
+        let plan = plan_piece(&piece, secs(20), &keyframes(), 160_000, false).unwrap();
         assert_eq!(plan.trim, Some((Hns::from_millis(7_300), secs(20))));
         assert!(plan.reencode);
         let on_key = t.pieces[0].trimmed(secs(6), secs(20), secs(20));
-        assert!(!plan_piece(&on_key, secs(20), &keyframes(), 160_000).unwrap().reencode);
+        assert!(!plan_piece(&on_key, secs(20), &keyframes(), 160_000, false).unwrap().reencode);
+    }
+
+    #[test]
+    fn seam_joinable_respects_time_and_pixel_thresholds() {
+        let mk = |source, a_ms, b_ms| Piece {
+            source,
+            a: Hns::from_millis(a_ms),
+            b: Hns::from_millis(b_ms),
+            tracks: vec![TrackEdit::default()],
+            gap: false,
+        };
+        // Touching pieces from the same clip -> joinable.
+        assert!(seam_joinable(&mk(0, 0, 5_000), &mk(0, 5_000, 10_000), secs(10), 1000.0));
+        // Small gap under 0.25 s -> joinable even when zoomed in (150 ms = 15 px at 10 s / 1000 px).
+        assert!(seam_joinable(&mk(0, 0, 5_000), &mk(0, 5_150, 10_000), secs(10), 1000.0));
+        // Gap of 0.4 s on 10 s / 1000 px (= 40 px > 6 px and > 0.25 s) -> NOT joinable.
+        assert!(!seam_joinable(&mk(0, 0, 5_000), &mk(0, 5_400, 10_000), secs(10), 1000.0));
+        // Gap of 0.4 s on 100 s / 1000 px (= 4 px <= 6 px) -> joinable at this zoom.
+        assert!(seam_joinable(&mk(0, 0, 50_000), &mk(0, 50_400, 100_000), secs(100), 1000.0));
+        // Gap of 0.8 s on 100 s / 1000 px (= 8 px > 6 px and > 0.25 s) -> NOT joinable.
+        assert!(!seam_joinable(&mk(0, 0, 50_000), &mk(0, 50_800, 100_000), secs(100), 1000.0));
+        // Different source clips -> never joinable.
+        assert!(!seam_joinable(&mk(0, 0, 5_000), &mk(1, 5_000, 10_000), secs(10), 1000.0));
+        // Reordered / overlapping pieces -> never joinable.
+        assert!(!seam_joinable(&mk(0, 5_000, 10_000), &mk(0, 0, 5_000), secs(10), 1000.0));
+    }
+
+    #[test]
+    fn join_within_bridges_small_gap_and_rejects_large_gap() {
+        let mut t = Timeline {
+            pieces: vec![
+                Piece {
+                    source: 0,
+                    a: Hns::ZERO,
+                    b: Hns::from_millis(5_000),
+                    tracks: vec![TrackEdit::default()],
+                    gap: false,
+                },
+                Piece {
+                    source: 0,
+                    a: Hns::from_millis(5_150),
+                    b: Hns::from_millis(10_000),
+                    tracks: vec![TrackEdit::default()],
+                    gap: false,
+                },
+            ],
+        };
+        assert_eq!(t.join(0), Ok(0));
+        assert_eq!(t.pieces.len(), 1);
+        assert_eq!((t.pieces[0].a, t.pieces[0].b), (Hns::ZERO, Hns::from_millis(10_000)));
     }
 
     #[test]
@@ -771,7 +1330,7 @@ mod tests {
     fn trimming_keeps_the_sound_where_it_was() {
         let mut e = TrackEdit::default();
         e.silence(secs(4), secs(6), secs(10));
-        let piece = Piece { source: 0, a: secs(10), b: secs(20), tracks: vec![e] };
+        let piece = Piece { source: 0, a: secs(10), b: secs(20), tracks: vec![e], gap: false };
         // Cut 3 s off the start: the silent stretch is now 1..3 s in.
         let t = piece.trimmed(secs(13), secs(20), secs(60));
         assert_eq!(t.span(), secs(7));
@@ -783,8 +1342,8 @@ mod tests {
 
     #[test]
     fn an_empty_piece_is_refused() {
-        let piece = Piece { source: 0, a: secs(6), b: secs(6), tracks: vec![] };
-        assert!(plan_piece(&piece, secs(20), &keyframes(), 1).is_err());
+        let piece = Piece { source: 0, a: secs(6), b: secs(6), tracks: vec![], gap: false };
+        assert!(plan_piece(&piece, secs(20), &keyframes(), 1, false).is_err());
     }
 
     #[test]

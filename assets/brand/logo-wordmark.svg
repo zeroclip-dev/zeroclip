@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 296 64" width="296" height="64" role="img" aria-label="ZeroClip">
+  <g transform="scale(0.25)">
+    <rect width="256" height="256" rx="56" fill="#0b0b0e"/>
+    <path d="M 60.9 163.7 A 76 76 0 1 0 74.3 74.3" fill="none" stroke="#2dd4bf" stroke-width="24" stroke-linecap="round"/>
+    <path d="M 56.9 62 Q 57 58 60.3 60.2 L 93.7 82.8 Q 97 85 93.4 86.8 L 59.6 103.2 Q 56 105 56.1 101 Z" fill="#2dd4bf"/>
+    <path d="M 110 101 Q 110 95 115 98 L 160 125 Q 165 128 160 131 L 115 158 Q 110 161 110 155 Z" fill="#f3f3f6"/>
+  </g>
+  <text x="82" y="47" fill="#f3f3f6" font-family="'Segoe UI', 'Inter', sans-serif" font-size="46" font-weight="700" letter-spacing="-0.8">ZeroClip</text>
+</svg>

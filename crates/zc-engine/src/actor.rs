@@ -134,6 +134,7 @@ impl Engine {
                 .clone()
                 .unwrap_or(config.default_output_dir),
             hotkeys: ChordMatcher::new(bindings(&config.settings)),
+            hotkeys_suspended: false,
             settings: config.settings,
             ports,
             inbox: inbox.clone(),
@@ -279,6 +280,8 @@ struct Actor {
     /// take them (P3.19).
     audio_tracks: Vec<TrackInfo>,
     hotkeys: ChordMatcher<HotkeyAction>,
+    /// Ignore matched hotkey actions while the UI is capturing a new hotkey binding.
+    hotkeys_suspended: bool,
     /// The one recording in progress, if any (D20).
     recording: Option<ActiveRecording>,
     /// The IO thread of the clip being snapshotted and written. One at a time, so a dump's copy
@@ -1455,6 +1458,16 @@ impl Actor {
         match command {
             Command::SaveClip => self.save_clip(),
             Command::FocusChoice(choice) => self.on_focus_choice(choice),
+            Command::SetHotkeysSuspended(suspended) => {
+                self.hotkeys_suspended = suspended;
+                if suspended && self.ptt_held {
+                    self.ptt_held = false;
+                    if let Some(mic) = self.ports.mic.as_mut() {
+                        mic.set_gate(false);
+                    }
+                    self.refresh_mic_state();
+                }
+            }
             Command::ToggleRecording => self.toggle_recording(),
             Command::Screenshot => self.take_screenshot(),
             Command::Bookmark => self.bookmark(),
@@ -1878,9 +1891,16 @@ impl Actor {
     fn on_os_event(&mut self, event: OsEvent) {
         match event {
             OsEvent::Key { key, down } => {
+                // A hotkey field is listening: hand it the raw key (a bool check otherwise).
+                if self.hotkeys_suspended {
+                    self.emit(EngineEvent::CaptureKey { key, down });
+                }
                 let Some(event) = self.hotkeys.on_key(key, down) else {
                     return;
                 };
+                if self.hotkeys_suspended {
+                    return;
+                }
                 tracing::debug!(?event, "hotkey");
                 let command = match event {
                     HotkeyEvent::Pressed(HotkeyAction::SaveClip) => Command::SaveClip,
@@ -1929,6 +1949,12 @@ impl Actor {
                 self.status.capturing =
                     matches!(after, WatchdogState::Running | WatchdogState::Resuming);
                 self.publish_status();
+                if before == WatchdogState::Running && after == WatchdogState::Draining {
+                    self.emit(EngineEvent::Warning(
+                        "Video encoder failed: restarting capture. Footage already buffered is                          kept."
+                            .into(),
+                    ));
+                }
             }
             match self.perform(action) {
                 Some(next) => event = next,
@@ -1996,6 +2022,12 @@ impl Actor {
             Ok(actual) => {
                 tracing::info!(codec = actual.name(), "encoder re-initialised");
                 let format = video.format();
+                if self.status.codec.is_some_and(|before| before != actual) {
+                    self.emit(EngineEvent::Warning(format!(
+                        "Encoder changed: now recording with {}. Quality may differ.",
+                        actual.name()
+                    )));
+                }
                 self.status.codec = Some(actual);
                 // The tee would keep writing the new encoder's packets under the old track
                 // header, as `restart_capture` avoids.
@@ -3537,6 +3569,49 @@ mod tests {
             match engine.wait_event(TIMEOUT).expect("status") {
                 EngineEvent::Status(_) => break,
                 EngineEvent::Warning(m) => assert!(!m.contains("hard disk"), "unexpected: {m}"),
+                _ => {}
+            }
+        }
+        engine.shutdown();
+    }
+
+    #[test]
+    fn suspended_hotkeys_do_not_dispatch_until_resumed() {
+        let input = SyntheticInput::default();
+        let ports = Ports { input: Some(Box::new(input.clone())), ..Ports::default() };
+        let (engine, _) = spawn(ports);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+
+        // Suspend global hotkeys, then press the default Save clip chord (Alt+F10).
+        engine.send(Command::SetHotkeysSuspended(true)).unwrap();
+        input.inject(OsEvent::Key { key: Key::ALT, down: true });
+        input.inject(OsEvent::Key { key: Key::f(10), down: true });
+        input.inject(OsEvent::Key { key: Key::f(10), down: false });
+        input.inject(OsEvent::Key { key: Key::ALT, down: false });
+        // Each raw transition is forwarded to the UI while suspended, in order.
+        for (key, down) in
+            [(Key::ALT, true), (Key::f(10), true), (Key::f(10), false), (Key::ALT, false)]
+        {
+            let seen = wait_for(&engine, |e| matches!(e, EngineEvent::CaptureKey { .. }));
+            assert_eq!(seen, EngineEvent::CaptureKey { key, down });
+        }
+
+        // Resume, then press the default Toggle recording chord (Alt+F9). Because inbox messages
+        // are FIFO, the Alt+F10 events were already processed while suspended and must not have
+        // emitted "Nothing to save yet".
+        engine.send(Command::SetHotkeysSuspended(false)).unwrap();
+        input.inject(OsEvent::Key { key: Key::ALT, down: true });
+        input.inject(OsEvent::Key { key: Key::f(9), down: true });
+        input.inject(OsEvent::Key { key: Key::f(9), down: false });
+        input.inject(OsEvent::Key { key: Key::ALT, down: false });
+
+        loop {
+            match engine.wait_event(TIMEOUT).expect("recording warning") {
+                EngineEvent::Warning(m) if m == "Nothing to record yet." => break,
+                EngineEvent::Warning(m) if m.starts_with("Nothing to save") => {
+                    panic!("suspended Save clip hotkey fired: {m}");
+                }
+                EngineEvent::CaptureKey { .. } => panic!("CaptureKey sent while not suspended"),
                 _ => {}
             }
         }

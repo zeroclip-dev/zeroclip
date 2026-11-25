@@ -1,30 +1,39 @@
-//! The clip list. For now a plain folder listing; the library (thumbnails,
-//! metadata from zc-store), the editor and sharing arrive in Phases 4–6.
+//! The Clips library: clips and screenshots grouped by game folder, with search, kind/game
+//! filtering, sorting, selection, inline rename, drag-out, and folder controls.
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 use std::time::SystemTime;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Context, FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point, Render, SharedString,
-    StatefulInteractiveElement as _, Styled, StyledImage as _, WeakEntity, Window, div, img, px,
-    rgb,
+    BoxShadow, Context, FocusHandle, FontWeight, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point, Render,
+    Role, SharedString, StatefulInteractiveElement as _, Styled, StyledImage as _, WeakEntity,
+    Window, div, img, point, px, rgb, rgba, transparent_black,
 };
 use zc_core::Hns;
 use zc_editor::ffmpeg::Ffmpeg;
 
 use super::components::{
-    button::{button, button_ghost},
+    button::{button, button_ghost, button_primary},
+    exe_icon,
+    filter_chip::{ChipIcon, filter_chip},
     segmented::segmented,
     text_field::text_field,
 };
-use super::theme;
+use super::{icons, theme};
 use crate::app::{NoticeLevel, ZeroClipApp};
 
-/// Width of a card in the grid view.
-const CARD_W: f32 = 220.0;
+/// Minimum width of a clip card before a column drops.
+const CARD_MIN_W: f32 = 200.0;
+/// Horizontal and vertical gap between clip cards.
+const CARD_GAP: f32 = 12.0;
+/// Card horizontal chrome: 8 px padding + 1 px card border + 1 px media focus border on each side.
+const CARD_CHROME: f32 = 20.0;
+/// Page horizontal padding on each side.
+const PAGE_PAD: f32 = 16.0;
 
 const EXTENSIONS: &[&str] = &["mp4", "mkv", "png", "jpg"];
 const MAX_SCAN_DEPTH: usize = 4;
@@ -154,7 +163,28 @@ impl Kind {
     }
 }
 
-/// The game filter's name for clips with no tag.
+/// How clips within each game group are ordered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SortOrder {
+    #[default]
+    Newest,
+    Largest,
+    Name,
+}
+
+impl SortOrder {
+    const ALL: [SortOrder; 3] = [SortOrder::Newest, SortOrder::Largest, SortOrder::Name];
+
+    fn label(self) -> &'static str {
+        match self {
+            SortOrder::Newest => "Newest",
+            SortOrder::Largest => "Largest",
+            SortOrder::Name => "Name",
+        }
+    }
+}
+
+/// The game filter's name for clips with no tag or subfolder.
 const OTHER: &str = "Other";
 
 /// The files of `kind` whose name contains `query` (case-insensitive, surrounding spaces
@@ -176,6 +206,100 @@ fn filter_files<'a>(
         .collect()
 }
 
+/// Group heading for `file`: its game tag, else its top subfolder under `root`, else [`OTHER`].
+fn clip_group(file: &ClipFile, root: &Path) -> String {
+    if let Some(game) = file.game.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
+        return game
+            .strip_suffix(".exe")
+            .or_else(|| game.strip_suffix(".EXE"))
+            .unwrap_or(game)
+            .to_owned();
+    }
+    if let Ok(rel) = file.path.strip_prefix(root) {
+        let mut components = rel.components();
+        if let (Some(Component::Normal(folder)), Some(_)) = (components.next(), components.next()) {
+            let folder = folder.to_string_lossy();
+            if !folder.is_empty() {
+                return folder.into_owned();
+            }
+        }
+    }
+    OTHER.to_owned()
+}
+
+fn sort_group(files: &mut [&ClipFile], order: SortOrder) {
+    match order {
+        SortOrder::Newest => files.sort_by_key(|f| std::cmp::Reverse(f.modified)),
+        SortOrder::Largest => files.sort_by_key(|f| std::cmp::Reverse(f.size_bytes)),
+        SortOrder::Name => files.sort_by_key(|f| display_name(&f.name).to_lowercase()),
+    }
+}
+
+/// Groups `files` by game folder/tag (alphabetical, [`OTHER`] last) and sorts inside each group.
+fn group_files<'a>(
+    files: &[&'a ClipFile],
+    root: &Path,
+    order: SortOrder,
+) -> Vec<(String, Vec<&'a ClipFile>)> {
+    let mut by_key: BTreeMap<(bool, String), (String, Vec<&'a ClipFile>)> = BTreeMap::new();
+    for file in files {
+        let label = clip_group(file, root);
+        let key = (label == OTHER, label.to_lowercase());
+        by_key.entry(key).or_insert_with(|| (label, Vec::new())).1.push(*file);
+    }
+    let mut groups: Vec<(String, Vec<&'a ClipFile>)> = by_key.into_values().collect();
+    for (_, group) in &mut groups {
+        sort_group(group, order);
+    }
+    groups
+}
+
+/// Computes the "All" chip count and per-game `(label, count)` entries (alphabetical, [`OTHER`]
+/// last). Every game present in `all_files` gets a chip; counts reflect `filtered` (after kind
+/// and search filters, before the game chip filter) so users see how many matching clips each game
+/// holds.
+fn game_chip_counts(
+    all_files: &[ClipFile],
+    filtered: &[&ClipFile],
+    root: &Path,
+) -> (usize, Vec<(String, usize)>) {
+    let mut by_key: BTreeMap<(bool, String), (String, usize)> = BTreeMap::new();
+    for file in all_files {
+        let label = clip_group(file, root);
+        let key = (label == OTHER, label.to_lowercase());
+        by_key.entry(key).or_insert((label, 0));
+    }
+    for file in filtered {
+        let label = clip_group(file, root);
+        let key = (label == OTHER, label.to_lowercase());
+        by_key.entry(key).or_insert((label, 0)).1 += 1;
+    }
+    (filtered.len(), by_key.into_values().collect())
+}
+
+/// Chooses the leading icon for a game filter chip: folder icon for [`OTHER`], cached exe icon
+/// when present on disk, otherwise the generic Lucide gamepad icon.
+fn game_chip_icon(game: &str, icons_dir: &Path) -> ChipIcon {
+    if game == OTHER {
+        ChipIcon::Svg("folder-open")
+    } else if let Some(path) = exe_icon::find_cached(icons_dir, game) {
+        ChipIcon::Image(path)
+    } else {
+        ChipIcon::Svg("gamepad-2")
+    }
+}
+
+/// Collects the screenshots from `groups` in their on-screen display order, so previous/next in
+/// the screenshot viewer matches the filtered and sorted Clips grid/list.
+fn ordered_screenshots(groups: &[(String, Vec<&ClipFile>)]) -> Vec<ClipFile> {
+    groups
+        .iter()
+        .flat_map(|(_, files)| files.iter())
+        .filter(|file| Kind::Screenshots.accepts(&file.name))
+        .map(|file| (*file).clone())
+        .collect()
+}
+
 /// A rename in progress: the file, the name being typed (without extension) and the last error.
 struct Renaming {
     path: PathBuf,
@@ -183,13 +307,16 @@ struct Renaming {
     error: Option<String>,
 }
 
-/// The Clips screen: the folder listing with Refresh, Open folder, search and a kind filter.
+/// The Clips screen: game-grouped clip library with search, filters, sort, selection and rename.
 pub struct ClipsView {
     app: WeakEntity<ZeroClipApp>,
     query: String,
     kind: Kind,
+    sort: SortOrder,
     /// Only clips of this game (`OTHER` for untagged ones); `None` shows all.
     game: Option<String>,
+    /// Currently selected clip path, shown with a brand focus ring.
+    selected: Option<PathBuf>,
     /// Search box focus, made on the first render.
     focus: Option<FocusHandle>,
     /// Rename box focus, made on the first render.
@@ -272,7 +399,9 @@ impl ClipsView {
             app,
             query: String::new(),
             kind: Kind::All,
+            sort: SortOrder::Newest,
             game: None,
+            selected: None,
             focus: None,
             rename_focus: None,
             renaming: None,
@@ -294,6 +423,7 @@ impl ClipsView {
             Ok(to) => {
                 zc_core::bookmarks::rename(&rename.path, &to);
                 zc_core::game_tag::rename(&rename.path, &to);
+                self.selected = Some(to.clone());
                 self.renaming = None;
                 let name =
                     to.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
@@ -404,7 +534,6 @@ fn renamed_path(path: &Path, stem: &str) -> Result<PathBuf, String> {
     Ok(to)
 }
 
-/// The small picture at the start of a row. `source` is the image file, if there is one yet.
 /// A clip's title in the UI: the date and time, without the repeated "ZeroClip clip" prefix and the
 /// extension, so near-identical names stay tellable apart when the card truncates them.
 pub fn display_name(file_name: &str) -> String {
@@ -416,30 +545,77 @@ pub fn display_name(file_name: &str) -> String {
     short.to_owned()
 }
 
+/// The small picture for a clip card or list row. `source` is the image file, if there is one yet.
 pub fn thumb_box(source: Option<PathBuf>, w: f32, h: f32) -> gpui::Div {
     let frame = div()
         .w(px(w))
         .h(px(h))
         .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
         .rounded(px(theme::RADIUS_MD))
         .overflow_hidden()
-        .bg(rgb(theme::ACCENT));
+        .bg(rgb(theme::SURFACE_INSET));
     match source {
         Some(path) => frame.child(img(path).w(px(w)).h(px(h)).object_fit(ObjectFit::Cover)),
-        None => frame,
+        None => frame.child(icons::icon("film", theme::TEXT_DIM)),
     }
+}
+
+fn brand_ring_shadow() -> Vec<BoxShadow> {
+    vec![BoxShadow {
+        color: rgb(theme::BRAND).into(),
+        offset: point(px(0.), px(0.)),
+        blur_radius: px(0.),
+        spread_radius: px(1.),
+        inset: false,
+    }]
+}
+
+fn group_heading(title: &str, count: usize, first: bool) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .when(!first, |d| d.pt_2())
+        .child(
+            div()
+                .text_size(px(theme::TEXT_CAPTION))
+                .line_height(px(18.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(theme::FG_SOFT))
+                .child(title.to_owned()),
+        )
+        .child(
+            div()
+                .px(px(7.))
+                .py(px(1.))
+                .rounded_full()
+                .bg(rgb(theme::SURFACE_RAISED))
+                .border_1()
+                .border_color(rgb(theme::BORDER_SUBTLE))
+                .text_size(px(theme::TEXT_MICRO))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(theme::MUTED_FG))
+                .child(count.to_string()),
+        )
+        .child(div().flex_1().h(px(1.)).bg(rgb(theme::BORDER_SUBTLE)))
 }
 
 impl ClipsView {
     /// Lets `el` be dragged out of the window as a file: onto a browser's upload box, Explorer, a
-    /// chat. A press then a move of a few pixels starts the drag; a plain click is untouched.
+    /// chat. A press selects the clip immediately; moving a few pixels starts the drag.
     fn drag_source<E: InteractiveElement>(&self, el: E, path: &Path, cx: &Context<Self>) -> E {
         let path = path.to_path_buf();
         super::clip_menu::on_right_click(el, &self.app, &path)
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, ev: &MouseDownEvent, _, _| {
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    this.selected = Some(path.clone());
                     this.drag_from = Some((path.clone(), ev.position));
+                    cx.notify();
                 }),
             )
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, _| {
@@ -459,16 +635,363 @@ impl ClipsView {
                 }
             }))
     }
-}
 
-impl ClipsView {
     /// Opens the rename bar for `path`.
     pub fn begin_rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let text = path.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+        self.selected = Some(path.clone());
         self.renaming = Some(Renaming { path, text, error: None });
         // Created here too: Rename from Home runs before Clips has ever rendered.
         self.rename_focus.get_or_insert_with(|| cx.focus_handle()).focus(window, cx);
         cx.notify();
+    }
+
+    /// Updates the highlighted clip selection (e.g. when stepping through screenshots in the
+    /// viewer).
+    pub fn set_selected(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.selected = Some(path);
+        cx.notify();
+    }
+
+    fn render_card(
+        &self,
+        idx: usize,
+        file: &ClipFile,
+        thumb: Option<PathBuf>,
+        card_w: f32,
+        screenshot_nav: Option<(Rc<Vec<ClipFile>>, usize)>,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let is_video = Kind::Videos.accepts(&file.name);
+        let selected = self.selected.as_deref() == Some(file.path.as_path());
+        let title = display_name(&file.name);
+        let meta = format!(
+            "{:.1} MB \u{b7} {}",
+            file.size_bytes as f64 / 1_000_000.0,
+            file.modified.map_or_else(|| "\u{2014}".to_owned(), age),
+        );
+        let pic_w = (card_w - CARD_CHROME).max(120.0);
+        let pic_h = (pic_w * 9.0 / 16.0).floor();
+        let group_name = format!("clip-card-{idx}");
+        let play_path = file.path.clone();
+        let play_path_key = file.path.clone();
+
+        let picture = thumb_box(thumb, pic_w, pic_h);
+        let media = div()
+            .id(("clip-play", idx))
+            .relative()
+            .rounded(px(theme::RADIUS_MD))
+            .overflow_hidden()
+            .border_1()
+            .border_color(transparent_black())
+            .focus_visible(|s| s.border_color(rgb(theme::RING)))
+            .child(picture)
+            .when(is_video, |d| {
+                d.tab_stop(true)
+                    .role(Role::Button)
+                    .aria_label(format!("Watch {title}"))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .opacity(0.)
+                            .group_hover(group_name.clone(), |s| s.opacity(1.))
+                            .child(
+                                div()
+                                    .size(px(40.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .bg(rgba(theme::SCRIM))
+                                    .child(icons::icon("play", theme::FG)),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let path = play_path.clone();
+                        this.selected = Some(path.clone());
+                        let _ = this.app.update(cx, |app, cx| app.play_clip(path, cx));
+                    }))
+                    .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _, cx| {
+                        if matches!(ev.keystroke.key.as_str(), "enter" | "space") {
+                            cx.stop_propagation();
+                            let path = play_path_key.clone();
+                            this.selected = Some(path.clone());
+                            let _ = this.app.update(cx, |app, cx| app.play_clip(path, cx));
+                        }
+                    }))
+            })
+            .when(!is_video, |d| {
+                let open_path = file.path.clone();
+                let open_path_key = file.path.clone();
+                let nav_click = screenshot_nav.clone();
+                let nav_key = screenshot_nav;
+                d.tab_stop(true)
+                    .role(Role::Button)
+                    .aria_label(format!("View {title}"))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .opacity(0.)
+                            .group_hover(group_name.clone(), |s| s.opacity(1.))
+                            .child(
+                                div()
+                                    .size(px(40.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .bg(rgba(theme::SCRIM))
+                                    .child(icons::icon("image", theme::FG)),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected = Some(open_path.clone());
+                        if let Some((shots, shot_idx)) = &nav_click {
+                            let list = (**shots).clone();
+                            let idx = *shot_idx;
+                            let _ =
+                                this.app.update(cx, |app, cx| app.view_screenshot(list, idx, cx));
+                        }
+                    }))
+                    .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _, cx| {
+                        if matches!(ev.keystroke.key.as_str(), "enter" | "space") {
+                            cx.stop_propagation();
+                            this.selected = Some(open_path_key.clone());
+                            if let Some((shots, shot_idx)) = &nav_key {
+                                let list = (**shots).clone();
+                                let idx = *shot_idx;
+                                let _ = this
+                                    .app
+                                    .update(cx, |app, cx| app.view_screenshot(list, idx, cx));
+                            }
+                        }
+                    }))
+            });
+
+        let more = super::clip_menu::more_button(("clip-more", idx), &self.app, &file.path, 28.);
+
+        let card = div()
+            .id(("clip-card", idx))
+            .group(group_name)
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label(title.clone())
+            .aria_selected(selected)
+            .w(px(card_w))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_2()
+            .rounded(px(theme::RADIUS))
+            .border_1()
+            .focus_visible(|s| s.border_color(rgb(theme::RING)))
+            .when(selected, |d| {
+                d.bg(rgb(theme::SURFACE_RAISED))
+                    .border_color(rgb(theme::BRAND))
+                    .shadow(brand_ring_shadow())
+                    .hover(|s| s.bg(rgb(theme::ACCENT)))
+                    .active(|s| s.bg(rgb(theme::SURFACE_ACTIVE)))
+            })
+            .when(!selected, |d| {
+                d.bg(rgb(theme::CARD))
+                    .border_color(rgb(theme::BORDER))
+                    .hover(|s| {
+                        s.bg(rgb(theme::SURFACE_RAISED)).border_color(rgb(theme::BORDER_STRONG))
+                    })
+                    .active(|s| s.bg(rgb(theme::ACCENT)))
+            })
+            .child(media)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .text_size(px(theme::TEXT_BODY))
+                                    .line_height(px(18.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(theme::FG))
+                                    .truncate()
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(theme::TEXT_MICRO))
+                                    .line_height(px(15.))
+                                    .text_color(rgb(theme::MUTED_FG))
+                                    .truncate()
+                                    .child(meta),
+                            ),
+                    )
+                    .child(more),
+            );
+
+        self.drag_source(card, &file.path, cx)
+    }
+
+    fn render_list_row(
+        &self,
+        idx: usize,
+        file: &ClipFile,
+        thumb: Option<PathBuf>,
+        screenshot_nav: Option<(Rc<Vec<ClipFile>>, usize)>,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let is_video = Kind::Videos.accepts(&file.name);
+        let selected = self.selected.as_deref() == Some(file.path.as_path());
+        let title = display_name(&file.name);
+        let edit = is_video.then(|| {
+            [("clip-watch", "Watch", true), ("clip-edit", "Edit", false)].map(
+                |(id, label, watch)| {
+                    let path = file.path.clone();
+                    button_ghost((id, idx), label).on_click(cx.listener(move |this, _, _, cx| {
+                        let path = path.clone();
+                        this.selected = Some(path.clone());
+                        let _ = this.app.update(cx, |app, cx| {
+                            if watch {
+                                app.play_clip(path, cx);
+                            } else {
+                                app.open_in_editor(path, false, cx);
+                            }
+                        });
+                    }))
+                },
+            )
+        });
+        let view_shot = (!is_video).then(|| {
+            let path = file.path.clone();
+            let path_key = file.path.clone();
+            let nav_click = screenshot_nav.clone();
+            let nav_key = screenshot_nav;
+            button_ghost(("clip-view", idx), "View")
+                .aria_label(format!("View {title}"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.selected = Some(path.clone());
+                    if let Some((shots, shot_idx)) = &nav_click {
+                        let list = (**shots).clone();
+                        let idx = *shot_idx;
+                        let _ = this.app.update(cx, |app, cx| app.view_screenshot(list, idx, cx));
+                    }
+                }))
+                .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _, cx| {
+                    if matches!(ev.keystroke.key.as_str(), "enter" | "space") {
+                        cx.stop_propagation();
+                        this.selected = Some(path_key.clone());
+                        if let Some((shots, shot_idx)) = &nav_key {
+                            let list = (**shots).clone();
+                            let idx = *shot_idx;
+                            let _ =
+                                this.app.update(cx, |app, cx| app.view_screenshot(list, idx, cx));
+                        }
+                    }
+                }))
+        });
+        let rename = {
+            let path = file.path.clone();
+            button_ghost(("clip-rename-open", idx), "Rename").on_click(
+                cx.listener(move |this, _, window, cx| this.begin_rename(path.clone(), window, cx)),
+            )
+        };
+        let more = super::clip_menu::more_button(("clip-more", idx), &self.app, &file.path, 32.);
+        let actions = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .children(edit.into_iter().flatten())
+            .children(view_shot)
+            .child(rename)
+            .child(more);
+
+        let name_col = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .min_w_0()
+            .child(thumb_box(thumb, 64., 36.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.))
+                    .child(
+                        div()
+                            .text_size(px(theme::TEXT_BODY))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(theme::FG))
+                            .truncate()
+                            .child(title.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme::TEXT_MICRO))
+                            .text_color(rgb(theme::TEXT_DIM))
+                            .truncate()
+                            .child(file.name.clone()),
+                    ),
+            );
+
+        let row = div()
+            .id(("clip-row", idx))
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label(title)
+            .aria_selected(selected)
+            .flex()
+            .flex_row()
+            .items_stretch()
+            .border_t_1()
+            .border_color(rgb(theme::BORDER_SUBTLE))
+            .focus_visible(|s| s.border_color(rgb(theme::RING)))
+            .when(selected, |d| {
+                d.bg(rgb(theme::BRAND_SOFT)).hover(|s| s.bg(rgb(theme::BRAND_SOFT)))
+            })
+            .when(!selected, |d| {
+                d.hover(|s| s.bg(rgb(theme::SURFACE_RAISED))).active(|s| s.bg(rgb(theme::ACCENT)))
+            })
+            .child(div().w(px(3.)).flex_none().when(selected, |d| d.bg(rgb(theme::BRAND))))
+            .child(
+                table_row(
+                    name_col,
+                    div()
+                        .text_size(px(theme::TEXT_CAPTION))
+                        .text_color(rgb(theme::MUTED_FG))
+                        .child(format!("{:.1} MB", file.size_bytes as f64 / 1_000_000.0)),
+                    div()
+                        .text_size(px(theme::TEXT_CAPTION))
+                        .text_color(rgb(theme::MUTED_FG))
+                        .child(file.modified.map_or_else(|| "\u{2014}".to_owned(), age)),
+                    Some(actions),
+                )
+                .flex_1()
+                .min_w_0(),
+            );
+
+        self.drag_source(row, &file.path, cx)
     }
 }
 
@@ -489,11 +1012,12 @@ impl Render for ClipsView {
         let rename_focus = self.rename_focus.get_or_insert_with(|| cx.focus_handle()).clone();
 
         // Thumbnails live next to the database. Any that are missing are made in the background.
-        let (ffmpeg_path, thumb_dir) = {
+        let (ffmpeg_path, thumb_dir, icons_dir) = {
             let app = entity.read(cx);
             (
                 app.settings.editor.ffmpeg_path.clone(),
                 app.paths.db_file.parent().map(|data| data.join("thumbs")),
+                app.paths.icons_dir.clone(),
             )
         };
         if let Some(thumb_dir) = &thumb_dir {
@@ -510,65 +1034,138 @@ impl Render for ClipsView {
         }
 
         let clips = &entity.read(cx).clips;
-        let mut games: Vec<&str> =
-            clips.files.iter().map(|f| f.game.as_deref().unwrap_or(OTHER)).collect();
-        games.sort_unstable_by_key(|g| (*g == OTHER, g.to_lowercase()));
-        games.dedup();
-        let shown = filter_files(&clips.files, self.kind, &self.query, self.game.as_deref());
+        let base_shown = filter_files(&clips.files, self.kind, &self.query, None);
+        let (all_chip_count, game_counts) = game_chip_counts(&clips.files, &base_shown, &dir);
+        let shown: Vec<&ClipFile> = match self.game.as_deref() {
+            Some(selected_game) => {
+                base_shown.into_iter().filter(|f| clip_group(f, &dir) == selected_game).collect()
+            }
+            None => base_shown,
+        };
+        let groups = group_files(&shown, &dir, self.sort);
+        let screenshots = Rc::new(ordered_screenshots(&groups));
 
-        let header = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .child(div().flex_1().text_xl().font_weight(FontWeight::SEMIBOLD).child("Clips"))
-            .child(button_ghost("clips-refresh", "Refresh").on_click(cx.listener(
-                |this, _, _, cx| {
-                    let _ = this.app.update(cx, |app, _| app.clips.invalidate());
-                    cx.notify();
-                },
-            )))
-            .child(button("clips-change", "Change folder").on_click(cx.listener(
-                |this, _, _, cx| {
-                    let _ = this.app.update(cx, |app, cx| {
-                        app.choose_output_dir();
-                        cx.notify();
-                    });
-                },
-            )))
-            .child(button("clips-open", "Open folder").on_click({
-                let dir = dir.clone();
-                cx.listener(move |this, _, _, cx| {
-                    if let Err(e) = open_folder(&dir) {
-                        let _ = this.app.update(cx, |app, cx| {
-                            app.notify(
-                                NoticeLevel::Error,
-                                format!("Couldn't open {}: {e}", dir.display()),
-                            );
-                            cx.notify();
-                        });
-                    }
-                })
-            }));
+        let total_count = clips.files.len();
+        let shown_count = shown.len();
+        let count_text = if shown_count == total_count {
+            match total_count {
+                1 => "1 clip".to_owned(),
+                n => format!("{n} clips"),
+            }
+        } else {
+            format!("{shown_count} of {total_count}")
+        };
 
-        let tools = div()
+        // Single 36 px toolbar row: title + count left, search + sort + view toggle right.
+        let toolbar = div()
+            .min_h(px(theme::CONTROL_H_LG))
             .flex()
             .flex_row()
             .flex_wrap()
             .items_center()
             .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(theme::page_title("Clips"))
+                    .child(
+                        div()
+                            .px(px(8.))
+                            .py(px(2.))
+                            .rounded_full()
+                            .bg(rgb(theme::SURFACE_RAISED))
+                            .border_1()
+                            .border_color(rgb(theme::BORDER_SUBTLE))
+                            .text_size(px(theme::TEXT_CAPTION))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(theme::MUTED_FG))
+                            .child(count_text),
+                    ),
+            )
+            .child(div().flex_1().min_w(px(8.)))
             .child(text_field(
                 "clips-search",
                 &focus,
                 window,
                 &self.query,
                 "Search clips",
-                240.,
+                180.,
                 cx.listener(|this, v: &String, _, cx| {
                     this.query = v.clone();
                     cx.notify();
                 }),
             ))
+            .child(segmented(
+                "clips-sort",
+                SortOrder::ALL.iter().map(|s| SharedString::from(s.label())).collect(),
+                SortOrder::ALL.iter().position(|s| *s == self.sort),
+                true,
+                cx.listener(|this, i: &usize, _, cx| {
+                    this.sort = SortOrder::ALL.get(*i).copied().unwrap_or_default();
+                    cx.notify();
+                }),
+            ))
+            .child(segmented(
+                "clips-layout",
+                vec![SharedString::from("List"), SharedString::from("Grid")],
+                Some(usize::from(self.grid)),
+                true,
+                cx.listener(|this, i: &usize, _, cx| {
+                    this.grid = *i == 1;
+                    cx.notify();
+                }),
+            ));
+
+        // Filter row: kind filter + wrapping game filter chips with icons and clip counts.
+        let game_chips = (!game_counts.is_empty()).then(|| {
+            let all_chip = filter_chip(
+                "clips-game-all",
+                "All",
+                all_chip_count,
+                None,
+                self.game.is_none(),
+                cx.listener(|this, _, _, cx| {
+                    this.game = None;
+                    cx.notify();
+                }),
+            );
+            let per_game = game_counts.iter().enumerate().map(|(i, (game_name, count))| {
+                let selected = self.game.as_deref() == Some(game_name.as_str());
+                let leading = game_chip_icon(game_name, &icons_dir);
+                let target = game_name.clone();
+                filter_chip(
+                    ("clips-game", i),
+                    game_name.clone(),
+                    *count,
+                    Some(leading),
+                    selected,
+                    cx.listener(move |this, _, _, cx| {
+                        this.game = Some(target.clone());
+                        cx.notify();
+                    }),
+                )
+            });
+            div()
+                .id("clips-game-chips")
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap(px(6.))
+                .child(all_chip)
+                .children(per_game)
+        });
+
+        let filters = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap_x_3()
+            .gap_y_2()
             .child(segmented(
                 "clips-kind",
                 Kind::ALL.iter().map(|k| SharedString::from(k.label())).collect(),
@@ -579,210 +1176,193 @@ impl Render for ClipsView {
                     cx.notify();
                 }),
             ))
-            .children((games.len() > 1).then(|| {
-                let names: Vec<SharedString> = std::iter::once("All games")
-                    .chain(games.iter().copied())
-                    .map(SharedString::from)
-                    .collect();
-                let current = self
-                    .game
-                    .as_deref()
-                    .map_or(Some(0), |g| games.iter().position(|x| *x == g).map(|i| i + 1));
-                let games: Vec<String> = games.iter().map(|g| (*g).to_owned()).collect();
-                segmented(
-                    "clips-game",
-                    names,
-                    current,
-                    true,
-                    cx.listener(move |this, i: &usize, _, cx| {
-                        this.game = i.checked_sub(1).and_then(|i| games.get(i).cloned());
-                        cx.notify();
-                    }),
-                )
-            }))
-            .child(segmented(
-                "clips-layout",
-                vec![SharedString::from("List"), SharedString::from("Grid")],
-                Some(usize::from(self.grid)),
-                true,
-                cx.listener(|this, i: &usize, _, cx| {
-                    this.grid = *i == 1;
-                    cx.notify();
-                }),
-            ))
-            .child(div().ml_auto().text_sm().text_color(rgb(theme::MUTED_FG)).child(format!(
-                "{} of {} files",
-                shown.len(),
-                clips.files.len()
-            )));
+            .children(game_chips);
+
+        // Storage location row: current folder path + refresh, folder picker, open in Explorer.
+        let storage_row = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py(px(6.))
+            .rounded(px(theme::RADIUS_MD))
+            .bg(rgb(theme::SURFACE_INSET))
+            .border_1()
+            .border_color(rgb(theme::BORDER_SUBTLE))
+            .child(icons::icon("folder-open", theme::MUTED_FG))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(140.))
+                    .text_size(px(theme::TEXT_CAPTION))
+                    .text_color(rgb(theme::FG_SOFT))
+                    .truncate()
+                    .child(dir.display().to_string()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(button_ghost("clips-refresh", "Refresh").h(px(28.)).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            let _ = this.app.update(cx, |app, _| app.clips.invalidate());
+                            cx.notify();
+                        }),
+                    ))
+                    .child(button("clips-change", "Change folder").h(px(28.)).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            let _ = this.app.update(cx, |app, cx| {
+                                app.choose_output_dir(cx);
+                                cx.notify();
+                            });
+                        }),
+                    ))
+                    .child(button_ghost("clips-open", "Open folder").h(px(28.)).on_click({
+                        let dir = dir.clone();
+                        cx.listener(move |this, _, _, cx| {
+                            if let Err(e) = open_folder(&dir) {
+                                let _ = this.app.update(cx, |app, cx| {
+                                    app.notify(
+                                        NoticeLevel::Error,
+                                        format!("Couldn't open {}: {e}", dir.display()),
+                                    );
+                                    cx.notify();
+                                });
+                            }
+                        })
+                    })),
+            );
+
+        // Compute responsive card width so cards fit cleanly at 760x500 and wide monitors alike.
+        let avail_w = (f32::from(window.viewport_size().width) - 2.0 * PAGE_PAD - 12.0).max(320.0);
+        let cols = (((avail_w + CARD_GAP) / (CARD_MIN_W + CARD_GAP)) as usize).clamp(2, 5);
+        let card_w = ((avail_w - CARD_GAP * (cols - 1) as f32) / cols as f32).floor();
 
         let body = if clips.files.is_empty() {
-            empty("No clips yet. Saved clips and screenshots will show up here.")
-        } else if shown.is_empty() {
-            empty(format!("No clips match \u{201c}{}\u{201d}.", self.query.trim()))
-        } else {
-            let rows = shown.iter().enumerate().map(|(i, file)| {
-                let is_video = Kind::Videos.accepts(&file.name);
-                let edit = is_video.then(|| {
-                    [("clip-watch", "Watch", true), ("clip-edit", "Edit", false)].map(
-                        |(id, label, watch)| {
-                            let path = file.path.clone();
-                            button_ghost((id, i), label).on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    let path = path.clone();
-                                    let _ = this.app.update(cx, |app, cx| {
-                                        if watch {
-                                            app.play_clip(path, cx);
-                                        } else {
-                                            app.open_in_editor(path, false, cx);
-                                        }
-                                    });
-                                },
-                            ))
+            let open_dir = dir.clone();
+            empty_state(
+                "No clips saved yet",
+                "Saved clips and screenshots from your sessions will appear here.",
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .pt_1()
+                    .child(button("clips-empty-open", "Open folder").on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            if let Err(e) = open_folder(&open_dir) {
+                                let _ = this.app.update(cx, |app, cx| {
+                                    app.notify(
+                                        NoticeLevel::Error,
+                                        format!("Couldn't open {}: {e}", open_dir.display()),
+                                    );
+                                    cx.notify();
+                                });
+                            }
                         },
-                    )
-                });
-                let rename = {
-                    let path = file.path.clone();
-                    button_ghost(("clip-rename-open", i), "Rename").on_click(cx.listener(
-                        move |this, _, window, cx| this.begin_rename(path.clone(), window, cx),
-                    ))
-                };
-                // A video shows its frame once ffmpeg has made it; a screenshot is its own picture.
-                let thumb = if is_video {
-                    thumb_dir.as_ref().and_then(|dir| self.thumbs.get(dir, file))
-                } else {
-                    Some(file.path.clone())
-                };
-                // Cards show Watch and a "more" button (the same menu as a right-click); the list
-                // has room for every action.
-                let more =
-                    super::clip_menu::more_button(("clip-more", i), &self.app, &file.path, 32.);
-                let actions = if self.grid {
+                    )))
+                    .child(button_ghost("clips-empty-change", "Change folder").on_click(
+                        cx.listener(|this, _, _, cx| {
+                            let _ = this.app.update(cx, |app, cx| {
+                                app.choose_output_dir(cx);
+                                cx.notify();
+                            });
+                        }),
+                    )),
+            )
+        } else if shown.is_empty() {
+            let trimmed = self.query.trim();
+            let detail = if trimmed.is_empty() {
+                "No clips match the active filters.".to_owned()
+            } else {
+                format!("No clips match \u{201c}{trimmed}\u{201d}.")
+            };
+            empty_state(
+                "No matching clips",
+                detail,
+                div().pt_1().child(button("clips-clear-filters", "Clear filters").on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.query.clear();
+                        this.kind = Kind::All;
+                        this.game = None;
+                        cx.notify();
+                    }),
+                )),
+            )
+        } else {
+            let mut global_idx: usize = 0;
+            let mut shot_idx: usize = 0;
+            let mut sections = Vec::with_capacity(groups.len());
+            for (group_idx, (group_title, files)) in groups.into_iter().enumerate() {
+                let heading = group_heading(&group_title, files.len(), group_idx == 0);
+                let section_body = if self.grid {
+                    let mut cards = Vec::with_capacity(files.len());
+                    for file in files {
+                        let is_video = Kind::Videos.accepts(&file.name);
+                        let (thumb, nav) = if is_video {
+                            (thumb_dir.as_ref().and_then(|dir| self.thumbs.get(dir, file)), None)
+                        } else {
+                            let nav = Some((Rc::clone(&screenshots), shot_idx));
+                            shot_idx += 1;
+                            (Some(file.path.clone()), nav)
+                        };
+                        cards.push(self.render_card(global_idx, file, thumb, card_w, nav, cx));
+                        global_idx += 1;
+                    }
                     div()
                         .flex()
                         .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .children(edit.into_iter().flatten().take(1))
-                        .child(div().flex_1())
-                        .child(more)
+                        .flex_wrap()
+                        .content_start()
+                        .gap(px(CARD_GAP))
+                        .children(cards)
+                        .into_any_element()
                 } else {
+                    let mut rows = Vec::with_capacity(files.len());
+                    for file in files {
+                        let is_video = Kind::Videos.accepts(&file.name);
+                        let (thumb, nav) = if is_video {
+                            (thumb_dir.as_ref().and_then(|dir| self.thumbs.get(dir, file)), None)
+                        } else {
+                            let nav = Some((Rc::clone(&screenshots), shot_idx));
+                            shot_idx += 1;
+                            (Some(file.path.clone()), nav)
+                        };
+                        rows.push(self.render_list_row(global_idx, file, thumb, nav, cx));
+                        global_idx += 1;
+                    }
                     div()
-                        .flex()
-                        .flex_row()
-                        .gap_1()
-                        .children(edit.into_iter().flatten())
-                        .child(rename)
-                };
-                if self.grid {
-                    return self
-                        .drag_source(div(), &file.path, cx)
-                        .w(px(CARD_W))
                         .flex()
                         .flex_col()
-                        .gap_2()
-                        .p_2()
                         .rounded(px(theme::RADIUS))
                         .bg(rgb(theme::CARD))
                         .border_1()
                         .border_color(rgb(theme::BORDER))
-                        .hover(|s| s.bg(rgb(theme::ACCENT)))
-                        .child({
-                            let path = file.path.clone();
-                            let picture = thumb_box(thumb, CARD_W - 18., (CARD_W - 18.) * 9. / 16.);
-                            // A video's picture is a play button: click to watch it.
-                            div().id(("clip-play", i)).relative().child(picture).when(
-                                is_video,
-                                |d| {
-                                    d.cursor_pointer()
-                                        .child(
-                                            div()
-                                                .absolute()
-                                                .inset_0()
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .text_color(rgb(0xffffff))
-                                                .text_2xl()
-                                                .child("\u{25b6}"),
-                                        )
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            let path = path.clone();
-                                            let _ = this
-                                                .app
-                                                .update(cx, |app, cx| app.play_clip(path, cx));
-                                        }))
-                                },
-                            )
-                        })
-                        .child(div().text_sm().truncate().child(display_name(&file.name)))
-                        .child(div().text_xs().text_color(rgb(theme::MUTED_FG)).child(format!(
-                            "{:.1} MB \u{b7} {}",
-                            file.size_bytes as f64 / 1_000_000.0,
-                            file.modified.map_or_else(|| "\u{2014}".to_owned(), age)
-                        )))
-                        .child(actions);
-                }
-                let name = div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_3()
-                    .child(thumb_box(thumb, 64., 36.))
-                    .child(div().min_w_0().child(file.name.clone()));
-                let row = table_row(
-                    name,
-                    format!("{:.1} MB", file.size_bytes as f64 / 1_000_000.0),
-                    file.modified.map_or_else(|| "\u{2014}".to_owned(), age),
-                    Some(actions),
-                );
-                self.drag_source(row, &file.path, cx)
-                    .border_t_1()
-                    .border_color(rgb(theme::BORDER))
-                    .hover(|s| s.bg(rgb(theme::ACCENT)))
-            });
-            if self.grid {
-                div()
-                    .id("clips-grid")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .content_start()
-                    .gap_3()
-                    .children(rows)
-                    .into_any_element()
-            } else {
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h_0()
-                    .rounded(px(theme::RADIUS))
-                    .bg(rgb(theme::CARD))
-                    .border_1()
-                    .border_color(rgb(theme::BORDER))
-                    .child(
-                        table_row("File", "Size", "Saved", None::<gpui::Div>)
-                            .text_sm()
-                            .text_color(rgb(theme::MUTED_FG)),
-                    )
-                    .child(
-                        div()
-                            .id("clips-list")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
-                            .text_sm()
-                            .children(rows),
-                    )
-                    .into_any_element()
+                        .overflow_hidden()
+                        .child(
+                            table_row("File", "Size", "Saved", None::<gpui::Div>)
+                                .text_size(px(theme::TEXT_MICRO))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(theme::MUTED_FG)),
+                        )
+                        .children(rows)
+                        .into_any_element()
+                };
+                sections.push(div().flex().flex_col().gap_3().child(heading).child(section_body));
             }
+            let scroll_id = if self.grid { "clips-grid" } else { "clips-list" };
+            div()
+                .id(scroll_id)
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .child(div().flex().flex_col().gap_5().pb_4().children(sections))
+                .into_any_element()
         };
 
         // The rename bar sits above the list while a rename is open: the typed name, the kept
@@ -795,42 +1375,75 @@ impl Render for ClipsView {
                 .map_or_else(String::new, |e| format!(".{e}"));
             div()
                 .flex()
-                .flex_row()
-                .flex_wrap()
-                .items_center()
+                .flex_col()
                 .gap_2()
-                .child(text_field(
-                    "clip-rename",
-                    &rename_focus,
-                    window,
-                    &rename.text,
-                    "New name",
-                    360.,
-                    cx.listener(|this, v: &String, _, cx| {
-                        if let Some(rename) = this.renaming.as_mut() {
-                            rename.text = v.clone();
-                            rename.error = None;
+                .p_3()
+                .rounded(px(theme::RADIUS))
+                .bg(rgb(theme::SURFACE_RAISED))
+                .border_1()
+                .border_color(rgb(theme::BORDER_STRONG))
+                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                    match ev.keystroke.key.as_str() {
+                        "enter" => this.commit_rename(cx),
+                        "escape" => {
+                            this.renaming = None;
+                            cx.notify();
                         }
-                        cx.notify();
-                    }),
-                ))
-                .child(div().text_sm().text_color(rgb(theme::MUTED_FG)).child(ext))
+                        _ => {}
+                    }
+                }))
                 .child(
-                    button("clip-rename-save", "Save")
-                        .on_click(cx.listener(|this, _, _, cx| this.commit_rename(cx))),
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(px(theme::TEXT_CAPTION))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(theme::FG_SOFT))
+                                .child("Rename clip"),
+                        )
+                        .child(text_field(
+                            "clip-rename",
+                            &rename_focus,
+                            window,
+                            &rename.text,
+                            "New name",
+                            280.,
+                            cx.listener(|this, v: &String, _, cx| {
+                                if let Some(rename) = this.renaming.as_mut() {
+                                    rename.text = v.clone();
+                                    rename.error = None;
+                                }
+                                cx.notify();
+                            }),
+                        ))
+                        .child(
+                            div()
+                                .text_size(px(theme::TEXT_CAPTION))
+                                .text_color(rgb(theme::MUTED_FG))
+                                .child(ext),
+                        )
+                        .child(
+                            button_primary("clip-rename-save", "Save name")
+                                .on_click(cx.listener(|this, _, _, cx| this.commit_rename(cx))),
+                        )
+                        .child(button_ghost("clip-rename-cancel", "Cancel").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.renaming = None;
+                                cx.notify();
+                            },
+                        ))),
                 )
-                .child(button_ghost("clip-rename-cancel", "Cancel").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.renaming = None;
-                        cx.notify();
-                    },
-                )))
-                .children(
-                    rename
-                        .error
-                        .as_ref()
-                        .map(|e| div().text_sm().text_color(rgb(theme::DANGER)).child(e.clone())),
-                )
+                .children(rename.error.as_ref().map(|e| {
+                    div()
+                        .text_size(px(theme::TEXT_CAPTION))
+                        .text_color(rgb(theme::DANGER))
+                        .child(e.clone())
+                }))
         });
 
         let list_error = clips.error.clone();
@@ -839,30 +1452,74 @@ impl Render for ClipsView {
             .flex()
             .flex_col()
             .gap_3()
-            .p_4()
-            .child(header)
-            .child(
-                div().text_sm().text_color(rgb(theme::MUTED_FG)).child(dir.display().to_string()),
-            )
-            .children(
-                list_error.map(|error| {
-                    div().text_sm().text_color(rgb(theme::DANGER)).child(error.clone())
-                }),
-            )
-            .child(tools)
+            .p(px(PAGE_PAD))
+            .overflow_hidden()
+            .child(toolbar)
+            .child(filters)
+            .child(storage_row)
+            .children(list_error.map(|error| {
+                div()
+                    .px_3()
+                    .py_2()
+                    .rounded(px(theme::RADIUS_MD))
+                    .bg(rgb(theme::DANGER_SOFT))
+                    .border_1()
+                    .border_color(rgb(theme::DANGER_BORDER))
+                    .text_size(px(theme::TEXT_CAPTION))
+                    .text_color(rgb(theme::DANGER))
+                    .child(error)
+            }))
             .children(rename_bar)
             .child(body)
             .into_any_element()
     }
 }
 
-fn empty(text: impl Into<SharedString>) -> gpui::AnyElement {
+fn empty_state(
+    title: impl Into<SharedString>,
+    detail: impl Into<SharedString>,
+    action: impl IntoElement,
+) -> gpui::AnyElement {
     div()
-        .py_8()
+        .id("clips-empty")
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
         .flex()
+        .items_center()
         .justify_center()
-        .text_color(rgb(theme::MUTED_FG))
-        .child(text.into())
+        .py_6()
+        .child(
+            div()
+                .w_full()
+                .max_w(px(400.))
+                .px_6()
+                .py_8()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_2()
+                .rounded(px(theme::RADIUS_LG))
+                .bg(rgb(theme::CARD))
+                .border_1()
+                .border_color(rgb(theme::BORDER))
+                .child(
+                    div()
+                        .size(px(40.))
+                        .mb_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(theme::RADIUS_MD))
+                        .bg(rgb(theme::SURFACE_RAISED))
+                        .border_1()
+                        .border_color(rgb(theme::BORDER))
+                        .child(icons::icon("film", theme::MUTED_FG)),
+                )
+                .child(theme::section_heading(title))
+                .child(theme::caption(detail).text_center())
+                .child(action),
+        )
         .into_any_element()
 }
 
@@ -876,13 +1533,14 @@ fn table_row(
     div()
         .flex()
         .flex_row()
-        .gap_6()
+        .items_center()
+        .gap_4()
         .px_3()
         .py_2()
         .child(div().flex_1().min_w_0().child(name))
-        .child(div().w(px(90.)).child(size))
-        .child(div().w(px(120.)).child(saved))
-        .child(div().w(px(150.)).flex().justify_end().children(action))
+        .child(div().w(px(76.)).flex_none().child(size))
+        .child(div().w(px(96.)).flex_none().child(saved))
+        .child(div().w(px(212.)).flex_none().flex().justify_end().children(action))
 }
 
 pub fn age(when: SystemTime) -> String {
@@ -988,5 +1646,107 @@ mod tests {
         assert_eq!(found, ["depth4.png", "sub.mkv", "top.mp4"]);
         assert!(list.error.is_none());
         assert!(missing.files.is_empty() && missing.error.is_none());
+    }
+
+    #[test]
+    fn game_chip_counts_tallies_filtered_clips_and_orders_other_last() {
+        let root = Path::new("clips");
+        let files = [
+            ClipFile {
+                name: "v1.mp4".into(),
+                path: root.join("v1.mp4"),
+                size_bytes: 1,
+                modified: None,
+                game: Some("Valorant.exe".into()),
+            },
+            ClipFile {
+                name: "s1.png".into(),
+                path: root.join("s1.png"),
+                size_bytes: 1,
+                modified: None,
+                game: Some("Valorant".into()),
+            },
+            ClipFile {
+                name: "c1.mp4".into(),
+                path: root.join("c1.mp4"),
+                size_bytes: 1,
+                modified: None,
+                game: Some("cs2.exe".into()),
+            },
+            ClipFile {
+                name: "other.png".into(),
+                path: root.join("other.png"),
+                size_bytes: 1,
+                modified: None,
+                game: None,
+            },
+        ];
+
+        // All kinds: sum of game chips equals total count, alphabetical with Other last.
+        let all_filtered = filter_files(&files, Kind::All, "", None);
+        let (all_total, chips) = game_chip_counts(&files, &all_filtered, root);
+        assert_eq!(all_total, 4);
+        assert_eq!(chips, vec![("cs2".into(), 1), ("Valorant".into(), 2), (OTHER.into(), 1)]);
+
+        // Screenshots only: cs2 stays listed with count 0, Valorant has 1, Other has 1.
+        let shots_filtered = filter_files(&files, Kind::Screenshots, "", None);
+        let (shots_total, shot_chips) = game_chip_counts(&files, &shots_filtered, root);
+        assert_eq!(shots_total, 2);
+        assert_eq!(shot_chips, vec![("cs2".into(), 0), ("Valorant".into(), 1), (OTHER.into(), 1)]);
+    }
+
+    #[test]
+    fn game_chip_icon_uses_folder_for_other_and_prefers_cached_exe_icon() {
+        let dir = std::env::temp_dir().join(format!("zc-clips-chip-icon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp icon dir");
+        let cs2 = dir.join("cs2.exe.png");
+        std::fs::write(&cs2, b"png").expect("write icon");
+
+        assert_eq!(game_chip_icon(OTHER, &dir), ChipIcon::Svg("folder-open"));
+        assert_eq!(game_chip_icon("cs2", &dir), ChipIcon::Image(cs2));
+        assert_eq!(game_chip_icon("UnknownGame", &dir), ChipIcon::Svg("gamepad-2"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ordered_screenshots_follows_group_and_sort_order_and_skips_videos() {
+        let root = Path::new("clips");
+        let files = [
+            ClipFile {
+                name: "b.png".into(),
+                path: root.join("b.png"),
+                size_bytes: 1,
+                modified: None,
+                game: Some("Valorant".into()),
+            },
+            ClipFile {
+                name: "clip.mp4".into(),
+                path: root.join("clip.mp4"),
+                size_bytes: 1,
+                modified: None,
+                game: Some("Valorant".into()),
+            },
+            ClipFile {
+                name: "a.jpg".into(),
+                path: root.join("a.jpg"),
+                size_bytes: 1,
+                modified: None,
+                game: Some("Valorant".into()),
+            },
+            ClipFile {
+                name: "c.png".into(),
+                path: root.join("c.png"),
+                size_bytes: 1,
+                modified: None,
+                game: Some("CS2".into()),
+            },
+        ];
+        let shown: Vec<&ClipFile> = files.iter().collect();
+        let groups = group_files(&shown, root, SortOrder::Name);
+        let ordered: Vec<String> =
+            ordered_screenshots(&groups).into_iter().map(|f| f.name).collect();
+        assert_eq!(ordered, ["c.png", "a.jpg", "b.png"]);
     }
 }
