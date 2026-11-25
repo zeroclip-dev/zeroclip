@@ -316,12 +316,19 @@ impl DvrBuffer {
             .map_or(oldest, |(meta, _, _)| meta.pts);
 
         let mut packets = Vec::with_capacity(self.rings.iter().map(PacketRing::len).sum());
-        for ring in &self.rings {
+        let mut video_packets = 0;
+        for (index, ring) in self.rings.iter().enumerate() {
             for (meta, abs, len) in ring.positions() {
                 if meta.pts >= start && until.is_none_or(|end| meta.pts < end) {
                     packets.push(PlannedPacket { meta, abs, len });
+                    video_packets += usize::from(index == VIDEO_RING);
                 }
             }
+        }
+        // `until` at or before the oldest frame cuts everything: a clip with no video is
+        // not a clip.
+        if video_packets == 0 {
+            return Err(DvrError::Empty);
         }
         Ok(SnapshotPlan { generation: self.generation, packets })
     }
@@ -596,6 +603,12 @@ impl SnapshotCopy {
                 // The lost packet and everything before the next keyframe after it go: that GOP
                 // is broken, and audio must not outlive the video it plays against.
                 let lost = self.next + index;
+                // A lost audio packet costs that packet only: the video is still whole, and a
+                // gap at the start of one audio track beats losing a GOP or the whole clip.
+                if self.plan.packets[lost].meta.track != TrackId::Video {
+                    self.next = lost + 1;
+                    return Ok(());
+                }
                 let lost_pts = self.plan.packets[lost].meta.pts;
                 let key = self
                     .plan
@@ -603,12 +616,6 @@ impl SnapshotCopy {
                     .iter()
                     .find(|p| {
                         p.meta.track == TrackId::Video && p.meta.keyframe && p.meta.pts > lost_pts
-                // A lost audio packet costs that packet only: the video is still whole, and a
-                // gap at the start of one audio track beats losing a GOP or the whole clip.
-                if self.plan.packets[lost].meta.track != TrackId::Video {
-                    self.next = lost + 1;
-                    return Ok(());
-                }
                     })
                     .ok_or(DvrError::Empty)?;
                 self.floor = self.floor.max(key.meta.pts);
@@ -673,6 +680,12 @@ mod tests {
     }
 
     #[test]
+    fn ring_file_bytes_saturates_instead_of_overflowing() {
+        let huge = DvrConfig { video_bytes: usize::MAX, audio_bytes: usize::MAX };
+        assert_eq!(huge.ring_file_bytes(), u64::MAX);
+    }
+
+    #[test]
     fn simple_mode_check_passes_when_the_drive_has_room() {
         // 1 min at 20 Mbps = 150 MB; with the 10% margin, 165 MB.
         let check = simple_mode_check(1, 20_000_000, 200_000_000);
@@ -685,12 +698,6 @@ mod tests {
         assert_eq!(
             check,
             SimpleCheck::TooLittleSpace { needed_bytes: 165_000_000, free_bytes: 100_000_000 }
-    #[test]
-    fn ring_file_bytes_saturates_instead_of_overflowing() {
-        let huge = DvrConfig { video_bytes: usize::MAX, audio_bytes: usize::MAX };
-        assert_eq!(huge.ring_file_bytes(), u64::MAX);
-    }
-
         );
     }
 
@@ -705,13 +712,6 @@ mod tests {
         assert!(matches!(check, SimpleCheck::TooLittleSpace { needed_bytes: u64::MAX, .. }));
     }
 
-    #[test]
-    fn dvr_discards_video_until_the_first_keyframe() {
-        let mut dvr = DvrBuffer::new(roomy());
-        let mut s = SyntheticStream::new();
-        let video: Vec<Packet> = (0..120).map(|_| s.next_video()).collect();
-        // Start listening mid-GOP, at frame 10: nothing is decodable until frame 60.
-        for p in &video[10..60] {
     #[test]
     fn a_lapped_audio_packet_costs_only_audio_not_video() {
         // Small audio rings, so the audio the plan names is gone after a little more audio.
@@ -730,6 +730,24 @@ mod tests {
         assert_eq!(clip.video().count(), planned_video, "no video was dropped for audio loss");
     }
 
+    #[test]
+    fn plan_until_before_the_oldest_frame_is_empty_not_a_zero_second_clip() {
+        let mut dvr = DvrBuffer::new(roomy());
+        let mut s = SyntheticStream::new();
+        let video: Vec<Packet> = (0..60).map(|_| s.next_video()).collect();
+        push_all(&mut dvr, &video);
+        let oldest = dvr.oldest_pts().unwrap();
+        let err = dvr.plan_snapshot_until(Hns::from_secs(5), oldest).err();
+        assert_eq!(err, Some(DvrError::Empty));
+    }
+
+    #[test]
+    fn dvr_discards_video_until_the_first_keyframe() {
+        let mut dvr = DvrBuffer::new(roomy());
+        let mut s = SyntheticStream::new();
+        let video: Vec<Packet> = (0..120).map(|_| s.next_video()).collect();
+        // Start listening mid-GOP, at frame 10: nothing is decodable until frame 60.
+        for p in &video[10..60] {
             assert_eq!(dvr.push(p.view()), Ok(PushOutcome::Discarded));
         }
         assert_eq!(dvr.push(video[60].view()), Ok(PushOutcome::Stored));
