@@ -8,9 +8,9 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
-    App, Bounds, InteractiveElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, Pixels, SharedString, Stateful, StatefulInteractiveElement, Styled, Window,
-    canvas, div, px, relative, rgb, transparent_black,
+    App, Bounds, DispatchPhase, InteractiveElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, Window, canvas, div, px, relative, rgb, transparent_black,
 };
 
 use crate::ui::theme;
@@ -94,15 +94,40 @@ pub fn slider(
         .bottom_0()
         .child({
             let bounds = state.bounds.clone();
-            canvas(move |b, _, _| bounds.set(b), |_, (), _, _| {}).absolute().size_full()
+            let (st, on_drag) = (state.clone(), on_change.clone());
+            canvas(
+                move |b, _, _| bounds.set(b),
+                // While held, follow the mouse anywhere in the window (an element's own move and
+                // up listeners only fire while the pointer is over it, which drops the drag as
+                // soon as the pointer slips off this thin strip).
+                move |_, (), window, _| {
+                    if !st.dragging.get() {
+                        return;
+                    }
+                    let mv = st.clone();
+                    window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Bubble && mv.dragging.get() && ev.dragging() {
+                            on_drag(mv.fraction_at(ev.position.x), window, cx);
+                        }
+                    });
+                    let up = st.dragging.clone();
+                    window.on_mouse_event(move |ev: &MouseUpEvent, phase, window, _| {
+                        if phase == DispatchPhase::Bubble && ev.button == MouseButton::Left {
+                            up.set(false);
+                            window.refresh();
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .size_full()
         })
         .child(rail)
         .child(fill)
         .child(thumb);
 
-    let (down, drag, drop, out) =
-        (state.clone(), state.clone(), state.dragging.clone(), state.dragging.clone());
-    let (on_down, on_drag, on_key) = (on_change.clone(), on_change.clone(), on_change);
+    let down = state.clone();
+    let (on_down, on_key) = (on_change.clone(), on_change);
     div()
         .id(id)
         .group(group_id)
@@ -123,6 +148,8 @@ pub fn slider(
         .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, window, cx| {
             down.dragging.set(true);
             on_down(down.fraction_at(ev.position.x), window, cx);
+            // Repaint so the window-wide drag listeners (registered in paint) take over.
+            window.refresh();
         })
         // Arrow keys nudge it by 5% (Home and End jump to the ends), for keyboard use.
         .on_key_down(move |ev: &KeyDownEvent, window, cx| {
@@ -136,11 +163,4 @@ pub fn slider(
             cx.stop_propagation();
             on_key(to.clamp(0.0, 1.0), window, cx);
         })
-        .on_mouse_move(move |ev: &MouseMoveEvent, window, cx| {
-            if drag.dragging.get() && ev.dragging() {
-                on_drag(drag.fraction_at(ev.position.x), window, cx);
-            }
-        })
-        .on_mouse_up(MouseButton::Left, move |_, _, _| drop.set(false))
-        .on_mouse_up_out(MouseButton::Left, move |_, _, _| out.set(false))
 }

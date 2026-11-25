@@ -3581,8 +3581,27 @@ impl EditorView {
         }
 
         let ph_x = x_of(self.player.playhead);
-        let playhead_line =
-            div().absolute().top_0().h_full().left(px(ph_x - 1.0)).w(px(2.)).bg(rgb(theme::FG));
+        // A 10 px grab area around the 2 px line: press and drag it to scrub (the strip's move
+        // handler follows `scrubbing`), instead of the press reordering the piece under it.
+        let playhead_line = div()
+            .absolute()
+            .top_0()
+            .h_full()
+            .left(px(ph_x - 5.0))
+            .w(px(10.))
+            .flex()
+            .justify_center()
+            .cursor_col_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.moving = None;
+                    this.scrubbing = true;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .child(div().w(px(2.)).h_full().bg(rgb(theme::FG)));
         let playhead_cap = div()
             .absolute()
             .top(px(-3.))
