@@ -311,7 +311,8 @@ fn black_frame() -> Arc<RenderImage> {
 
 /// A running ffmpeg decode, killed when dropped.
 struct Decoder {
-    child: Child,
+    /// `None` only once dropped, when it has been handed to a thread to reap.
+    child: Option<Child>,
     frames: Receiver<Arc<RenderImage>>,
     /// Frames taken from `frames` so far.
     taken: u32,
@@ -349,14 +350,20 @@ impl Decoder {
                 }
             }
         });
-        Ok(Self { child, frames, taken: 0 })
+        Ok(Self { child: Some(child), frames, taken: 0 })
     }
 }
 
 impl Drop for Decoder {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Killed here, so quitting never leaves ffmpeg running; only the wait (which can take a
+        // moment while scrubbing drops one decoder per frame) is moved off the UI thread.
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
     }
 }
 
@@ -619,16 +626,20 @@ fn stop_audio_tree(mut sink: Child, mut decoders: Vec<Child>) {
         no_window(&mut cmd);
         cmd.spawn().ok()
     };
+    // Killed on this thread (it is quick), so quitting right after never leaves a process behind;
+    // only the waiting is left to a thread.
+    for dec in &mut decoders {
+        let _ = dec.kill();
+    }
+    let _ = sink.kill();
     std::thread::spawn(move || {
         for dec in &mut decoders {
-            let _ = dec.kill();
             let _ = dec.wait();
         }
         #[cfg(windows)]
         if let Some(mut tree) = tree {
             let _ = tree.wait();
         }
-        let _ = sink.kill();
         let _ = sink.wait();
     });
 }
@@ -695,10 +706,12 @@ fn spawn_multi_track_mixer(
         cmd.args(["-hide_banner", "-nostdin", "-loglevel", "error"])
             .arg("-ss")
             .arg(format!("{:.6}", item.from.as_secs_f64()))
-            .arg("-i")
-            .arg(&item.path)
+            // `-t` before `-i` counts source time; after it, output time, which `atempo` stretches
+            // (a slow speed would cut the sound short).
             .arg("-t")
             .arg(format!("{duration_secs:.6}"))
+            .arg("-i")
+            .arg(zc_editor::ffmpeg::input_arg(&item.path))
             .args(["-vn", "-sn", "-map"])
             .arg(format!("0:a:{}", sound.track));
         if !tempo_filters.is_empty() {

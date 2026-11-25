@@ -98,7 +98,6 @@ pub struct ZeroClipApp {
     pub menu_focus: FocusHandle,
     /// The metadata database (waveform cache). `None` when it couldn't be opened.
     pub store: Option<Arc<Mutex<zc_store::Store>>>,
-    #[allow(dead_code)] // used by the Profiles screen
     pub open_apps: ui::components::open_apps::OpenAppsList,
     /// The focus prompt on screen, if a second game asked to take over (D35).
     pub focus_prompt: Option<ui::focus_prompt::FocusPrompt>,
@@ -665,6 +664,14 @@ impl ZeroClipApp {
 impl Render for ZeroClipApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         ui::focus_prompt::clear_if_left(self);
+        // A hotkey field that was listening when the user left Settings (by any route) must not
+        // leave the global hotkeys suspended. Deferred: the view updates this entity.
+        if self.tab != Tab::Settings {
+            let settings = self.screens.settings().clone();
+            if settings.read(cx).is_listening() {
+                cx.defer(move |cx| settings.update(cx, |view, cx| view.leave(cx)));
+            }
+        }
         ui::shell(self, window, cx)
     }
 }

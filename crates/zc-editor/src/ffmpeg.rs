@@ -6,9 +6,10 @@
 //! verified to play (DESIGN §9, "Worth adding").
 
 use std::ffi::OsString;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use zc_core::Hns;
 use zc_core::media::Codec;
@@ -132,15 +133,15 @@ impl Ffmpeg {
     /// See [`FfmpegError`]. A video codec other than H.264, HEVC or AV1 is `Failed`.
     pub fn probe(&self, path: &Path) -> Result<ProbeInfo, FfmpegError> {
         let ffprobe = self.exe.with_file_name(PROBE_EXE);
-        let streams = run(&ffprobe, &stream_args(path))?;
+        let streams = run_for(&ffprobe, &stream_args(path), Some(PROBE_LIMIT))?;
         let (stream, duration, start) = parse_streams(&String::from_utf8_lossy(&streams))
             .map_err(|stderr| FfmpegError::Failed { stderr })?;
-        let packets = run(&ffprobe, &keyframe_args(path))?;
+        let packets = run_for(&ffprobe, &keyframe_args(path), Some(PROBE_LIMIT))?;
         let keyframes = parse_keyframes(&String::from_utf8_lossy(&packets), start);
         let audio_names = parse_audio_names(&String::from_utf8_lossy(&streams));
         // A second, small query: the format section of the first one would blur which `duration`
         // belongs to which stream. An unreadable span just means that track gets the whole clip.
-        let spans = run(&ffprobe, &audio_span_args(path))
+        let spans = run_for(&ffprobe, &audio_span_args(path), Some(PROBE_LIMIT))
             .map(|out| parse_audio_spans(&String::from_utf8_lossy(&out)))
             .unwrap_or_default();
         let audio_spans = (0..usize::from(stream.audio_tracks))
@@ -261,6 +262,15 @@ fn search_path(name: &str) -> Option<PathBuf> {
 /// Runs `exe` with `args` and returns its stdout. Non-zero exit is `Failed` with the last
 /// lines of stderr.
 fn run(exe: &Path, args: &[OsString]) -> Result<Vec<u8>, FfmpegError> {
+    run_for(exe, args, None)
+}
+
+/// How long a probe may take before it is killed: a hung or stuck file must not hold a reader
+/// thread (and the clip's tab) forever.
+const PROBE_LIMIT: Duration = Duration::from_secs(60);
+
+/// [`run`], killing the process and failing when it is still going after `limit`.
+fn run_for(exe: &Path, args: &[OsString], limit: Option<Duration>) -> Result<Vec<u8>, FfmpegError> {
     let mut cmd = Command::new(exe);
     cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(windows)]
@@ -271,12 +281,49 @@ fn run(exe: &Path, args: &[OsString]) -> Result<Vec<u8>, FfmpegError> {
         // https://learn.microsoft.com/windows/win32/procthread/process-creation-flags
         cmd.creation_flags(0x0800_0000);
     }
-    let out = cmd.output()?;
-    if out.status.success() {
-        Ok(out.stdout)
+    let Some(limit) = limit else {
+        let out = cmd.output()?;
+        return finish(out.status.success(), out.stdout, &out.stderr);
+    };
+    let mut child = cmd.spawn()?;
+    // Both pipes are drained on threads, or a chatty process would fill one and never exit.
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if started.elapsed() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let (stdout, stderr) = (stdout.join().unwrap_or_default(), stderr.join().unwrap_or_default());
+    match status {
+        Some(status) => finish(status.success(), stdout, &stderr),
+        None => {
+            Err(FfmpegError::Failed { stderr: format!("timed out after {} s", limit.as_secs()) })
+        }
+    }
+}
+
+fn finish(success: bool, stdout: Vec<u8>, stderr: &[u8]) -> Result<Vec<u8>, FfmpegError> {
+    if success {
+        Ok(stdout)
     } else {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        Err(FfmpegError::Failed { stderr: last_lines(&stderr, 20) })
+        Err(FfmpegError::Failed { stderr: last_lines(&String::from_utf8_lossy(stderr), 20) })
     }
 }
 
@@ -480,6 +527,21 @@ fn common_args() -> Vec<OsString> {
 }
 
 fn os(path: &Path) -> OsString {
+    input_arg(path)
+}
+
+/// `path` as a command-line argument ffmpeg takes for a file: a relative path that would read as
+/// an option (`-x.mp4`) or a protocol (`concat:a|b`, `http:`...) gets a `./` in front. Absolute
+/// paths (all the app passes) are untouched.
+#[must_use]
+pub fn input_arg(path: &Path) -> OsString {
+    if !path.is_absolute() {
+        let text = path.to_string_lossy();
+        let first = text.split(['/', '\\']).next().unwrap_or_default();
+        if text.starts_with('-') || first.contains(':') {
+            return format!("./{text}").into();
+        }
+    }
     path.as_os_str().to_os_string()
 }
 
@@ -1501,6 +1563,13 @@ mod tests {
             audio_edit_args_rebuilding_master(Path::new("i"), Path::new("o"), &tracks, 192_000)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn option_and_protocol_like_paths_are_made_plain_files() {
+        assert_eq!(input_arg(Path::new("-y.mp4")), OsString::from("./-y.mp4"));
+        assert_eq!(input_arg(Path::new("concat:a|b")), OsString::from("./concat:a|b"));
+        assert_eq!(input_arg(Path::new("clip.mp4")), OsString::from("clip.mp4"));
     }
 
     #[test]

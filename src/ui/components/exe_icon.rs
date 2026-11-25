@@ -38,7 +38,33 @@ pub fn capture(dir: &Path, exe: &str) -> bool {
 
 /// Finds an existing non-empty cached icon PNG for `game`, trying both the raw name and with a
 /// `.exe` suffix (clip game tags strip `.exe`, whereas profiles cache icons as `<name>.exe.png`).
+///
+/// Called for every game chip while drawing, so a lookup is kept for a few seconds (an icon that
+/// shows up later is found on the next expiry) instead of touching the disk on every frame.
 pub fn find_cached(dir: &Path, game: &str) -> Option<PathBuf> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    type Seen = HashMap<(PathBuf, String), (Instant, Option<PathBuf>)>;
+    static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
+    const KEEP: Duration = Duration::from_secs(5);
+    let key = (dir.to_path_buf(), game.to_owned());
+    if let Ok(seen) = SEEN.lock()
+        && let Some((at, found)) = seen.as_ref().and_then(|m| m.get(&key))
+        && at.elapsed() < KEEP
+    {
+        return found.clone();
+    }
+    let found = find_uncached(dir, game);
+    if let Ok(mut seen) = SEEN.lock() {
+        let map = seen.get_or_insert_with(HashMap::new);
+        map.retain(|_, (at, _)| at.elapsed() < KEEP);
+        map.insert(key, (Instant::now(), found.clone()));
+    }
+    found
+}
+
+fn find_uncached(dir: &Path, game: &str) -> Option<PathBuf> {
     let trimmed = game.trim();
     if trimmed.is_empty() {
         return None;

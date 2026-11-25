@@ -1746,11 +1746,12 @@ impl ProfilesView {
                     .icon_tried
                     .get(&profile.exe)
                     .is_none_or(|t| t.elapsed() > Duration::from_secs(3));
-                if !file.is_file() && due {
+                let present = file.is_file();
+                if !present && due {
                     self.icon_tried.insert(profile.exe.clone(), Instant::now());
-                    exe_icon::capture(icons_dir, &profile.exe);
+                    return exe_icon::capture(icons_dir, &profile.exe);
                 }
-                file.is_file()
+                present
             });
 
         let validation =
