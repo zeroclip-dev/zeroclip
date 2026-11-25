@@ -543,8 +543,9 @@ impl Timeline {
         self.join_within(i, JOIN_GAP_THRESHOLD)
     }
 
-    /// Like [`Self::join`], allowing a source-time gap up to `max_gap` between `pieces[i].b` and
-    /// `pieces[i + 1].a` (matching [`seam_joinable`] at the current zoom).
+    /// Joins piece `i` and the one after it back into one, allowing a source-time gap up to
+    /// `max_gap` between `pieces[i].b` and `pieces[i + 1].a` (matching [`seam_joinable`] at the
+    /// current zoom). Returns the joined piece's index.
     pub fn join_within(&mut self, i: usize, max_gap: Hns) -> Result<usize, String> {
         let (Some(first), Some(second)) = (self.pieces.get(i), self.pieces.get(i + 1)) else {
             return Err("There is no piece after this one to join.".to_owned());
