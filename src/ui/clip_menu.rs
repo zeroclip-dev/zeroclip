@@ -58,11 +58,21 @@ pub fn more_button(
         .hover(|s| s.bg(rgb(theme::ACCENT)).border_color(rgb(theme::BORDER)))
         .active(|s| s.bg(rgb(theme::SURFACE_ACTIVE)))
         .child(icons::icon("ellipsis", theme::FG_SOFT))
-        .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
-            // Not a drag start for the card underneath.
-            cx.stop_propagation();
-            let _ =
-                app.update(cx, |app, cx| app.open_clip_menu(path.clone(), ev.position, window, cx));
+        .on_mouse_down(MouseButton::Left, {
+            let (app, path) = (app.clone(), path.clone());
+            move |ev, window, cx| {
+                // Not a drag start for the card underneath.
+                cx.stop_propagation();
+                let _ = app
+                    .update(cx, |app, cx| app.open_clip_menu(path.clone(), ev.position, window, cx));
+            }
+        })
+        // Enter or Space on the focused button (a mouse click already opened it on press).
+        .on_click(move |ev, window, cx| {
+            if ev.is_keyboard() {
+                let _ =
+                    app.update(cx, |app, cx| app.open_clip_menu(path.clone(), ev.position(), window, cx));
+            }
         })
 }
 
@@ -159,11 +169,19 @@ pub fn layer(
         app.screens.clips().clone().update(cx, |clips, cx| clips.begin_rename(path, window, cx));
     }));
     items.push(menu_rule().into_any_element());
-    items.push(item("menu-delete", "Move to Recycle Bin", true, |app, path, _, _| {
+    items.push(item("menu-delete", "Move to Recycle Bin", true, |app, path, _, cx| {
         match zc_win::shell::recycle(&path) {
             Ok(()) => {
-                let _ = std::fs::remove_file(zc_core::bookmarks::sidecar(&path));
-                zc_core::game_tag::remove(&path);
+                // The bookmarks and game tag go to the bin too, so restoring the clip from there
+                // brings them back with it.
+                for side in [zc_core::bookmarks::sidecar(&path), path.with_extension("game")] {
+                    if side.is_file() {
+                        let _ = zc_win::shell::recycle(&side);
+                    }
+                }
+                // A screen still pointing at the deleted file would show or play a ghost.
+                app.screens.clips().clone().update(cx, |clips, cx| clips.forget(&path, cx));
+                app.screens.player().clone().update(cx, |player, cx| player.forget(&path, cx));
                 app.clips.invalidate();
                 app.notify(NoticeLevel::Info, "Moved to the Recycle Bin");
             }
@@ -202,13 +220,15 @@ pub fn layer(
         .occlude()
         // Esc closes it. The owner focuses `menu_focus` when it opens the menu.
         .track_focus(&app.menu_focus)
-        .on_key_down(move |ev, _, cx| {
-            if ev.keystroke.key == "escape" {
-                close_key.update(cx, |app, cx| {
-                    app.clip_menu = None;
-                    cx.notify();
-                });
-            }
+        .on_key_down(move |ev, window, cx| match ev.keystroke.key.as_str() {
+            "escape" => close_key.update(cx, |app, cx| {
+                app.clip_menu = None;
+                cx.notify();
+            }),
+            // Arrow keys walk the rows, like Tab and Shift+Tab.
+            "down" => window.focus_next(cx),
+            "up" => window.focus_prev(cx),
+            _ => {}
         })
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())

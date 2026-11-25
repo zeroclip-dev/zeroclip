@@ -161,6 +161,11 @@ pub fn run(
     infos: &[StreamInfo],
     output: &Path,
 ) -> Result<Duration> {
+    // Never touch a file that is already there: the cleanup below deletes `output` on failure and
+    // the final rename would overwrite it. Callers pick a free name, so this is only a race.
+    if output.exists() {
+        anyhow::bail!("{} already exists", output.display());
+    }
     let started = Instant::now();
     let mut made: Vec<Made> = Vec::new();
     // One piece off a keyframe re-encodes every piece's video the same way, so the joined
