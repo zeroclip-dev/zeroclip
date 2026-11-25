@@ -504,6 +504,12 @@ impl Pipeline {
             (u32::try_from(size.Width).unwrap_or(0), u32::try_from(size.Height).unwrap_or(0));
         // NV12 and the encoders need even sizes.
         let size_out = (size_in.0 & !1, size_in.1 & !1);
+        if size_out.0 == 0 || size_out.1 == 0 {
+            return Err(SourceError::Other(format!(
+                "the capture target has no size ({}x{}); is the window minimised?",
+                size_in.0, size_in.1
+            )));
+        }
         let converter = NvConverter::new(&device, size_in, size_out)?;
 
         // The codec ladder: the preference if the GPU has it, else the best it has;
