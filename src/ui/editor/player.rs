@@ -828,7 +828,7 @@ fn spawn_multi_track_mixer(
                 let samples = aligned_bytes / size_of::<f32>();
                 for (s, b) in pcm_bufs[idx][..samples]
                     .iter_mut()
-                    .zip(raw_bufs[idx][..aligned_bytes].chunks_exact(4))
+                    .zip(raw_bufs[idx][..aligned_bytes].as_chunks::<4>().0)
                 {
                     *s = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
                 }
@@ -853,8 +853,11 @@ fn spawn_multi_track_mixer(
             scale_pcm_chunk(&mut mix_out[..max_samples], last_gain, target, MIX_CHANNELS);
             last_gain = target;
             let write_len = max_samples * size_of::<f32>();
-            for (dst, &sample) in
-                out_bytes[..write_len].chunks_exact_mut(4).zip(&mix_out[..max_samples])
+            for (dst, &sample) in out_bytes[..write_len]
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(&mix_out[..max_samples])
             {
                 dst.copy_from_slice(&sample.to_le_bytes());
             }
