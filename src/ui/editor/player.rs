@@ -340,11 +340,15 @@ impl Decoder {
         };
         let (tx, frames) = sync_channel(BACKLOG);
         std::thread::spawn(move || {
-            let mut raw = vec![0u8; (WIDTH * HEIGHT * 4) as usize];
             // Ends when ffmpeg exits or is killed (the read fails), or the player is gone.
-            while stdout.read_exact(&mut raw).is_ok() {
+            loop {
+                // Each frame gets its own buffer, which the image then owns: no copy.
+                let mut raw = vec![0u8; (WIDTH * HEIGHT * 4) as usize];
+                if stdout.read_exact(&mut raw).is_err() {
+                    break;
+                }
                 // ffmpeg's BGRA is the byte order GPUI wants, so the bytes go in as they are.
-                let Some(buffer) = RgbaImage::from_raw(WIDTH, HEIGHT, raw.clone()) else {
+                let Some(buffer) = RgbaImage::from_raw(WIDTH, HEIGHT, raw) else {
                     break;
                 };
                 if tx.send(Arc::new(RenderImage::new(vec![Frame::new(buffer)]))).is_err() {

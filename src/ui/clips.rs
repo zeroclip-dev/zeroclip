@@ -423,11 +423,17 @@ impl ClipsView {
             Ok(to) => {
                 zc_core::bookmarks::rename(&rename.path, &to);
                 zc_core::game_tag::rename(&rename.path, &to);
+                let from = rename.path.clone();
                 self.selected = Some(to.clone());
                 self.renaming = None;
                 let name =
                     to.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
                 let _ = self.app.update(cx, |app, cx| {
+                    // A project that holds the clip must follow it to its new name.
+                    app.screens
+                        .editor()
+                        .clone()
+                        .update(cx, |editor, cx| editor.rename(&from, &to, cx));
                     app.clips.invalidate();
                     app.notify(NoticeLevel::Info, format!("Renamed to {name}"));
                     cx.notify();
