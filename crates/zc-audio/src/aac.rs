@@ -228,7 +228,12 @@ impl AacEncoder {
                 let mut data = std::ptr::null_mut();
                 let mut len = 0u32;
                 self.output_buffer.Lock(&mut data, None, Some(&mut len)).context("Lock (AAC)")?;
-                let bytes = std::slice::from_raw_parts(data, len as usize);
+                // A null pointer or zero length would make the slice undefined behaviour.
+                let bytes: &[u8] = if data.is_null() || len == 0 {
+                    &[]
+                } else {
+                    std::slice::from_raw_parts(data, len as usize)
+                };
                 if !bytes.is_empty() {
                     sink.push(PacketRef {
                         meta: PacketMeta { track: self.track, pts, duration, keyframe: true },

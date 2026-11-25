@@ -405,11 +405,14 @@ impl HwEncoder {
             let mut data = std::ptr::null_mut();
             let mut len = 0u32;
             buffer.Lock(&mut data, None, Some(&mut len)).context("IMFMediaBuffer::Lock")?;
-            let bytes = std::slice::from_raw_parts(data, len as usize);
-            sink.push(PacketRef {
-                meta: PacketMeta { track: TrackId::Video, pts, duration, keyframe },
-                data: bytes,
-            });
+            // A null pointer or zero length would make the slice undefined behaviour.
+            if !data.is_null() && len != 0 {
+                let bytes = std::slice::from_raw_parts(data, len as usize);
+                sink.push(PacketRef {
+                    meta: PacketMeta { track: TrackId::Video, pts, duration, keyframe },
+                    data: bytes,
+                });
+            }
             buffer.Unlock().context("IMFMediaBuffer::Unlock")?;
         }
         Ok(())
