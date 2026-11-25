@@ -1,6 +1,5 @@
 //! The "Open apps" list: windows running now, each with toggles to make it a game profile or a
 //! recorded audio track. Used by the Profiles tab.
-#![allow(dead_code)] // used once the Profiles screen is ported
 
 use std::path::Path;
 
