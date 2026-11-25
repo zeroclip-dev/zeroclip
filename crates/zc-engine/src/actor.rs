@@ -141,6 +141,7 @@ impl Engine {
             wake,
             status: EngineStatus::default(),
             recorder: Arc::new(Recorder::new(dvr)),
+            dvr_applied: dvr,
             stats_seen: RecorderStats::default(),
             audio_tracks: Vec::new(),
             recording: None,
@@ -265,6 +266,9 @@ struct Actor {
     /// The thread that writes finished GOPs to the ring file, in disk mode (P4.21).
     persister: Option<Persister>,
     output_dir: PathBuf,
+    /// The size the RAM buffer was last given, so a change of bitrate or of `enabled` resizes it
+    /// even when the window stays the same.
+    dvr_applied: DvrConfig,
     /// Where output goes when the setting is cleared.
     default_output_dir: PathBuf,
     ports: Ports,
@@ -770,8 +774,9 @@ impl Actor {
         let ram = effective_ram_ceiling(self.settings.dvr.ram_ceiling_mib, self.total_mib);
         let disk = self.storage == DvrStorage::Disk;
         let clamp = clamp_for(&self.settings, profile, if disk { u32::MAX } else { ram.mib });
-        if clamp.window != self.status.buffer_window && self.settings.dvr.enabled {
-            let config = dvr_for(&self.settings, clamp.window);
+        let config = dvr_for(&self.settings, clamp.window);
+        let changed = clamp.window != self.status.buffer_window || config != self.dvr_applied;
+        if changed && self.settings.dvr.enabled {
             if disk {
                 // Sized at start for the largest saved window, so this is a no-op unless a
                 // settings change since then asked for more (and then it keeps the footage).
@@ -787,6 +792,7 @@ impl Actor {
                 }
             } else {
                 self.recorder.resize(config);
+                self.dvr_applied = config;
             }
         }
         self.status.buffer_window = clamp.window;
