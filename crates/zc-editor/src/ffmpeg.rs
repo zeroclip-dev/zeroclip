@@ -126,6 +126,14 @@ impl Ffmpeg {
         run(&self.exe, &remux_args(input, output)).map(drop)
     }
 
+    /// Rewrites `input` as a plain MP4 at `output`, keeping every track ([`faststart_args`]).
+    ///
+    /// # Errors
+    /// See [`FfmpegError`].
+    pub fn faststart(&self, input: &Path, output: &Path) -> Result<(), FfmpegError> {
+        run(&self.exe, &faststart_args(input, output)).map(drop)
+    }
+
     /// Reads the first video stream, the audio track count, the duration and the keyframe
     /// times of `path` (ffprobe, demux only).
     ///
@@ -715,6 +723,33 @@ pub fn remux_args(input: &Path, output: &Path) -> Vec<OsString> {
     args.extend(
         ["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-movflags", "+faststart"]
             .map(OsString::from),
+    );
+    args.push(os(output));
+    args
+}
+
+/// Arguments for a stream-copy remux that keeps every stream (all audio tracks and their names)
+/// as a plain MP4 with the index up front. Only the first audio track (Master) is marked
+/// default, so players that pick one track play the mix.
+#[must_use]
+pub fn faststart_args(input: &Path, output: &Path) -> Vec<OsString> {
+    let mut args = common_args();
+    args.push("-i".into());
+    args.push(os(input));
+    args.extend(
+        [
+            "-map",
+            "0",
+            "-c",
+            "copy",
+            "-disposition:a",
+            "0",
+            "-disposition:a:0",
+            "default",
+            "-movflags",
+            "+faststart",
+        ]
+        .map(OsString::from),
     );
     args.push(os(output));
     args

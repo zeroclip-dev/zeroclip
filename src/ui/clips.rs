@@ -459,9 +459,9 @@ fn thumb_file_name(file: &ClipFile) -> String {
     format!("{hash:016x}.jpg")
 }
 
-/// Rewrites `clip` as a plain MP4 at `to`: index up front, the video and the Master audio only.
-/// Recordings are fragmented so a crash can't corrupt them, but VLC and Windows Media Player
-/// mishandle seeking in those, and in files with several audio tracks.
+/// Rewrites `clip` as a plain MP4 at `to`: index up front, every track kept (the editor's lanes
+/// need them), Master marked default. Recordings are fragmented so a crash can't corrupt them,
+/// but VLC and Windows Media Player mishandle seeking in fragmented files.
 pub fn remux_plain(ffmpeg_path: Option<&Path>, clip: &Path, to: &Path) -> Result<(), String> {
     // The cleanup below deletes `to` on failure: never when it was already there (ffmpeg refuses
     // to overwrite, and that file isn't ours).
@@ -469,7 +469,7 @@ pub fn remux_plain(ffmpeg_path: Option<&Path>, clip: &Path, to: &Path) -> Result
         return Err(format!("{} already exists", to.display()));
     }
     let ffmpeg = Ffmpeg::locate(ffmpeg_path).map_err(|e| e.to_string())?;
-    let result = ffmpeg.remux_for_export(clip, to).map_err(|e| e.to_string());
+    let result = ffmpeg.faststart(clip, to).map_err(|e| e.to_string());
     if result.is_err() || std::fs::metadata(to).map_or(true, |m| m.len() == 0) {
         let _ = std::fs::remove_file(to);
         return result.and(Err("ffmpeg wrote nothing".into()));
