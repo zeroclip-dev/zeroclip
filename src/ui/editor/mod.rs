@@ -401,7 +401,10 @@ impl EditorView {
                 // Clips differ in how many audio tracks they have (an app that was closed has no
                 // track), so those are not compared; every piece keeps the tracks all share.
                 let same_audio = |s: StreamInfo| StreamInfo { audio_tracks: 0, ..s };
-                if let Some(first) = self.sources.first()
+                // Compare with a clip still on the timeline: a deleted clip stays in `sources`
+                // for undo, but must not block a clip that only has to match what is left.
+                if let Some(first) =
+                    self.timeline.pieces.first().and_then(|p| self.sources.get(p.source))
                     && let Err(error) = zc_editor::concat::check_compatible(&[
                         same_audio(first.info.stream),
                         same_audio(info.stream),
