@@ -134,6 +134,10 @@ pub struct EditorView {
     /// The width the timeline was last drawn at.
     drawn_width: f32,
     scrubbing: bool,
+    /// Playback was running when the scrub started; resumes from the final position on release.
+    scrub_resume: bool,
+    /// Latest scrub time waiting for the in-flight still decode to finish (older ones are dropped).
+    scrub_pending: Option<Hns>,
     player: Player,
     /// Whether a task is already ticking the player.
     ticking: bool,
@@ -253,6 +257,8 @@ impl EditorView {
             strip: Rc::new(Cell::new(Bounds::default())),
             drawn_width: 0.0,
             scrubbing: false,
+            scrub_resume: false,
+            scrub_pending: None,
             lanes: Rc::default(),
             drag: None,
             range: None,
@@ -336,6 +342,7 @@ impl EditorView {
     fn reset(&mut self) {
         self.generation += 1;
         self.player.pause();
+        self.ffmpeg = None;
         self.sources.clear();
         self.timeline = Timeline::default();
         self.mix.clear();
@@ -348,6 +355,8 @@ impl EditorView {
         self.loading.clear();
         self.problem = None;
         self.scrubbing = false;
+        self.scrub_resume = false;
+        self.scrub_pending = None;
         self.player.reset();
         self.picking = false;
         self.finishing = false;
@@ -479,6 +488,7 @@ impl EditorView {
                 if self.solo.is_some_and(|s| s >= tracks) {
                     self.solo = None;
                 }
+                let first = self.timeline.pieces.is_empty();
                 self.timeline.pieces.push(Piece {
                     source: index,
                     a: Hns::ZERO,
@@ -493,11 +503,11 @@ impl EditorView {
                     info,
                     waves: vec![None; own],
                 });
-                for track in 0..own {
+                // Only the lanes that are drawn: with several tracks, track 0 (Master) is hidden.
+                for track in usize::from(tracks > 1)..tracks {
                     self.spawn_waveform(generation, &ffmpeg, index, track, cx);
                 }
                 self.spawn_thumbs(generation, &ffmpeg, index, cx);
-                let first = self.ffmpeg.is_none();
                 self.ffmpeg = Some(ffmpeg);
                 if first {
                     self.seek(Hns::ZERO, cx);
@@ -651,13 +661,37 @@ impl EditorView {
         }
     }
 
+    /// Empties the project when it holds `path`, a file that was just deleted.
+    pub fn forget(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if self.sources.iter().any(|s| s.path == path) {
+            self.reset();
+            self.problem = Some("A clip on the timeline was deleted.".to_owned());
+            cx.notify();
+        }
+    }
+
+    /// Points the project at `to` when it holds `from`, a file that was just renamed.
+    pub fn rename(&mut self, from: &Path, to: &Path, cx: &mut Context<Self>) {
+        let name = to.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let mut found = false;
+        for source in self.sources.iter_mut().filter(|s| s.path == from) {
+            source.path = to.to_path_buf();
+            source.name.clone_from(&name);
+            found = true;
+        }
+        if found {
+            cx.notify();
+        }
+    }
+
     /// Adds every clip in `paths` to the end of the timeline. Anything that isn't a file is
     /// reported, not silently skipped.
     fn add_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
         let mut skipped = 0;
         for path in paths {
             if path.is_file() {
-                self.add_clip(path.clone(), cx);
+                // A relative path would resolve against whatever the working directory is later.
+                self.add_clip(std::path::absolute(path).unwrap_or_else(|_| path.clone()), cx);
             } else {
                 skipped += 1;
             }
@@ -762,6 +796,24 @@ impl EditorView {
     /// Pauses and shows the frame at timeline time `t`.
     fn seek(&mut self, t: Hns, cx: &mut Context<Self>) {
         let t = t.min(self.timeline.total());
+        let Some((i, _)) = self.timeline.locate(t) else { return };
+        if self.ffmpeg.is_none() {
+            return;
+        }
+        if self.scrubbing && self.player.busy() {
+            // A still is still decoding: keep only the latest time, the tick shows it next.
+            self.player.playhead = t;
+            self.scrub_pending = Some(t);
+        } else {
+            self.show_still(t);
+        }
+        self.selected = Some(i);
+        self.ensure_ticking(cx);
+        cx.notify();
+    }
+
+    /// Pauses and starts decoding the frame at timeline time `t`.
+    fn show_still(&mut self, t: Hns) {
         let Some((i, src)) = self.timeline.locate(t) else { return };
         let Some(ffmpeg) = self.ffmpeg.as_ref() else { return };
         let piece = &self.timeline.pieces[i];
@@ -770,9 +822,32 @@ impl EditorView {
         } else {
             self.player.show_at(ffmpeg, &self.sources[piece.source].path, src, t);
         }
-        self.selected = Some(i);
-        self.ensure_ticking(cx);
-        cx.notify();
+    }
+
+    /// Starts a drag on the timeline that scrubs. Playback pauses so the drag shows stills, not a
+    /// restart per move.
+    fn begin_scrub(&mut self) {
+        self.scrubbing = true;
+        self.scrub_resume = self.player.playing;
+        if self.scrub_resume {
+            self.player.pause();
+        }
+    }
+
+    /// Ends a scrub: shows the last still, or resumes playing from it.
+    fn end_scrub(&mut self, cx: &mut Context<Self>) {
+        if !self.scrubbing {
+            return;
+        }
+        self.scrubbing = false;
+        let pending = self.scrub_pending.take();
+        if std::mem::take(&mut self.scrub_resume) {
+            self.play_from(self.player.playhead, cx);
+        } else if let Some(t) = pending {
+            self.show_still(t);
+            self.ensure_ticking(cx);
+            cx.notify();
+        }
     }
 
     /// Stops playback, picture and sound. Called when the user leaves the Editor tab.
@@ -858,6 +933,8 @@ impl EditorView {
         }
         self.paused_on_blur = false;
         self.scrubbing = false;
+        self.scrub_resume = false;
+        self.scrub_pending = None;
         self.player.pause();
         if self.timeline.locate(Hns::ZERO).is_some() {
             self.seek(Hns::ZERO, cx);
@@ -882,7 +959,11 @@ impl EditorView {
                             this.ticking = false;
                             return false;
                         }
-                        let busy = this.player.tick();
+                        let mut busy = this.player.tick();
+                        if !busy && let Some(t) = this.scrub_pending.take() {
+                            this.show_still(t);
+                            busy = this.player.busy();
+                        }
                         if this.player.playing {
                             this.selected = this.timeline.locate(this.player.playhead).map(|l| l.0);
                         }
@@ -931,7 +1012,7 @@ impl EditorView {
         }
         let edited_audio = self.drag.is_some();
         self.trim = None;
-        self.scrubbing = false;
+        self.end_scrub(cx);
         self.drag = None;
         self.ranging = false;
         // A click, not a drag: no range.
@@ -986,13 +1067,13 @@ impl EditorView {
         const GRAB: f32 = 9.0;
         let lane = self.lanes.borrow().get(t).copied();
         let (Some(lane), Some((i, _))) = (lane, self.timeline.locate(here)) else {
-            self.scrubbing = true;
+            self.begin_scrub();
             self.seek(here, cx);
             return;
         };
         if self.timeline.pieces[i].gap {
             // A gap has no sound to edit: the press just moves the playhead there.
-            self.scrubbing = true;
+            self.begin_scrub();
             self.seek(here, cx);
             return;
         }
@@ -1310,6 +1391,11 @@ impl EditorView {
         };
         let Some(state) = from.pop() else { return };
         to.push(std::mem::replace(&mut self.timeline.pieces, state));
+        // The restored state may have fewer tracks than the soloed one.
+        let tracks = self.timeline.pieces.first().map_or(0, |p| p.tracks.len());
+        if self.solo.is_some_and(|s| s >= tracks) {
+            self.solo = None;
+        }
         self.problem = None;
         self.drag = None;
         self.range = None;
@@ -1794,7 +1880,8 @@ fn build_piece_sounds(
     let to_sound = |track: usize, edit: &TrackEdit| Sound {
         track,
         mute: edit.mute,
-        gain_db: edit.gain_db,
+        // The level at this point, so a line too short to send still plays at its own level.
+        gain_db: edit.db_at(from_offset),
         line: edit.line_from(from_offset),
         silence_ranges: Vec::new(),
     };
@@ -3587,8 +3674,10 @@ impl EditorView {
                 let y_of = |db: f64| model::db_to_frac(db) * LANE_HEIGHT;
                 block = block.children(line.windows(2).flat_map(|seg| {
                     let (x0, x1) = (px_of(seg[0].at), px_of(seg[1].at));
-                    let steps = ((x1 - x0) / 2.0).ceil().max(1.0) as usize;
                     let (d0, d1) = (seg[0].db, seg[1].db);
+                    // A level stretch is one bar; only a slope needs a step every 2 px.
+                    let steps =
+                        if d0 == d1 { 1 } else { ((x1 - x0) / 2.0).ceil().max(1.0) as usize };
                     (0..steps).map(move |k| {
                         let f = (k as f64 + 0.5) / steps as f64;
                         let y = y_of(d0 + (d1 - d0) * f);
@@ -3735,7 +3824,7 @@ impl EditorView {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _, cx| {
                     this.moving = None;
-                    this.scrubbing = true;
+                    this.begin_scrub();
                     cx.stop_propagation();
                     cx.notify();
                 }),
@@ -3908,7 +3997,7 @@ impl EditorView {
                         this.click_split(t, cx);
                     } else if ev.modifiers.shift {
                         // Shift keeps the old press-and-drag scrub.
-                        this.scrubbing = true;
+                        this.begin_scrub();
                         this.seek(t, cx);
                     } else {
                         // A click selects; moving 4 px or more turns the press into a reorder.
@@ -4508,6 +4597,17 @@ mod tests {
         assert_eq!(solo, Some(1));
         assert_eq!(solo_sounds.len(), 1);
         assert_eq!(solo_sounds[0].track, 1);
+    }
+
+    #[test]
+    fn preview_keeps_the_envelope_level_near_a_piece_end() {
+        let mut edit = TrackEdit::default();
+        edit.add_point(Hns::from_secs(5), -12.0, Hns::from_secs(10));
+        // 20 ms before the end the line is too short to send, but the level is still the line's.
+        let at = Hns::from_secs(10) - Hns::from_millis(20);
+        let (sounds, _) = build_piece_sounds(&[edit.clone()], at, None);
+        assert!(sounds[0].line.is_none());
+        assert_eq!(sounds[0].gain_db, edit.db_at(at));
     }
 
     #[test]

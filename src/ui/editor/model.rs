@@ -250,6 +250,8 @@ impl TrackEdit {
     /// Silences `a..b` of a piece `span` long with a dip in the volume line, short ramps either side
     /// so there is no click. The video and the other tracks are untouched.
     pub fn silence(&mut self, a: Hns, b: Hns, span: Hns) {
+        // A stale range (the piece was cut since) must not reach past the piece.
+        let (a, b) = (a.max(Hns::ZERO), b.min(span));
         if self.mute || b <= a {
             return;
         }
@@ -1441,6 +1443,18 @@ mod tests {
         let mut all = TrackEdit::default();
         all.silence(Hns::ZERO, secs(10), secs(10));
         assert!(all.mute);
+    }
+
+    #[test]
+    fn silencing_a_stale_range_stays_inside_the_piece() {
+        let mut e = TrackEdit::default();
+        e.silence(secs(8), secs(15), secs(10));
+        assert!(e.points.iter().all(|p| p.at <= secs(10)));
+        assert_eq!(e.db_at(secs(9)), MIN_DB);
+        // Entirely past the end: nothing to silence.
+        let mut gone = TrackEdit::default();
+        gone.silence(secs(11), secs(12), secs(10));
+        assert_eq!(gone, TrackEdit::default());
     }
 
     #[test]
