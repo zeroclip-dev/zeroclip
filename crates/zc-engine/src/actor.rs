@@ -1339,13 +1339,14 @@ impl Actor {
 
     /// Starts the video source on `target`, and the audio sources unless they already run.
     fn start_capture(&mut self, target: CaptureTarget) {
-        self.start_video(target);
-        if !self.audio_running {
+        // No audio without video: it would fill the buffer with tracks no clip can use.
+        if self.start_video(target) && !self.audio_running {
             self.start_audio();
         }
     }
 
-    fn start_video(&mut self, target: CaptureTarget) {
+    /// Returns false when a video source exists but failed to start.
+    fn start_video(&mut self, target: CaptureTarget) -> bool {
         let health = self.health_emitter();
         let config = video_start(&self.settings, target);
         let sink: SharedSink = self.recorder.clone();
@@ -1360,11 +1361,15 @@ impl Actor {
                 self.status.codec = Some(codec);
                 self.video_track = self.ports.video.as_ref().and_then(|video| video.format());
             }
-            Some(Err(e)) => self.emit(EngineEvent::Error(format!("Capture couldn't start: {e}"))),
+            Some(Err(e)) => {
+                self.emit(EngineEvent::Error(format!("Capture couldn't start: {e}")));
+                return false;
+            }
             None => self.emit(EngineEvent::Warning(
                 "No capture source is attached, so nothing is captured or buffered.".into(),
             )),
         }
+        true
     }
 
     fn stop_sources(&mut self) {
@@ -1394,7 +1399,9 @@ impl Actor {
         self.status.capturing = false;
         match target {
             // Audio keeps running when only the video restarts.
-            Some(target) if was_capturing => self.start_video(target),
+            Some(target) if was_capturing => {
+                self.start_video(target);
+            }
             Some(target) => self.start_capture(target),
             None => self.stop_capture(),
         }
@@ -2270,6 +2277,44 @@ mod tests {
         let event = wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
         let EngineEvent::Status(status) = event else { unreachable!() };
         assert!(!status.capturing);
+    }
+
+    #[test]
+    fn audio_does_not_start_when_video_failed() {
+        let game = FakeAudio::default();
+        let ports = Ports {
+            video: Some(Box::new(FakeVideo { fail: true, targets: Arc::default() })),
+            game_audio: Some(Box::new(game.clone())),
+            ..Ports::default()
+        };
+        let (engine, _) = spawn_in(screen_settings(), ports);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Error(m) if m.starts_with("Capture")));
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        assert_eq!(game.0.lock().unwrap().0, 0, "no audio without video");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn game_mode_capture_stops_when_the_game_exits() {
+        let (targets, input) = (Arc::new(Mutex::new(Vec::new())), FakeInput::default());
+        let ports = Ports {
+            input: Some(Box::new(input.clone())),
+            video: Some(Box::new(FakeVideo { fail: false, targets })),
+            ..Ports::default()
+        };
+        let mut settings = Settings::default();
+        settings.profiles.games.iter_mut().for_each(|game| game.session_recording = false);
+        let (engine, _) = spawn_in(settings, ports);
+        wait_for(&engine, |e| matches!(e, EngineEvent::Status(_)));
+        let emit = input.0.lock().unwrap().clone().expect("input started");
+        emit(OsEvent::Foreground { pid: 42, hwnd: 100, exe: CS2.into(), fullscreen: false });
+        wait_for_focus(&engine, CS2, true);
+        emit(OsEvent::ProcessExited { pid: 42, exit_code: 0 });
+        wait_for(
+            &engine,
+            |e| matches!(e, EngineEvent::Status(s) if s.game.is_none() && !s.capturing),
+        );
+        engine.shutdown();
     }
 
     #[test]
