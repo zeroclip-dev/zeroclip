@@ -37,6 +37,7 @@ use zc_core::time::FramePacer;
 use zc_core::watchdog::HealthEvent;
 use zc_win::clock;
 use zc_win::com::Apartment;
+use zc_win::error::WinResultExt;
 use zc_win::mf::MediaFoundation;
 
 use crate::capture::{CapturedFrame, WgcCapture, capture_item, hdr_sdr_white};
@@ -296,7 +297,13 @@ impl FrameHandler {
             Ok(Err(TrySendError::Full(_))) | Err(_) => {
                 if !self.dropping {
                     match &sent {
-                        Err(e) => tracing::warn!(%e, "dropping frames: conversion failed"),
+                        Err(e) => {
+                            tracing::warn!(%e, "dropping frames: conversion failed");
+                            // SAFETY: plain COM call on a live device.
+                            if let Err(lost) = unsafe { self.device.GetDeviceRemovedReason() } {
+                                (self.health)(HealthEvent::EncoderFault { hresult: lost.code().0 });
+                            }
+                        }
                         _ => tracing::warn!("dropping frames: the encoder isn't keeping up"),
                     }
                 }
@@ -380,6 +387,9 @@ fn run(
                     device = ?device_ok,
                     "video health (last 5 s)"
                 );
+                // A removed or reset GPU never recovers by itself: end the loop so the fault
+                // below reaches the watchdog, which rebuilds the device and encoder.
+                device_ok.context("D3D11 device removed")?;
             }
             let now_seen = shared.seen.load(Ordering::Relaxed);
             if now_seen != seen {
