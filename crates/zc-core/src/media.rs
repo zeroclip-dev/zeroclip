@@ -129,7 +129,7 @@ pub struct TrackInfo {
 }
 
 /// Most audio tracks a recording can carry. Video is always one more track (DESIGN §6).
-pub const MAX_AUDIO_TRACKS: u8 = 7;
+pub const MAX_AUDIO_TRACKS: u8 = 16;
 
 /// An audio track's slot, below [`MAX_AUDIO_TRACKS`]. The field is private, so the only
 /// ways to make one are [`TrackId::audio`] and the named constants on [`TrackId`].
@@ -162,16 +162,15 @@ impl TrackId {
     /// Number of tracks: video plus every audio slot.
     pub const COUNT: usize = 1 + MAX_AUDIO_TRACKS as usize;
     /// All tracks, in index order: video, then audio slots 0 and up.
-    pub const ALL: [Self; Self::COUNT] = [
-        Self::Video,
-        Self::Audio(AudioTrack(0)),
-        Self::Audio(AudioTrack(1)),
-        Self::Audio(AudioTrack(2)),
-        Self::Audio(AudioTrack(3)),
-        Self::Audio(AudioTrack(4)),
-        Self::Audio(AudioTrack(5)),
-        Self::Audio(AudioTrack(6)),
-    ];
+    pub const ALL: [Self; Self::COUNT] = {
+        let mut all = [Self::Video; Self::COUNT];
+        let mut n = 0;
+        while n < MAX_AUDIO_TRACKS {
+            all[1 + n as usize] = Self::Audio(AudioTrack(n));
+            n += 1;
+        }
+        all
+    };
 
     /// The audio track in slot `n`, or `None` if `n` is [`MAX_AUDIO_TRACKS`] or more.
     #[must_use]

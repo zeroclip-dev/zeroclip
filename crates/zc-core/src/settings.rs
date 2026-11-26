@@ -824,14 +824,14 @@ storage = \"disk\"
     }
 
     #[test]
-    fn at_most_four_app_tracks_fit_the_audio_slots() {
-        assert_eq!(MAX_APP_TRACKS, 4);
+    fn app_tracks_beyond_the_audio_slots_are_rejected() {
+        assert_eq!(MAX_APP_TRACKS, 13);
         let mut s = Settings::default();
         s.audio.app_tracks =
             (0..MAX_APP_TRACKS).map(|i| track(&format!("App {i}"), "a.exe")).collect();
         assert!(s.problems().is_empty(), "{:#?}", s.problems());
         s.audio.app_tracks.push(track("Extra", "b.exe"));
-        assert!(s.problems().iter().any(|p| p.contains("At most 4 app tracks")));
+        assert!(s.problems().iter().any(|p| p.contains("At most 13 app tracks")));
     }
 
     #[test]
