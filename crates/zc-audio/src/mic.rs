@@ -236,6 +236,11 @@ impl AudioSource for MicSource {
                     }
                     continue;
                 };
+                // Silence up to 100 ms ago before any read, so a mic that stops delivering for
+                // over a second leaves no gap (as game and app audio).
+                if let Err(e) = encode.pad_silence(zc_win::clock::now(), &*sink) {
+                    tracing::warn!(%e, "microphone silence failed");
+                }
                 let result = s.read(|data, frames, qpc| {
                     let n = (frames as usize * ch).min(pcm.len());
                     let buf = &mut pcm[..n];

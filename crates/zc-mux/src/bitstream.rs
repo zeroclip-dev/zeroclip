@@ -99,8 +99,15 @@ pub fn avcc(sps: &[u8], pps: &[u8]) -> Result<Vec<u8>, TryFromIntError> {
     // numOfPictureParameterSets = 1.
     record.push(1);
     push_length16(&mut record, pps)?;
-    // ponytail: the High-profile extension (chroma format, bit depths, SPS extensions) is
-    // not written. Add it when a player rejects a High-profile file.
+    // The High-profile family must carry chroma format, bit depths and the SPS-extension
+    // count (ISO/IEC 14496-15, 5.3.3.1.2).
+    // ponytail: assumes 4:2:0 8-bit, which every hardware encoder here emits. Read them from
+    // the SPS if 4:2:2/10-bit H.264 is ever supported.
+    if matches!(profile, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138) {
+        // 6 reserved bits + chroma_format 1; 5 reserved + bit_depth_luma_minus8 0; the same
+        // for chroma; numOfSequenceParameterSetExt 0.
+        record.extend_from_slice(&[0xFD, 0xF8, 0xF8, 0x00]);
+    }
     Ok(record)
 }
 
@@ -522,8 +529,17 @@ mod tests {
                 1,    // numOfPictureParameterSets
                 0x00, 0x04, // PPS length
                 0x68, 0xEE, 0x3C, 0x80, // PPS
+                0xFD, 0xF8, 0xF8, 0x00, // High profile: 4:2:0, 8-bit, no SPS extensions
             ]
         );
+    }
+
+    #[test]
+    fn avcc_has_no_high_profile_extension_for_main_profile() {
+        let sps = [0x67, 0x4D, 0x00, 0x28, 0xAC];
+        let pps = [0x68, 0xEE];
+        let record = avcc(&sps, &pps).unwrap();
+        assert_eq!(record.len(), 6 + 2 + 5 + 1 + 2 + 2);
     }
 
     #[test]

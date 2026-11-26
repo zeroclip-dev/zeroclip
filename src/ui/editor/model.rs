@@ -250,6 +250,8 @@ impl TrackEdit {
     /// Silences `a..b` of a piece `span` long with a dip in the volume line, short ramps either side
     /// so there is no click. The video and the other tracks are untouched.
     pub fn silence(&mut self, a: Hns, b: Hns, span: Hns) {
+        // A stale range (the piece was cut since) must not reach past the piece.
+        let (a, b) = (a.max(Hns::ZERO), b.min(span));
         if self.mute || b <= a {
             return;
         }
@@ -362,14 +364,14 @@ impl TrackEdit {
         }
         let db = self.db_at(at);
         let mut left = self.clone();
-        left.points = self.points.iter().copied().filter(|p| p.at < at).collect();
+        left.points = self.points.iter().copied().filter(|p| p.at + MIN_GAP <= at).collect();
         left.points.push(EnvPoint { at, db });
         let mut right = self.clone();
         right.points = std::iter::once(EnvPoint { at: Hns::ZERO, db })
             .chain(
                 self.points
                     .iter()
-                    .filter(|p| p.at > at)
+                    .filter(|p| p.at >= at + MIN_GAP)
                     .map(|p| EnvPoint { at: p.at - at, db: p.db }),
             )
             .collect();
@@ -412,6 +414,12 @@ impl TrackEdit {
     }
 }
 
+/// `db` moved by `by`, kept in range. A point at the bottom is a silenced stretch: it stays there,
+/// or raising the level would make deleted audio audible.
+fn shift_db(db: f64, by: f64) -> f64 {
+    if db <= MIN_DB { MIN_DB } else { (db + by).clamp(MIN_DB, MAX_DB) }
+}
+
 impl TrackEdit {
     /// The level the piece's dB control shows: the flat level, or the line's loudest point.
     pub fn level(&self) -> f64 {
@@ -428,7 +436,7 @@ impl TrackEdit {
         if self.has_line() {
             let by = db - self.level();
             for p in &mut self.points {
-                p.db += by;
+                p.db = shift_db(p.db, by);
             }
         } else {
             self.gain_db = db;
@@ -456,7 +464,7 @@ pub fn mixed_tracks(tracks: &[TrackEdit], mix: &[TrackMix]) -> Vec<TrackEdit> {
             out.mute |= m.mute;
             if out.points.len() >= 2 {
                 for p in &mut out.points {
-                    p.db += m.gain_db;
+                    p.db = shift_db(p.db, m.gain_db);
                 }
             } else {
                 out.gain_db += m.gain_db;
@@ -1441,6 +1449,38 @@ mod tests {
         let mut all = TrackEdit::default();
         all.silence(Hns::ZERO, secs(10), secs(10));
         assert!(all.mute);
+    }
+
+    #[test]
+    fn silencing_a_stale_range_stays_inside_the_piece() {
+        let mut e = TrackEdit::default();
+        e.silence(secs(8), secs(15), secs(10));
+        assert!(e.points.iter().all(|p| p.at <= secs(10)));
+        assert_eq!(e.db_at(secs(9)), MIN_DB);
+        // Entirely past the end: nothing to silence.
+        let mut gone = TrackEdit::default();
+        gone.silence(secs(11), secs(12), secs(10));
+        assert_eq!(gone, TrackEdit::default());
+    }
+
+    #[test]
+    fn raising_the_level_keeps_silenced_stretches_silent() {
+        let mut e = TrackEdit::default();
+        e.silence(secs(4), secs(6), secs(10));
+        let mixed = mixed_tracks(&[e.clone()], &[TrackMix { mute: false, gain_db: 6.0 }]);
+        assert_eq!(mixed[0].db_at(secs(5)), MIN_DB);
+        e.set_piece_level(6.0);
+        assert_eq!(e.db_at(secs(5)), MIN_DB);
+        assert!(e.points.iter().all(|p| p.db <= MAX_DB));
+    }
+
+    #[test]
+    fn splitting_keeps_points_a_gap_away_from_the_cut() {
+        let mut e = TrackEdit::default();
+        e.add_point(secs(5), -10.0, secs(10));
+        let (l, r) = e.split(secs(5) + Hns::from_millis(20), secs(10));
+        assert!(l.points.windows(2).all(|w| w[1].at - w[0].at >= MIN_GAP));
+        assert!(r.points.windows(2).all(|w| w[1].at - w[0].at >= MIN_GAP));
     }
 
     #[test]

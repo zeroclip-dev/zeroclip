@@ -69,14 +69,20 @@ struct Shared {
     /// reuses an NV12 slot after its frame left the channel, so a stalled encoder can't have
     /// queued slots overwritten under it.
     queued: AtomicUsize,
+    /// Frames lost before the channel, per 5 s health log (one per frame interval at most).
+    dropped: AtomicU64,
 }
 
-/// How many converted frames may wait for the encoder. Well under the converter's 8-slot ring,
-/// which also has to cover the frames the encoder itself holds.
-const QUEUE_DEPTH: usize = 2;
+/// How many converted frames may wait for the encoder. Half the converter's 8-slot ring, the
+/// other half covers the frames the encoder itself holds; the headroom rides out GPU contention
+/// from a game without dropping.
+const QUEUE_DEPTH: usize = 4;
 
 /// How long WGC may send nothing before capture is restarted (see `run`).
 const STALL: Duration = Duration::from_secs(3);
+
+/// Minimum gap between "dropping frames" warnings.
+const DROP_WARN_EVERY: Duration = Duration::from_secs(5);
 
 /// What the encoder thread reports once it's running.
 struct Started {
@@ -211,6 +217,11 @@ struct FrameHandler {
     context: ID3D11DeviceContext,
     last: Option<Hns>,
     dropping: bool,
+    /// When the last drop was counted; at most one per frame interval, so a 200 Hz
+    /// refresh doesn't flood the health channel.
+    last_drop: Option<Hns>,
+    /// When the last drop warning was logged; one per [`DROP_WARN_EVERY`].
+    warned: Option<Instant>,
     /// Kept so a screenshot never waits for the screen to change (WGC sends nothing
     /// while it's still).
     latest: Option<Latest>,
@@ -222,17 +233,19 @@ impl FrameHandler {
     fn on_frame(&mut self, frame: &CapturedFrame) {
         self.shared.arrived.fetch_add(1, Ordering::Relaxed);
         self.shared.seen.fetch_add(1, Ordering::Relaxed);
+        if self.shared.queued.load(Ordering::Acquire) >= QUEUE_DEPTH {
+            // Converting now would advance the ring onto a slot still waiting in the channel.
+            // Checked before the pacer and any GPU work, so a dropped refresh costs nothing and
+            // doesn't use up the frame slot: the next refresh can still fill it.
+            self.drop_frame(frame.time);
+            return;
+        }
         if !self.pacer.accept(frame.time) {
             return;
         }
         let slot = match self.sdr_frame(frame) {
             Ok(texture) => {
                 self.keep_latest(&texture, frame.size);
-                if self.shared.queued.load(Ordering::Acquire) >= QUEUE_DEPTH {
-                    // Converting now would advance the ring onto a slot still waiting in the channel.
-                    self.drop_frame();
-                    return;
-                }
                 self.converter.convert(&texture, frame.size)
             }
             Err(e) => Err(e),
@@ -298,11 +311,31 @@ impl FrameHandler {
         }
     }
 
-    /// Counts a frame lost before it reached the channel: warns once per run of drops.
-    fn drop_frame(&mut self) {
-        if !self.dropping {
+    /// Counts a frame lost because the encoder's queue is full, at most once per frame interval.
+    fn drop_frame(&mut self, time: Hns) {
+        if self.last_drop.is_some_and(|last| time - last < self.pacer.interval()) {
+            return;
+        }
+        self.last_drop = Some(time);
+        if self.warn_due() {
             tracing::warn!("dropping frames: the encoder isn't keeping up");
         }
+        self.note_drop();
+    }
+
+    /// Whether a drop warning may be logged now (one per [`DROP_WARN_EVERY`]); the total is in
+    /// the periodic health log anyway.
+    fn warn_due(&mut self) -> bool {
+        let due = self.warned.is_none_or(|at| at.elapsed() >= DROP_WARN_EVERY);
+        if due {
+            self.warned = Some(Instant::now());
+        }
+        due
+    }
+
+    /// Books one drop: the 5 s counter, and the watchdog's event.
+    fn note_drop(&mut self) {
+        self.shared.dropped.fetch_add(1, Ordering::Relaxed);
         (self.health)(HealthEvent::FrameDropped);
         self.dropping = true;
     }
@@ -325,20 +358,18 @@ impl FrameHandler {
             }
             Ok(Err(TrySendError::Disconnected(_))) => {}
             Ok(Err(TrySendError::Full(_))) | Err(_) => {
-                if !self.dropping {
-                    match &sent {
-                        Err(e) => {
-                            tracing::warn!(%e, "dropping frames: conversion failed");
-                            // SAFETY: plain COM call on a live device.
-                            if let Err(lost) = unsafe { self.device.GetDeviceRemovedReason() } {
-                                (self.health)(HealthEvent::EncoderFault { hresult: lost.code().0 });
-                            }
-                        }
-                        _ => tracing::warn!("dropping frames: the encoder isn't keeping up"),
+                if let Err(e) = &sent {
+                    if self.warn_due() {
+                        tracing::warn!(%e, "dropping frames: conversion failed");
                     }
+                    // SAFETY: plain COM call on a live device.
+                    if let Err(lost) = unsafe { self.device.GetDeviceRemovedReason() } {
+                        (self.health)(HealthEvent::EncoderFault { hresult: lost.code().0 });
+                    }
+                } else if self.warn_due() {
+                    tracing::warn!("dropping frames: the encoder isn't keeping up");
                 }
-                (self.health)(HealthEvent::FrameDropped);
-                self.dropping = true;
+                self.note_drop();
             }
         }
     }
@@ -379,7 +410,7 @@ fn run(
         if let Some(white) = hdr {
             tracing::info!(white, "HDR display: capturing scRGB and tone-mapping to SDR");
         }
-        WgcCapture::start(&device, item, config.capture_cursor, hdr, move |frame| {
+        WgcCapture::start(&device, item, config.capture_cursor, hdr, config.fps, move |frame| {
             if let Ok(mut handler) = handler.lock() {
                 handler.on_frame(&frame);
             }
@@ -413,6 +444,7 @@ fn run(
                 tracing::info!(
                     wgc_frames = shared.arrived.swap(0, Ordering::Relaxed),
                     submitted = std::mem::take(&mut submitted),
+                    dropped = shared.dropped.swap(0, Ordering::Relaxed),
                     capture_open = capture.as_ref().is_some_and(|c| !c.is_closed()),
                     device = ?device_ok,
                     "video health (last 5 s)"
@@ -463,7 +495,11 @@ fn run(
             while let Some(event) = encoder.next_event()? {
                 match event {
                     EncoderEvent::NeedInput => credits += 1,
-                    EncoderEvent::HaveOutput => encoder.take_output(&**sink)?,
+                    EncoderEvent::HaveOutput => {
+                        if encoder.take_output(&**sink)? {
+                            health(HealthEvent::KeyframeEmitted);
+                        }
+                    }
                     EncoderEvent::DrainComplete | EncoderEvent::Other => {}
                 }
             }
@@ -582,6 +618,8 @@ impl Pipeline {
             context: context.clone(),
             last: None,
             dropping: false,
+            last_drop: None,
+            warned: None,
             latest: None,
             tonemap: None,
         }));

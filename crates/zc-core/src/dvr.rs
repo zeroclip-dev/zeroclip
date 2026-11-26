@@ -34,19 +34,33 @@ pub struct DvrConfig {
 }
 
 impl DvrConfig {
-    /// Extra footage reserved on top of the window. At most 2 s, so a full window still
-    /// covers its oldest whole GOP after eviction (GOPs are 1 s by default).
-    const HEADROOM: Hns = Hns::from_secs(2);
+    /// Extra footage reserved on top of a window, beyond the keyframe interval: one more
+    /// second, so a full window still covers its oldest whole GOP after eviction and the audio
+    /// that goes with it.
+    const HEADROOM: Hns = Hns::from_secs(1);
 
     /// Sizes the buffer to hold `window` of footage at the worst-case bitrates.
     ///
     /// The ring must fit the *maximum* VBR bitrate (DESIGN §4): 20 Mbps is 2.5 MB/s,
-    /// so one minute needs ~150 MB. A little headroom (at most ~2 s) is fine and lets
+    /// so one minute needs ~150 MB. The headroom (a keyframe interval and 1 s) lets
     /// a full window survive whole-GOP eviction.
     #[must_use]
     pub fn for_window(window: Hns, max_video_bitrate_bps: u64, audio_bitrate_bps: u64) -> Self {
-        let ticks = u128::try_from(window.ticks().max(0).saturating_add(Self::HEADROOM.ticks()))
-            .unwrap_or(0);
+        Self::for_window_gop(window, Hns::from_secs(1), max_video_bitrate_bps, audio_bitrate_bps)
+    }
+
+    /// [`for_window`](Self::for_window) for a keyframe interval other than the default 1 s: the
+    /// headroom covers one whole GOP, so a full window still starts on a keyframe and has its
+    /// audio.
+    #[must_use]
+    pub fn for_window_gop(
+        window: Hns,
+        keyframe_interval: Hns,
+        max_video_bitrate_bps: u64,
+        audio_bitrate_bps: u64,
+    ) -> Self {
+        let headroom = keyframe_interval.ticks().max(0).saturating_add(Self::HEADROOM.ticks());
+        let ticks = u128::try_from(window.ticks().max(0).saturating_add(headroom)).unwrap_or(0);
         let ticks_per_second = u128::from(Hns::PER_SECOND.unsigned_abs());
         // Bits per second × seconds, then ÷ 8 for bytes. Widened to u128, so it can't overflow.
         let bytes = |bits_per_second: u64| {
@@ -606,6 +620,8 @@ impl SnapshotCopy {
                 // A lost audio packet costs that packet only: the video is still whole, and a
                 // gap at the start of one audio track beats losing a GOP or the whole clip.
                 if self.plan.packets[lost].meta.track != TrackId::Video {
+                    // Its buffer is still the zero fill: mark it so `finish` leaves it out.
+                    self.packets[lost].data = Vec::new();
                     self.next = lost + 1;
                     return Ok(());
                 }
@@ -630,7 +646,8 @@ impl SnapshotCopy {
     #[must_use]
     pub fn finish(mut self) -> DvrClip {
         let floor = self.floor;
-        self.packets.retain(|p| p.meta.pts >= floor);
+        // An emptied payload is a packet that was lapped before it was copied.
+        self.packets.retain(|p| p.meta.pts >= floor && !p.data.is_empty());
         // Stable sort, and TrackId orders video first, so equal PTS keep video ahead of audio.
         self.packets.sort_by_key(|p| (p.meta.pts, p.meta.track));
         DvrClip { packets: self.packets }
@@ -680,6 +697,14 @@ mod tests {
     }
 
     #[test]
+    fn headroom_covers_a_long_keyframe_interval() {
+        let cfg = |gop| DvrConfig::for_window_gop(Hns::from_secs(60), gop, 8_000_000, 0);
+        // 1 MB/s: the window plus one GOP plus 1 s.
+        assert_eq!(cfg(Hns::from_secs(4)).video_bytes, 65_000_000);
+        assert_eq!(cfg(Hns::from_secs(1)).video_bytes, 62_000_000);
+    }
+
+    #[test]
     fn ring_file_bytes_saturates_instead_of_overflowing() {
         let huge = DvrConfig { video_bytes: usize::MAX, audio_bytes: usize::MAX };
         assert_eq!(huge.ring_file_bytes(), u64::MAX);
@@ -720,6 +745,7 @@ mod tests {
         push_all(&mut dvr, &s.take_secs(3));
         let plan = dvr.plan_snapshot(Hns::from_secs(3)).unwrap();
         let planned_video = plan.packets.iter().filter(|p| p.meta.track == TrackId::Video).count();
+        let plan_audio = plan.packets.len() - planned_video;
         push_all(&mut dvr, &s.take_secs(1));
 
         let mut copy = SnapshotCopy::new(plan);
@@ -728,6 +754,9 @@ mod tests {
         }
         let clip = copy.finish();
         assert_eq!(clip.video().count(), planned_video, "no video was dropped for audio loss");
+        // A lapped audio packet must be left out, not shipped as a zero-filled buffer.
+        assert!(clip.packets.iter().all(|p| p.data.iter().any(|&b| b != 0)), "zero packet");
+        assert!(clip.packets.len() - planned_video < plan_audio, "lapped audio was kept");
     }
 
     #[test]

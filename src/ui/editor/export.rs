@@ -4,6 +4,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -80,6 +81,8 @@ fn gap_spec(plan: &PiecePlan, info: &StreamInfo) -> GapSpec {
         fps: info.fps,
         audio_tracks: plan.tracks.len(),
         audio_bitrate_bps: plan.tracks.first().map_or(160_000, |t| t.bitrate_bps),
+        audio_rate: info.audio_rate,
+        audio_channels: info.audio_channels,
         duration: plan.range.1 - plan.range.0,
     }
 }
@@ -87,7 +90,10 @@ fn gap_spec(plan: &PiecePlan, info: &StreamInfo) -> GapSpec {
 /// Makes one piece into a file next to `output`. A piece that is the whole clip with no edits is
 /// the source file itself.
 ///
-/// `exact` is the video codec when the video is re-encoded to start on the exact frame.
+/// `exact` is the video codec when the video is re-encoded to start on the exact frame. Every
+/// scratch path is pushed to `created` before ffmpeg writes it, so a failure leaves nothing behind
+/// that the caller can't delete.
+#[expect(clippy::too_many_arguments, reason = "one call site; a struct would only rename them")]
 fn make(
     ffmpeg: &Ffmpeg,
     plan: &PiecePlan,
@@ -96,10 +102,12 @@ fn make(
     info: &StreamInfo,
     tag: &str,
     exact: Option<Codec>,
+    created: &mut Vec<PathBuf>,
 ) -> Result<Made> {
     if plan.gap {
         // Black and silent from ffmpeg's own generators; no source file is read.
         let path = scratch_name(output, &format!("{tag}g"));
+        created.push(path.clone());
         ffmpeg.make_gap(&gap_spec(plan, info), &path)?;
         return Ok(Made { path, scratch: true });
     }
@@ -107,6 +115,7 @@ fn make(
     let trimmed = match (exact, plan.trim) {
         (Some(codec), _) => {
             let path = scratch_name(output, &format!("{tag}t"));
+            created.push(path.clone());
             if keep_all_audio {
                 trim_preserving_all_audio(
                     ffmpeg,
@@ -123,6 +132,7 @@ fn make(
         }
         (None, Some((start, end))) => {
             let path = scratch_name(output, &format!("{tag}t"));
+            created.push(path.clone());
             if keep_all_audio {
                 trim_preserving_all_audio(ffmpeg, source, start, end, &path, None)?;
             } else {
@@ -136,6 +146,7 @@ fn make(
         return Ok(trimmed);
     }
     let path = scratch_name(output, &format!("{tag}a"));
+    created.push(path.clone());
     let edited = if keep_all_audio {
         let master_bitrate_bps = plan.tracks[0].bitrate_bps;
         ffmpeg.edit_audio_rebuilding_master(&trimmed.path, &path, &plan.tracks, master_bitrate_bps)
@@ -167,27 +178,26 @@ pub fn run(
         anyhow::bail!("{} already exists", output.display());
     }
     let started = Instant::now();
-    let mut made: Vec<Made> = Vec::new();
-    // One piece off a keyframe re-encodes every piece's video the same way, so the joined
-    // file has one set of video parameters.
-    let exact = plans.iter().any(|p| p.reencode);
-    let mut result = build(ffmpeg, plans, sources, infos, output, exact, &mut made);
-    // A gap is the only piece ffmpeg makes from scratch, so its encoder settings may not match
-    // the clips' exactly. When the join fails, redo it with every piece re-encoded the same way.
-    if result.is_err() && !exact && plans.iter().any(|p| p.gap) {
-        discard(&mut made, Some(output));
-        result = build(ffmpeg, plans, sources, infos, output, true, &mut made);
-    }
+    // Scratch names are unique per run, so a leftover from an earlier attempt never blocks `-n`.
+    static RUNS: AtomicU32 = AtomicU32::new(0);
+    let run = RUNS.fetch_add(1, Ordering::Relaxed);
+    // A gap is made from scratch by ffmpeg, so only re-encoding every clip piece the same way
+    // (same codec, pixel format, parameter sets) gives one set of video parameters at the seams.
+    // The same goes for a piece off a keyframe. A plain stream copy of the rest is safe.
+    let exact = plans.iter().any(|p| p.reencode || p.gap);
+    let mut created = Vec::new();
+    let result = build(ffmpeg, plans, sources, infos, output, exact, run, &mut created);
     let failed = result.is_err();
-    discard(&mut made, failed.then_some(output));
+    discard(&mut created, failed.then_some(output));
     result.map(|()| started.elapsed())
 }
 
 /// Deletes our scratch files, and `output` when a failed run left it half-written.
-fn discard(made: &mut Vec<Made>, output: Option<&Path>) {
-    for m in made.drain(..).filter(|m| m.scratch) {
-        // The scratch files are ours; failing to delete one must not fail the export.
-        let _ = std::fs::remove_file(&m.path);
+fn discard(created: &mut Vec<PathBuf>, output: Option<&Path>) {
+    for path in created.drain(..) {
+        // The scratch files are ours (one may already be renamed to `output`); failing to delete
+        // one must not fail the export.
+        let _ = std::fs::remove_file(path);
     }
     if let Some(output) = output {
         let _ = std::fs::remove_file(output);
@@ -195,6 +205,7 @@ fn discard(made: &mut Vec<Made>, output: Option<&Path>) {
 }
 
 /// One go at writing `plans` as `output`; `exact` re-encodes every clip piece's video.
+#[expect(clippy::too_many_arguments, reason = "one call site; a struct would only rename them")]
 fn build(
     ffmpeg: &Ffmpeg,
     plans: &[PiecePlan],
@@ -202,12 +213,15 @@ fn build(
     infos: &[StreamInfo],
     output: &Path,
     exact: bool,
-    made: &mut Vec<Made>,
+    run: u32,
+    created: &mut Vec<PathBuf>,
 ) -> Result<()> {
+    let mut made: Vec<Made> = Vec::new();
     for (n, plan) in plans.iter().enumerate() {
         let info = &infos[plan.source];
         let codec = exact.then_some(info.codec);
-        made.push(make(ffmpeg, plan, &sources[plan.source], output, info, &n.to_string(), codec)?);
+        let tag = format!("{run}-{n}");
+        made.push(make(ffmpeg, plan, &sources[plan.source], output, info, &tag, codec, created)?);
     }
     match made.as_slice() {
         [] => anyhow::bail!("nothing to save"),
@@ -250,7 +264,14 @@ mod tests {
 
     #[test]
     fn a_gap_copies_the_clips_format_and_the_pieces_track_count() {
-        let info = StreamInfo { codec: Codec::H264, size: (2560, 1440), fps: 144, audio_tracks: 3 };
+        let info = StreamInfo {
+            codec: Codec::H264,
+            size: (2560, 1440),
+            fps: (144, 1),
+            audio_tracks: 3,
+            audio_rate: 44_100,
+            audio_channels: 1,
+        };
         let plan = PiecePlan {
             source: 0,
             trim: None,
@@ -264,7 +285,8 @@ mod tests {
             gap: true,
         };
         let spec = gap_spec(&plan, &info);
-        assert_eq!((spec.codec, spec.size, spec.fps), (Codec::H264, (2560, 1440), 144));
+        assert_eq!((spec.codec, spec.size, spec.fps), (Codec::H264, (2560, 1440), (144, 1)));
+        assert_eq!((spec.audio_rate, spec.audio_channels), (44_100, 1));
         assert_eq!((spec.audio_tracks, spec.audio_bitrate_bps), (1, 96_000));
         assert_eq!(spec.duration, Hns::from_secs(2));
     }

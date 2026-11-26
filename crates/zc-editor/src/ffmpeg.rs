@@ -110,7 +110,11 @@ impl Ffmpeg {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
         let list = std::env::temp_dir()
             .join(format!("zeroclip-concat-{}-{nanos}.txt", std::process::id()));
-        let body: String = inputs.iter().map(|p| concat_line(p) + "\n").collect();
+        // The list sits in the temp dir, so a relative input would resolve against the wrong place.
+        let body: String = inputs
+            .iter()
+            .map(|p| concat_line(&std::path::absolute(p).unwrap_or_else(|_| p.clone())) + "\n")
+            .collect();
         std::fs::write(&list, body)?;
         let result = run(&self.exe, &concat_args(&list, output)).map(drop);
         // The list is scratch; failing to delete it must not fail the export.
@@ -124,6 +128,14 @@ impl Ffmpeg {
     /// See [`FfmpegError`].
     pub fn remux_for_export(&self, input: &Path, output: &Path) -> Result<(), FfmpegError> {
         run(&self.exe, &remux_args(input, output)).map(drop)
+    }
+
+    /// Rewrites `input` as a plain MP4 at `output`, keeping every track ([`faststart_args`]).
+    ///
+    /// # Errors
+    /// See [`FfmpegError`].
+    pub fn faststart(&self, input: &Path, output: &Path) -> Result<(), FfmpegError> {
+        run(&self.exe, &faststart_args(input, output)).map(drop)
     }
 
     /// Reads the first video stream, the audio track count, the duration and the keyframe
@@ -287,14 +299,18 @@ fn run_for(exe: &Path, args: &[OsString], limit: Option<Duration>) -> Result<Vec
     };
     let mut child = cmd.spawn()?;
     // Both pipes are drained on threads, or a chatty process would fill one and never exit.
+    // The bytes come back over a channel so a pipe held open by a stray grandchild (a shim's real
+    // ffprobe) can be given up on instead of joined forever.
     let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
             if let Some(mut pipe) = pipe {
                 let _ = pipe.read_to_end(&mut bytes);
             }
-            bytes
-        })
+            let _ = tx.send(bytes);
+        });
+        rx
     };
     let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
     let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
@@ -304,19 +320,42 @@ fn run_for(exe: &Path, args: &[OsString], limit: Option<Duration>) -> Result<Vec
             break Some(status);
         }
         if started.elapsed() >= limit {
-            let _ = child.kill();
+            kill_tree(&mut child);
             let _ = child.wait();
             break None;
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let (stdout, stderr) = (stdout.join().unwrap_or_default(), stderr.join().unwrap_or_default());
+    let pipe_wait = Duration::from_secs(5);
+    let stdout = stdout.recv_timeout(pipe_wait).unwrap_or_default();
+    let stderr = stderr.recv_timeout(pipe_wait).unwrap_or_default();
     match status {
         Some(status) => finish(status.success(), stdout, &stderr),
         None => {
             Err(FfmpegError::Failed { stderr: format!("timed out after {} s", limit.as_secs()) })
         }
     }
+}
+
+/// Kills `child` and everything it started. A shim (Chocolatey) runs the real tool as a child, and
+/// that one keeps the pipes open after the shim dies.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        let taskkill = Path::new(&root).join("System32").join("taskkill.exe");
+        let _ = Command::new(taskkill)
+            .args(["/F", "/T", "/PID"])
+            .arg(child.id().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x0800_0000)
+            .status();
+    }
+    // Also covers a failed taskkill, and non-Windows builds.
+    let _ = child.kill();
 }
 
 fn finish(success: bool, stdout: Vec<u8>, stderr: &[u8]) -> Result<Vec<u8>, FfmpegError> {
@@ -338,7 +377,7 @@ fn last_lines(text: &str, n: usize) -> String {
 fn stream_args(path: &Path) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["-v", "error", "-show_entries"].map(OsString::from).to_vec();
     args.push(
-        "stream=codec_type,codec_name,width,height,avg_frame_rate:stream_tags=handler_name:format=duration,start_time"
+        "stream=codec_type,codec_name,width,height,avg_frame_rate,sample_rate,channels:stream_tags=handler_name:format=duration,start_time"
             .into(),
     );
     args.extend(["-of", "default=noprint_wrappers=1"].map(OsString::from));
@@ -371,6 +410,9 @@ fn parse_streams(text: &str) -> Result<(StreamInfo, Hns, Hns), String> {
     let mut height = None;
     let mut fps_rate = None;
     let mut audio = 0usize;
+    let mut in_first_audio = false;
+    let mut audio_rate = None;
+    let mut audio_channels = None;
     let mut duration = None;
     let mut start = None;
     for line in text.lines() {
@@ -382,6 +424,7 @@ fn parse_streams(text: &str) -> Result<(StreamInfo, Hns, Hns), String> {
                 in_first_video = false;
             }
             "codec_type" => {
+                in_first_audio = value == "audio" && audio == 0;
                 in_first_video = value == "video" && !video_seen;
                 if in_first_video {
                     codec_name = block_codec;
@@ -394,6 +437,8 @@ fn parse_streams(text: &str) -> Result<(StreamInfo, Hns, Hns), String> {
             "width" if in_first_video => width = Some(value),
             "height" if in_first_video => height = Some(value),
             "avg_frame_rate" if in_first_video => fps_rate = Some(value),
+            "sample_rate" if in_first_audio => audio_rate = value.parse::<u32>().ok(),
+            "channels" if in_first_audio => audio_channels = value.parse::<u8>().ok(),
             // Only the format section asks for these, and it comes after every stream block.
             "duration" => duration = value.parse::<f64>().ok(),
             "start_time" => start = value.parse::<f64>().ok(),
@@ -407,12 +452,22 @@ fn parse_streams(text: &str) -> Result<(StreamInfo, Hns, Hns), String> {
         other => return Err(format!("unsupported video codec {other}")),
     };
     let size = (parse_dim(width)?, parse_dim(height)?);
-    let fps = fps_rate.and_then(parse_rate).unwrap_or(0);
-    let duration = Hns::from_secs_f64(duration.ok_or("no duration")?);
+    let fps = fps_rate.and_then(parse_rate).unwrap_or((0, 0));
+    let duration = duration.ok_or("no duration")?;
+    if !duration.is_finite() || duration <= 0.0 {
+        return Err(format!("invalid duration {duration}"));
+    }
+    let duration = Hns::from_secs_f64(duration);
     // A missing start time (N/A) means the file starts at zero.
     let start = Hns::from_secs_f64(start.unwrap_or(0.0));
-    let stream =
-        StreamInfo { codec, size, fps, audio_tracks: u8::try_from(audio).unwrap_or(u8::MAX) };
+    let stream = StreamInfo {
+        codec,
+        size,
+        fps,
+        audio_tracks: u8::try_from(audio).unwrap_or(u8::MAX),
+        audio_rate: audio_rate.unwrap_or(0),
+        audio_channels: audio_channels.unwrap_or(0),
+    };
     Ok((stream, duration, start))
 }
 
@@ -476,22 +531,19 @@ fn parse_dim(value: Option<&str>) -> Result<u32, String> {
     value.and_then(|v| v.parse().ok()).ok_or_else(|| "missing video size".into())
 }
 
-/// Parses an ffprobe rate such as `60/1` or `30000/1001`, rounded to whole frames per second.
-/// `0/0` (unknown) gives `None`.
-fn parse_rate(rate: &str) -> Option<u32> {
+/// Parses an ffprobe rate such as `60/1` or `60000/1001` into a reduced fraction, so NTSC and
+/// whole rates stay different. `0/0` (unknown) gives `None`.
+fn parse_rate(rate: &str) -> Option<(u32, u32)> {
     let (num, den) = rate.split_once('/')?;
-    let (num, den): (f64, f64) = (num.parse().ok()?, den.parse().ok()?);
-    if den == 0.0 {
+    let (num, den): (u32, u32) = (num.parse().ok()?, den.parse().ok()?);
+    if num == 0 || den == 0 {
         return None;
     }
-    let fps = (num / den).round();
-    // Frame rates are small positive numbers, so this conversion cannot lose anything real.
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "a frame rate is a small non-negative whole number"
-    )]
-    Some(fps as u32)
+    let (mut a, mut b) = (num, den);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    Some((num / a, den / a))
 }
 
 /// Parses `pts_time,flags` CSV lines from [`KEYFRAME_ENTRIES`]. Keeps keyframes (flags start with
@@ -559,6 +611,13 @@ pub fn concat_line(path: &Path) -> String {
     format!("file '{}'", path.to_string_lossy().replace('\'', r"'\''"))
 }
 
+/// Where a stream-copy `-ss` should seek for a keyframe at `start`. ffprobe rounds keyframe times
+/// to microseconds, which can land a hair before the real keyframe and make ffmpeg's backward seek
+/// pick the one before it; half a millisecond past it is safe (frames are at least ~1 ms apart).
+fn copy_seek(start: Hns) -> Hns {
+    if start > Hns::ZERO { start + Hns::from_ticks(5_000) } else { start }
+}
+
 /// Arguments for a stream-copy trim of `[start, end)`. `-t` goes after `-i`: input seeking
 /// resets timestamps, so a duration is what's needed (works on every ffmpeg version).
 ///
@@ -575,7 +634,7 @@ pub fn trim_args(
     }
     let mut args = common_args();
     args.push("-ss".into());
-    args.push(ffmpeg_time(start).into());
+    args.push(ffmpeg_time(copy_seek(start)).into());
     args.push("-i".into());
     args.push(os(input));
     args.push("-t".into());
@@ -620,6 +679,8 @@ pub fn trim_exact_args(
     args.push(ffmpeg_time(end - start).into());
     args.extend(["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy"].map(OsString::from));
     args.extend(video.iter().map(OsString::from));
+    // Same pixel format as the gap pieces, so the joined file has one set of video parameters.
+    args.extend(["-pix_fmt", "yuv420p"].map(OsString::from));
     args.extend(["-avoid_negative_ts", "make_zero", "-movflags", "+faststart"].map(OsString::from));
     args.push(os(output));
     Ok(args)
@@ -635,12 +696,16 @@ pub struct GapSpec {
     pub codec: Codec,
     /// Frame size, pixels.
     pub size: (u32, u32),
-    /// Frame rate (`0` when unknown reads as 30).
-    pub fps: u32,
+    /// Frame rate as a fraction (a `0` denominator, unknown, reads as 30).
+    pub fps: (u32, u32),
     /// How many silent audio tracks to make (the clip pieces' count).
     pub audio_tracks: usize,
     /// The audio bitrate, bits per second.
     pub audio_bitrate_bps: u32,
+    /// Audio sample rate, Hz (`0` reads as 48 kHz).
+    pub audio_rate: u32,
+    /// Audio channel count (`0` reads as stereo).
+    pub audio_channels: u8,
     /// How long the gap runs.
     pub duration: Hns,
 }
@@ -648,7 +713,8 @@ pub struct GapSpec {
 /// Arguments for [`Ffmpeg::make_gap`]: a black picture (`color`) and one silent stereo track per
 /// audio track (`anullsrc`), both generated by ffmpeg's `lavfi` source filters, so no input file
 /// is read. The video is encoded as the clip's codec at the clip's size and frame rate (8-bit
-/// 4:2:0), the audio as 48 kHz stereo AAC, so the concat demuxer can join it to the clip pieces.
+/// 4:2:0), the audio as AAC at the clip's rate and channels (48 kHz stereo if unknown), so the
+/// concat demuxer can join it to the clip pieces.
 ///
 /// # Errors
 /// [`FfmpegError::Failed`] for a zero duration or size, or AV1 (which can't be encoded here).
@@ -666,13 +732,16 @@ pub fn gap_args(spec: &GapSpec, output: &Path) -> Result<Vec<OsString>, FfmpegEr
         }
     };
     let secs = ffmpeg_time(spec.duration);
-    let fps = if spec.fps == 0 { 30 } else { spec.fps };
+    let (fps_num, fps_den) = if spec.fps.0 == 0 || spec.fps.1 == 0 { (30, 1) } else { spec.fps };
+    let rate = if spec.audio_rate == 0 { GAP_AUDIO_RATE } else { spec.audio_rate };
+    let channels = if spec.audio_channels == 0 { 2 } else { spec.audio_channels };
     let mut args = common_args();
     args.extend(["-f", "lavfi", "-i"].map(OsString::from));
+    let fps = if fps_den == 1 { fps_num.to_string() } else { format!("{fps_num}/{fps_den}") };
     args.push(format!("color=c=black:s={}x{}:r={fps}", spec.size.0, spec.size.1).into());
     if spec.audio_tracks > 0 {
         args.extend(["-f", "lavfi", "-i"].map(OsString::from));
-        args.push(format!("anullsrc=r={GAP_AUDIO_RATE}:cl=stereo").into());
+        args.push(format!("anullsrc=r={rate}:cl=stereo").into());
     }
     args.extend(["-map", "0:v:0"].map(OsString::from));
     // One input stream can feed every output track.
@@ -685,8 +754,9 @@ pub fn gap_args(spec: &GapSpec, output: &Path) -> Result<Vec<OsString>, FfmpegEr
         args.extend(["-c:a", "aac", "-b:a"].map(OsString::from));
         args.push(spec.audio_bitrate_bps.to_string().into());
         args.extend(["-ar"].map(OsString::from));
-        args.push(GAP_AUDIO_RATE.to_string().into());
-        args.extend(["-ac", "2"].map(OsString::from));
+        args.push(rate.to_string().into());
+        args.extend(["-ac"].map(OsString::from));
+        args.push(channels.to_string().into());
     }
     args.extend(["-t"].map(OsString::from));
     args.push(secs.into());
@@ -715,6 +785,33 @@ pub fn remux_args(input: &Path, output: &Path) -> Vec<OsString> {
     args.extend(
         ["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-movflags", "+faststart"]
             .map(OsString::from),
+    );
+    args.push(os(output));
+    args
+}
+
+/// Arguments for a stream-copy remux that keeps every stream (all audio tracks and their names)
+/// as a plain MP4 with the index up front. Only the first audio track (Master) is marked
+/// default, so players that pick one track play the mix.
+#[must_use]
+pub fn faststart_args(input: &Path, output: &Path) -> Vec<OsString> {
+    let mut args = common_args();
+    args.push("-i".into());
+    args.push(os(input));
+    args.extend(
+        [
+            "-map",
+            "0",
+            "-c",
+            "copy",
+            "-disposition:a",
+            "0",
+            "-disposition:a:0",
+            "default",
+            "-movflags",
+            "+faststart",
+        ]
+        .map(OsString::from),
     );
     args.push(os(output));
     args
@@ -1059,8 +1156,12 @@ fn envelope_expr(points: &[EnvelopePoint]) -> Result<String, FfmpegError> {
     let mut db = format!("{:.3}", last.db);
     for w in points.windows(2).rev() {
         let (a, b) = (w[0], w[1]);
+        // A segment too short to print as a nonzero length would divide by zero (NaN gain).
+        if format!("{:.6}", b.secs - a.secs).parse::<f64>().unwrap_or(0.0) <= 0.0 {
+            continue;
+        }
         db = format!(
-            r"if(lt(t\,{:.4})\,{:.3}+({:.3})*(t-{:.4})/{:.4}\,{db})",
+            r"if(lt(t\,{:.6})\,{:.3}+({:.3})*(t-{:.6})/{:.6}\,{db})",
             b.secs,
             a.db,
             b.db - a.db,
@@ -1069,7 +1170,7 @@ fn envelope_expr(points: &[EnvelopePoint]) -> Result<String, FfmpegError> {
         );
     }
     let first = points[0];
-    let db = format!(r"if(lt(t\,{:.4})\,{:.3}\,{db})", first.secs, first.db);
+    let db = format!(r"if(lt(t\,{:.6})\,{:.3}\,{db})", first.secs, first.db);
     Ok(format!(r"if(lte({db}\,{SILENT_DB})\,0\,pow(10\,({db})/20))"))
 }
 
@@ -1145,7 +1246,7 @@ mod tests {
                 "error",
                 "-n",
                 "-ss",
-                "2.7000000",
+                "2.7005000",
                 "-i",
                 "in.mp4",
                 "-t",
@@ -1169,9 +1270,11 @@ mod tests {
         GapSpec {
             codec: Codec::Hevc,
             size: (1920, 1080),
-            fps: 60,
+            fps: (60, 1),
             audio_tracks: 2,
             audio_bitrate_bps: 160_000,
+            audio_rate: 0,
+            audio_channels: 0,
             duration: Hns::from_millis(2_500),
         }
     }
@@ -1198,7 +1301,7 @@ mod tests {
 
     #[test]
     fn a_gap_with_no_audio_tracks_has_no_audio_input_and_unknown_fps_reads_as_30() {
-        let spec = GapSpec { audio_tracks: 0, fps: 0, ..gap_spec() };
+        let spec = GapSpec { audio_tracks: 0, fps: (0, 0), ..gap_spec() };
         let args = strs(&gap_args(&spec, Path::new("g.mp4")).unwrap());
         assert!(!args.iter().any(|a| a.starts_with("anullsrc")));
         assert!(!args.contains(&"-c:a".into()));
@@ -1336,7 +1439,9 @@ mod tests {
         let chain = &strs(&args)[8];
         assert!(chain.starts_with("[0:a:0]volume=volume='if(lte("), "{chain}");
         assert!(chain.ends_with(":eval=frame[a0]"), "{chain}");
-        assert!(chain.contains(r"if(lt(t\,2.0000)\,0.000+(-60.000)*(t-0.0000)/2.0000\,-60.000)"));
+        assert!(
+            chain.contains(r"if(lt(t\,2.000000)\,0.000+(-60.000)*(t-0.000000)/2.000000\,-60.000)")
+        );
         let one = [EnvelopePoint { secs: 0.0, db: 0.0 }];
         assert!(envelope_expr(&one).is_err());
         let backwards =
@@ -1583,6 +1688,8 @@ mod tests {
     const STREAMS: &str = "\
 codec_name=aac
 codec_type=audio
+sample_rate=48000
+channels=2
 avg_frame_rate=0/0
 codec_name=h264
 codec_type=video
@@ -1601,7 +1708,8 @@ start_time=0.250000
         let (stream, duration, start) = parse_streams(STREAMS).unwrap();
         assert_eq!(stream.codec, Codec::H264);
         assert_eq!(stream.size, (1920, 1080));
-        assert_eq!(stream.fps, 60);
+        assert_eq!(stream.fps, (60, 1));
+        assert_eq!((stream.audio_rate, stream.audio_channels), (48_000, 2));
         assert_eq!(stream.audio_tracks, 2);
         assert_eq!(duration, Hns::from_millis(12_500));
         assert_eq!(start, Hns::from_millis(250));
@@ -1647,10 +1755,54 @@ start_time=0.250000
     }
 
     #[test]
-    fn parse_rate_rounds_ntsc_and_rejects_unknown() {
-        assert_eq!(parse_rate("60/1"), Some(60));
-        assert_eq!(parse_rate("30000/1001"), Some(30));
+    fn parse_rate_keeps_ntsc_apart_from_whole_rates_and_rejects_unknown() {
+        assert_eq!(parse_rate("60/1"), Some((60, 1)));
+        assert_eq!(parse_rate("120/2"), Some((60, 1)));
+        assert_eq!(parse_rate("60000/1001"), Some((60_000, 1001)));
         assert_eq!(parse_rate("0/0"), None);
+    }
+
+    #[test]
+    fn parse_streams_rejects_bad_durations() {
+        for bad in ["0.000000", "-1.0", "NaN", "inf"] {
+            let text = STREAMS.replace("12.500000", bad);
+            assert!(parse_streams(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_copy_trim_seeks_just_past_the_keyframe_but_not_at_zero() {
+        let seek = |start| {
+            let args = strs(
+                &trim_args(Path::new("i.mp4"), start, Hns::from_secs(9), Path::new("o.mp4"))
+                    .unwrap(),
+            );
+            args[args.iter().position(|a| a == "-ss").unwrap() + 1].clone()
+        };
+        assert_eq!(seek(Hns::from_secs(2)), "2.0005000");
+        assert_eq!(seek(Hns::ZERO), "0.0000000");
+    }
+
+    #[test]
+    fn a_volume_line_skips_segments_too_short_to_print() {
+        let pts = [
+            EnvelopePoint { secs: 1.0, db: 0.0 },
+            EnvelopePoint { secs: 1.000_000_01, db: -6.0 },
+            EnvelopePoint { secs: 3.0, db: -12.0 },
+        ];
+        let expr = envelope_expr(&pts).unwrap();
+        assert!(!expr.contains("/0.000000"), "{expr}");
+    }
+
+    #[test]
+    fn a_gap_takes_the_clips_ntsc_rate_and_audio_format() {
+        let spec =
+            GapSpec { fps: (60_000, 1001), audio_rate: 44_100, audio_channels: 1, ..gap_spec() };
+        let args = strs(&gap_args(&spec, Path::new("g.mp4")).unwrap());
+        let has = |pair: [&str; 2]| args.windows(2).any(|w| w == pair);
+        assert!(has(["-i", "color=c=black:s=1920x1080:r=60000/1001"]));
+        assert!(has(["-i", "anullsrc=r=44100:cl=stereo"]));
+        assert!(has(["-ar", "44100"]) && has(["-ac", "1"]));
     }
 
     #[test]
