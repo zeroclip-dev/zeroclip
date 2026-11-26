@@ -333,3 +333,12 @@ the wall clock as before. Muted playback in the clip player keeps the audio cloc
 unmuting needs no restart. ffplay is no longer used by the app.
 Consequence: a device error degrades to "no sound" and the wall clock; the release package still ships
 `ffplay.exe` (release workflow, `update.rs`) until the owner decides to drop it.
+
+### D40 · Up to 16 audio tracks; only switched-on app tracks use a slot (amends D26, D27)
+Why: the 7-track ceiling left room for 4 app tracks, and switched-off entries (kept for stable labels) still
+counted, so the Profiles screen could read 0 / 4 tracks while every Audio track switch was locked.
+Decision: `MAX_AUDIO_TRACKS` is 16, so up to 13 app tracks beside Master, game and mic. Rings stay
+preallocated in fixed arrays (no allocation on the hot path, DESIGN §6), but only enabled tracks are filled.
+A new app track takes a free slot, evicting a switched-off entry when the saved list is full. Clips still
+omit an app track that made no sound in their window, so unused tracks do not reach the editor.
+Consequence: about 24 KB/s of RAM per enabled track (D26); the cap is a ceiling, not unlimited.

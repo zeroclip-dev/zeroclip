@@ -40,7 +40,12 @@ pub fn has_live_track(tracks: &[AppTrack], exe: &str) -> bool {
 /// Whether turning on a track for `exe` can succeed: it already has an entry to re-enable, or
 /// there is a free slot for a new one.
 pub fn track_slot_free(tracks: &[AppTrack], exe: &str) -> bool {
-    tracks.len() < MAX_APP_TRACKS || tracks.iter().any(|t| same_exe(&t.exe, exe))
+    live_tracks(tracks) < MAX_APP_TRACKS || tracks.iter().any(|t| same_exe(&t.exe, exe))
+}
+
+/// Tracks that are switched on. Switched-off entries are kept for stable labels but don't use a slot.
+pub fn live_tracks(tracks: &[AppTrack]) -> usize {
+    tracks.iter().filter(|t| t.enabled).count()
 }
 
 /// Makes `exe` a game profile, or removes its profile. Adding keeps an existing profile as it is,
@@ -70,8 +75,14 @@ pub fn set_audio_track(tracks: &mut Vec<AppTrack>, exe: &str, on: bool) -> bool 
     if !on {
         return true;
     }
-    if tracks.len() >= MAX_APP_TRACKS {
+    if live_tracks(tracks) >= MAX_APP_TRACKS {
         return false;
+    }
+    // Settings cap the list length, so drop a switched-off entry to make room.
+    if tracks.len() >= MAX_APP_TRACKS
+        && let Some(i) = tracks.iter().position(|t| !t.enabled)
+    {
+        tracks.remove(i);
     }
     let label = unique_label(tracks, track_label(name));
     tracks.push(AppTrack { label, exe: name.to_owned(), enabled: true });
@@ -161,6 +172,17 @@ mod tests {
         assert!(track_slot_free(&tracks, "a0.exe"));
         assert!(set_audio_track(&mut tracks, "a0.exe", true));
         assert_eq!(tracks.len(), MAX_APP_TRACKS);
+    }
+
+    #[test]
+    fn switched_off_tracks_do_not_block_a_new_one() {
+        let mut tracks: Vec<AppTrack> = (0..MAX_APP_TRACKS)
+            .map(|i| track(&format!("App {i}"), &format!("a{i}.exe"), false))
+            .collect();
+        assert!(track_slot_free(&tracks, "New.exe"));
+        assert!(set_audio_track(&mut tracks, "New.exe", true));
+        assert_eq!(tracks.len(), MAX_APP_TRACKS);
+        assert!(has_live_track(&tracks, "New.exe"));
     }
 
     #[test]
