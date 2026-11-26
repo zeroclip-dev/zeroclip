@@ -260,6 +260,10 @@ impl NvConverter {
         // an input view (and a texture reference) every frame.
         unsafe { ManuallyDrop::drop(&mut stream.pInputSurface) };
         result.context("VideoProcessorBlt")?;
+        // Submit the blit now rather than whenever the driver batches it, so it isn't left behind a
+        // game's queue. <https://learn.microsoft.com/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-flush>
+        // SAFETY: plain COM call on a live context.
+        unsafe { self.context.Flush() };
         self.last = Some(slot);
         self.next = (slot + 1) % RING;
         Ok(slot)
