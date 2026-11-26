@@ -218,6 +218,12 @@ impl FramePacer {
 pub struct MasterClock {
     origin: Option<Hns>,
     offsets: [Hns; TrackId::COUNT],
+    /// How much of the raw timeline is cut out for pauses. Every track subtracts the same
+    /// amount, so tracks stay aligned and the buffer holds no hole where capture was stopped.
+    paused_total: Hns,
+    /// While capture is stopped: the PTS where the footage before the pause ended, which the
+    /// first keyframe after it must continue from.
+    resume_at: Option<Hns>,
 }
 
 impl MasterClock {
@@ -245,13 +251,40 @@ impl MasterClock {
         self.offsets[track.index()] = offset;
     }
 
+    /// Capture stopped, and the buffer's footage ends at `end` (session PTS). Until
+    /// [`resume`](Self::resume), [`is_paused`](Self::is_paused) holds. Does nothing before the
+    /// clock is anchored, or if it is already paused.
+    pub fn pause(&mut self, end: Hns) {
+        if self.origin.is_some() && self.resume_at.is_none() {
+            self.resume_at = Some(end);
+        }
+    }
+
+    /// Whether capture is paused: only a video keyframe may end it (see [`resume`](Self::resume)).
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.resume_at.is_some()
+    }
+
+    /// Capture is running again; `raw` is the first video keyframe's raw timestamp. From here
+    /// every track's PTS continues from where the footage ended, so the time spent paused leaves
+    /// no hole in the clip and doesn't eat the DVR window.
+    pub fn resume(&mut self, raw: Hns) {
+        if let (Some(end), Some(origin)) = (self.resume_at.take(), self.origin) {
+            let now = raw - origin - self.paused_total;
+            if now > end {
+                self.paused_total += now - end;
+            }
+        }
+    }
+
     /// Converts a raw timestamp from `track` into session PTS.
     ///
     /// Returns `None` before the clock is anchored, and for samples that would land
     /// before the start of the session (negative PTS).
     #[must_use]
     pub fn to_pts(&self, track: TrackId, raw: Hns) -> Option<Hns> {
-        let pts = raw - self.origin? + self.offsets[track.index()];
+        let pts = raw - self.origin? - self.paused_total + self.offsets[track.index()];
         (pts >= Hns::ZERO).then_some(pts)
     }
 }
@@ -460,6 +493,40 @@ mod tests {
         clock.anchor(Hns(1_000_000));
         assert_eq!(clock.to_pts(TrackId::Video, Hns(1_500_000)), Some(Hns(500_000)));
         assert_eq!(clock.to_pts(TrackId::GameAudio, Hns(1_000_000)), Some(Hns::ZERO));
+    }
+
+    #[test]
+    fn a_pause_is_cut_out_of_every_track_alike() {
+        let (video, audio) = (TrackId::Video, TrackId::GameAudio);
+        let mut clock = MasterClock::new();
+        clock.anchor(Hns::from_secs(100));
+        // 10 s of footage, then capture stops.
+        assert_eq!(clock.to_pts(video, Hns::from_secs(110)), Some(Hns::from_secs(10)));
+        clock.pause(Hns::from_secs(10));
+        assert!(clock.is_paused());
+        // 50 s later the first keyframe arrives, and the audio 20 ms before it.
+        clock.resume(Hns::from_secs(160));
+        assert!(!clock.is_paused());
+        assert_eq!(clock.to_pts(video, Hns::from_secs(160)), Some(Hns::from_secs(10)));
+        let early = Hns::from_secs(160) - Hns::from_millis(20);
+        assert_eq!(clock.to_pts(audio, early), Some(Hns::from_secs(10) - Hns::from_millis(20)));
+        // A second pause adds to the first.
+        clock.pause(Hns::from_secs(12));
+        clock.resume(Hns::from_secs(200));
+        assert_eq!(clock.to_pts(video, Hns::from_secs(200)), Some(Hns::from_secs(12)));
+        assert_eq!(clock.to_pts(audio, Hns::from_secs(201)), Some(Hns::from_secs(13)));
+    }
+
+    #[test]
+    fn pausing_an_unanchored_clock_or_twice_changes_nothing() {
+        let mut clock = MasterClock::new();
+        clock.pause(Hns::from_secs(5));
+        assert!(!clock.is_paused());
+        clock.anchor(Hns::ZERO);
+        clock.pause(Hns::from_secs(5));
+        clock.pause(Hns::from_secs(9));
+        clock.resume(Hns::from_secs(20));
+        assert_eq!(clock.to_pts(TrackId::Video, Hns::from_secs(20)), Some(Hns::from_secs(5)));
     }
 
     #[test]

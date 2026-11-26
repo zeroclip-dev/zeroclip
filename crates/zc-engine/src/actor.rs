@@ -1520,6 +1520,8 @@ impl Actor {
         if let Some(video) = video {
             video.stop();
         }
+        // The next start carries on from the end of the buffered footage, not from the wall clock.
+        self.recorder.pause();
         // A recovery cut short here must not restart the encoder later (a pending flush's
         // `Flushed` then finds no watchdog and is dropped).
         self.watchdog = None;
