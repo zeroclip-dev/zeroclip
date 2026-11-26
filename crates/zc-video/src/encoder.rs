@@ -114,6 +114,13 @@ pub fn probe(device: &ID3D11Device) -> Vec<Codec> {
     supported
 }
 
+/// The mean bitrate for peak-constrained VBR: halfway between the preset's floor and peak, so
+/// the rate controller aims for real quality and only the max is a ceiling. (Using the floor as
+/// the mean made Ultra target 8 Mbps against a 35 Mbps peak.)
+fn mean_bitrate(config: &VideoStart) -> u32 {
+    config.min_bitrate_bps.saturating_add(config.max_bitrate_bps.max(config.min_bitrate_bps)) / 2
+}
+
 /// Frames per GOP for a fixed keyframe interval (at least 1).
 fn gop_frames(fps: u32, interval: Hns) -> u32 {
     let frames = i64::from(fps) * interval.ticks() / Hns::PER_SECOND;
@@ -233,7 +240,7 @@ impl HwEncoder {
                 ),
                 (
                     &CODECAPI_AVEncCommonMeanBitRate,
-                    VARIANT::from(config.min_bitrate_bps),
+                    VARIANT::from(mean_bitrate(config)),
                     "mean bitrate",
                 ),
                 (
@@ -267,7 +274,7 @@ impl HwEncoder {
             };
             let output = video_type(&subtype(codec)).context("encoder output type")?;
             output
-                .SetUINT32(&MF_MT_AVG_BITRATE, config.min_bitrate_bps)
+                .SetUINT32(&MF_MT_AVG_BITRATE, mean_bitrate(config))
                 .context("MF_MT_AVG_BITRATE")?;
             // Must match the converter's output colour space (BT.709, limited range).
             for (key, value) in [
@@ -381,41 +388,47 @@ impl HwEncoder {
     }
 
     /// Takes one encoded packet and pushes it into `sink`. Only call after
-    /// [`EncoderEvent::HaveOutput`]. Allocates nothing on our side.
+    /// [`EncoderEvent::HaveOutput`]. Allocates nothing on our side. Returns whether a keyframe was pushed.
     ///
     /// # Errors
     /// Encoder faults.
-    pub fn take_output(&mut self, sink: &dyn PacketSink) -> Result<(), SourceError> {
+    pub fn take_output(&mut self, sink: &dyn PacketSink) -> Result<bool, SourceError> {
         let mut out = [MFT_OUTPUT_DATA_BUFFER { dwStreamID: 0, ..Default::default() }];
         let mut status = 0u32;
         // After a stream change the call must be repeated for the pending output
         // (https://learn.microsoft.com/windows/win32/medfound/handling-stream-changes),
         // or the packet it announced is never taken. One repeat is enough.
-        for attempt in 0..2 {
-            // SAFETY: valid output array and status for the call.
-            match unsafe { self.transform.ProcessOutput(0, &mut out, &mut status) } {
-                Ok(()) => break,
-                Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE && attempt == 0 => {
-                    // The encoder settled its output format (e.g. after the first frame).
-                    // SAFETY: plain COM calls on a live transform.
-                    unsafe {
-                        self.transform
-                            .GetOutputAvailableType(0, 0)
-                            .and_then(|t| self.transform.SetOutputType(0, &t, 0))
+        let processed = (|| -> Result<(), SourceError> {
+            for attempt in 0..2 {
+                // SAFETY: valid output array and status for the call.
+                match unsafe { self.transform.ProcessOutput(0, &mut out, &mut status) } {
+                    Ok(()) => return Ok(()),
+                    Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE && attempt == 0 => {
+                        // The encoder settled its output format (e.g. after the first frame).
+                        // SAFETY: plain COM calls on a live transform.
+                        unsafe {
+                            self.transform
+                                .GetOutputAvailableType(0, 0)
+                                .and_then(|t| self.transform.SetOutputType(0, &t, 0))
+                        }
+                        .context("output stream change")?;
                     }
-                    .context("output stream change")?;
+                    Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
+                    Err(e) => return Err(e).context("ProcessOutput"),
                 }
-                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
-                Err(e) => return Err(e).context("ProcessOutput"),
             }
-        }
+            Ok(())
+        })();
         // SAFETY: both fields are `ManuallyDrop`; each is taken or dropped exactly
-        // once. Skipping this leaks a sample every frame.
+        // once, on every path out of the call above (the MFT may fill them even when it
+        // fails). Skipping this leaks a sample or event collection per call.
         let sample = unsafe {
             ManuallyDrop::drop(&mut out[0].pEvents);
             ManuallyDrop::take(&mut out[0].pSample)
         };
-        let Some(sample) = sample else { return Ok(()) };
+        processed?;
+        let Some(sample) = sample else { return Ok(false) };
+        let mut emitted_keyframe = false;
         // SAFETY: plain COM calls on the sample the encoder just handed us; the
         // buffer stays locked while the slice is alive and is unlocked right after.
         unsafe {
@@ -429,6 +442,7 @@ impl HwEncoder {
             // A null pointer or zero length would make the slice undefined behaviour.
             if !data.is_null() && len != 0 {
                 let bytes = std::slice::from_raw_parts(data, len as usize);
+                emitted_keyframe = keyframe;
                 sink.push(PacketRef {
                     meta: PacketMeta { track: TrackId::Video, pts, duration, keyframe },
                     data: bytes,
@@ -436,7 +450,7 @@ impl HwEncoder {
             }
             buffer.Unlock().context("IMFMediaBuffer::Unlock")?;
         }
-        Ok(())
+        Ok(emitted_keyframe)
     }
 
     /// Flushes everything queued into `sink`, waiting up to 2 s. Errors are logged:
@@ -456,7 +470,7 @@ impl HwEncoder {
         while Instant::now() < deadline {
             match self.next_event() {
                 Ok(Some(EncoderEvent::HaveOutput)) => {
-                    if let Err(e) = self.take_output(sink) {
+                    if let Err(e) = self.take_output(sink).map(drop) {
                         tracing::warn!(%e, "encoder drain");
                         return;
                     }

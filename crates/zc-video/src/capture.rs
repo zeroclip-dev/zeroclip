@@ -308,7 +308,7 @@ pub struct WgcCapture {
 }
 
 impl WgcCapture {
-    /// Starts capturing `item`, calling `on_frame` from the frame pool's thread.
+    /// Starts capturing `item` for a target of `fps`, calling `on_frame` from the frame pool's thread.
     ///
     /// # Errors
     /// Session creation failures; [`SourceError::Protected`] for protected content.
@@ -317,6 +317,7 @@ impl WgcCapture {
         item: &GraphicsCaptureItem,
         capture_cursor: bool,
         hdr_white: Option<f32>,
+        fps: u32,
         on_frame: impl FnMut(CapturedFrame) + Send + 'static,
     ) -> Result<Self, SourceError> {
         let err = |context: &'static str| move |e| capture_error(context, &e);
@@ -403,10 +404,13 @@ impl WgcCapture {
         if let Err(e) = session.SetIsCursorCaptureEnabled(capture_cursor) {
             tracing::debug!(%e, "can't change cursor capture");
         }
-        // WGC's default minimum gap between frames is ~16.7 ms, which on a 200 Hz
-        // display gave 50 fps in the Phase 0 spike. Ask for every refresh and let the
-        // `FramePacer` decimate. Windows 11 22H2+; older systems keep the default.
-        if let Err(e) = session.SetMinUpdateInterval(TimeSpan { Duration: 10_000 }) {
+        // WGC's default minimum gap between frames is ~16.7 ms, which on a 200 Hz display gave 50 fps
+        // in the Phase 0 spike. Ask for a little under one frame period: the `FramePacer` still
+        // picks the frames on its grid, but WGC no longer copies every refresh (200+ GPU copies a
+        // second next to a game). Windows 11 22H2+; older systems keep the default. See
+        // <https://learn.microsoft.com/uwp/api/windows.graphics.capture.graphicscapturesession.minupdateinterval>.
+        let period = 10_000_000 / i64::from(fps.max(1));
+        if let Err(e) = session.SetMinUpdateInterval(TimeSpan { Duration: period - period / 4 }) {
             tracing::debug!(%e, "can't lower WGC's minimum update interval");
         }
         let closed = Arc::new(AtomicBool::new(false));

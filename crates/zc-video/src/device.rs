@@ -51,6 +51,16 @@ pub fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext), SourceErro
     // SAFETY: plain COM call on a live device; the result is the previous state.
     let _ = unsafe { multithread.SetMultithreadProtected(true) };
 
+    // A game saturating the GPU would otherwise starve our blit and encode: ask for the top GPU
+    // scheduling priority (range -7..=7). Best effort.
+    // <https://learn.microsoft.com/windows/win32/api/dxgi/nf-dxgi-idxgidevice-setgputhreadpriority>
+    if let Ok(dxgi) = device.cast::<IDXGIDevice>() {
+        // SAFETY: plain COM call on a live device.
+        if let Err(e) = unsafe { dxgi.SetGPUThreadPriority(7) } {
+            tracing::warn!(%e, "can't raise the GPU thread priority");
+        }
+    }
+
     let desc = adapter_desc(&device)?;
     let name = String::from_utf16_lossy(&desc.Description);
     tracing::info!(
