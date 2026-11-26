@@ -34,19 +34,33 @@ pub struct DvrConfig {
 }
 
 impl DvrConfig {
-    /// Extra footage reserved on top of the window. At most 2 s, so a full window still
-    /// covers its oldest whole GOP after eviction (GOPs are 1 s by default).
-    const HEADROOM: Hns = Hns::from_secs(2);
+    /// Extra footage reserved on top of a window, beyond the keyframe interval: one more
+    /// second, so a full window still covers its oldest whole GOP after eviction and the audio
+    /// that goes with it.
+    const HEADROOM: Hns = Hns::from_secs(1);
 
     /// Sizes the buffer to hold `window` of footage at the worst-case bitrates.
     ///
     /// The ring must fit the *maximum* VBR bitrate (DESIGN §4): 20 Mbps is 2.5 MB/s,
-    /// so one minute needs ~150 MB. A little headroom (at most ~2 s) is fine and lets
+    /// so one minute needs ~150 MB. The headroom (a keyframe interval and 1 s) lets
     /// a full window survive whole-GOP eviction.
     #[must_use]
     pub fn for_window(window: Hns, max_video_bitrate_bps: u64, audio_bitrate_bps: u64) -> Self {
-        let ticks = u128::try_from(window.ticks().max(0).saturating_add(Self::HEADROOM.ticks()))
-            .unwrap_or(0);
+        Self::for_window_gop(window, Hns::from_secs(1), max_video_bitrate_bps, audio_bitrate_bps)
+    }
+
+    /// [`for_window`](Self::for_window) for a keyframe interval other than the default 1 s: the
+    /// headroom covers one whole GOP, so a full window still starts on a keyframe and has its
+    /// audio.
+    #[must_use]
+    pub fn for_window_gop(
+        window: Hns,
+        keyframe_interval: Hns,
+        max_video_bitrate_bps: u64,
+        audio_bitrate_bps: u64,
+    ) -> Self {
+        let headroom = keyframe_interval.ticks().max(0).saturating_add(Self::HEADROOM.ticks());
+        let ticks = u128::try_from(window.ticks().max(0).saturating_add(headroom)).unwrap_or(0);
         let ticks_per_second = u128::from(Hns::PER_SECOND.unsigned_abs());
         // Bits per second × seconds, then ÷ 8 for bytes. Widened to u128, so it can't overflow.
         let bytes = |bits_per_second: u64| {
@@ -680,6 +694,14 @@ mod tests {
         assert!((150_000_000..=155_000_000).contains(&cfg.video_bytes), "{cfg:?}");
         // 192 kbps = 24 KB/s → 1.44 MB per track, plus ≤ 2 s headroom.
         assert!((1_440_000..=1_488_000).contains(&cfg.audio_bytes), "{cfg:?}");
+    }
+
+    #[test]
+    fn headroom_covers_a_long_keyframe_interval() {
+        let cfg = |gop| DvrConfig::for_window_gop(Hns::from_secs(60), gop, 8_000_000, 0);
+        // 1 MB/s: the window plus one GOP plus 1 s.
+        assert_eq!(cfg(Hns::from_secs(4)).video_bytes, 65_000_000);
+        assert_eq!(cfg(Hns::from_secs(1)).video_bytes, 62_000_000);
     }
 
     #[test]

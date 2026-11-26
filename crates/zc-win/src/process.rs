@@ -228,13 +228,15 @@ fn pids_for_exe(exe: &str) -> Vec<u32> {
     // SAFETY: `snapshot` is a fresh handle from CreateToolhelp32Snapshot, and nothing else owns it.
     let snapshot = unsafe { Owned::new(snapshot) };
 
+    // Encoded once, so the walk below compares UTF-16 in place and allocates nothing per process.
+    let wanted: Vec<u16> = file_name(exe).encode_utf16().collect();
     let mut pids = Vec::new();
     let mut entry =
         PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
     // SAFETY: `*snapshot` is a live toolhelp snapshot. `entry.dwSize` is set, as the API requires.
     let mut more = unsafe { Process32FirstW(*snapshot, &raw mut entry) }.is_ok();
     while more {
-        if exe_matches(&wide_to_string(&entry.szExeFile), exe) {
+        if wide_name_matches(&entry.szExeFile, &wanted) {
             pids.push(entry.th32ProcessID);
         }
         // SAFETY: same snapshot and entry as above. An error here means the walk is done.
@@ -256,10 +258,15 @@ fn file_name(path: &str) -> &str {
     Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or(path)
 }
 
-/// The UTF-16 string up to its first nul.
-fn wide_to_string(wide: &[u16]) -> String {
+/// [`exe_matches`] for a nul-terminated UTF-16 file name against an already encoded one, without
+/// allocating. Case folding is ASCII-only, as in `exe_matches`.
+fn wide_name_matches(wide: &[u16], wanted: &[u16]) -> bool {
     let end = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
-    String::from_utf16_lossy(&wide[..end])
+    let name = &wide[..end];
+    let fold = |c: u16| u8::try_from(c).map_or(c, |b| u16::from(b.to_ascii_lowercase()));
+    !wanted.is_empty()
+        && name.len() == wanted.len()
+        && name.iter().zip(wanted).all(|(&a, &b)| fold(a) == fold(b))
 }
 
 #[cfg(test)]
@@ -271,6 +278,16 @@ mod tests {
         assert!(exe_matches("Discord.exe", "discord.exe"));
         assert!(exe_matches(r"C:\Apps\Discord.exe", "Discord.exe"));
         assert!(exe_matches("C:/Apps/Discord.exe", r"D:\Other\DISCORD.EXE"));
+    }
+
+    #[test]
+    fn wide_name_matches_agrees_with_exe_matches() {
+        let wide = |s: &str| s.encode_utf16().chain([0, 0]).collect::<Vec<u16>>();
+        let wanted: Vec<u16> = "Discord.exe".encode_utf16().collect();
+        assert!(wide_name_matches(&wide("discord.EXE"), &wanted));
+        assert!(!wide_name_matches(&wide("discord.exe2"), &wanted));
+        assert!(!wide_name_matches(&wide("spotify.exe"), &wanted));
+        assert!(!wide_name_matches(&wide("x"), &[]));
     }
 
     #[test]

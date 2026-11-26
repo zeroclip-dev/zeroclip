@@ -13,6 +13,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use zc_core::Hns;
@@ -53,6 +54,17 @@ impl Spool {
 /// Dropping it closes the spool, and the reader stops once it has drained the rest.
 pub struct SpoolWriter {
     spool: Arc<Spool>,
+    /// PTS of the first video keyframe taken, which is the file's time zero. `i64::MIN` until then.
+    origin: Arc<AtomicI64>,
+}
+
+impl SpoolWriter {
+    /// The PTS (ticks) of the first keyframe this writer accepted, or `i64::MIN` before that.
+    /// The recording's own clock starts there.
+    #[must_use]
+    pub fn origin(&self) -> Arc<AtomicI64> {
+        Arc::clone(&self.origin)
+    }
 }
 
 impl PacketWriter for SpoolWriter {
@@ -64,6 +76,9 @@ impl PacketWriter for SpoolWriter {
                 return Ok(());
             }
             state.skip_until_keyframe = false;
+            if self.origin.load(Ordering::Relaxed) == i64::MIN {
+                self.origin.store(packet.meta.pts.ticks(), Ordering::Relaxed);
+            }
         }
         if !state.ring.push(packet) {
             // Only the first dropped packet is reported. The rest up to the next keyframe
@@ -130,7 +145,10 @@ pub fn spool_with_capacity(bytes: usize) -> (SpoolWriter, SpoolReader) {
         }),
         ready: Condvar::new(),
     });
-    (SpoolWriter { spool: Arc::clone(&spool) }, SpoolReader { spool })
+    (
+        SpoolWriter { spool: Arc::clone(&spool), origin: Arc::new(AtomicI64::new(i64::MIN)) },
+        SpoolReader { spool },
+    )
 }
 
 /// Runs on the IO thread. Writes every packet from `reader` into `out` until the writer
@@ -260,6 +278,8 @@ mod tests {
                 writer.write(packet.view()).expect("the spool has room");
             }
         }
+        let origin = writer.origin().load(Ordering::Relaxed);
+        assert_eq!(origin, stream.frame_pts(60).ticks(), "time zero is the first keyframe");
         drop(writer);
 
         let dir = scratch_dir("in-order");

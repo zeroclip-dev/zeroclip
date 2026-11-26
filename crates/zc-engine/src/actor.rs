@@ -460,8 +460,9 @@ struct ActiveRecording {
     path: PathBuf,
     /// The IO thread that drains the spool into the file.
     thread: JoinHandle<()>,
-    /// When it started, which is what a bookmark counts from.
-    started: Instant,
+    /// PTS (ticks) of the file's first video keyframe, which is what a bookmark counts from.
+    /// `i64::MIN` until the spool has taken one.
+    origin: Arc<std::sync::atomic::AtomicI64>,
 }
 
 /// Why a DVR save produced no clip, as its IO thread reports it.
@@ -546,7 +547,7 @@ fn staging_config(settings: &Settings) -> DvrConfig {
 fn dvr_for(settings: &Settings, window: Hns) -> DvrConfig {
     let max_video_bps = u64::from(settings.video.max_bitrate_kbps) * 1_000;
     let audio_bps = u64::from(settings.audio.bitrate_kbps) * 1_000;
-    DvrConfig::for_window(window, max_video_bps, audio_bps)
+    DvrConfig::for_window_gop(window, settings.video.keyframe_interval(), max_video_bps, audio_bps)
 }
 
 /// The DVR window a profile asks for, limited by the effective RAM ceiling (`ram_ceiling_mib`, the
@@ -829,6 +830,27 @@ impl Actor {
 
     /// Applies the tracked game's profile again after the settings changed, or the default when no
     /// game is tracked or its profile was removed.
+    /// The DVR was switched on or off in the settings, so the buffer follows now rather than at
+    /// the next start. Off: the rings shrink to nothing, which also releases their page locks,
+    /// and the disk writer stops. On: the ring file starts in disk mode (the staging area is
+    /// sized here), and the RAM buffer is sized by the profile that `reapply_profile` applies next.
+    fn toggle_dvr(&mut self) {
+        if self.settings.dvr.enabled {
+            self.storage = self.settings.dvr.storage;
+            self.start_ring();
+            if self.storage == DvrStorage::Disk {
+                let staging = staging_config(&self.settings);
+                self.recorder.resize(staging);
+                self.dvr_applied = staging;
+            }
+        } else {
+            drop(self.persister.take());
+            let off = DvrConfig { video_bytes: 0, audio_bytes: 0 };
+            self.recorder.resize(off);
+            self.dvr_applied = off;
+        }
+    }
+
     fn reapply_profile(&mut self) {
         let profile = self
             .tracked
@@ -1539,8 +1561,16 @@ impl Actor {
             Command::ApplySettings(settings) => {
                 // Phase 4: also re-size the DVR buffer. Until then it keeps its startup size.
                 let video_changed = self.settings.video != settings.video;
+                let dvr_toggled = self.settings.dvr.enabled != settings.dvr.enabled;
                 self.settings = *settings;
+                if dvr_toggled {
+                    self.toggle_dvr();
+                }
                 self.reapply_profile();
+                if dvr_toggled && self.settings.dvr.enabled {
+                    // After the profile sized the RAM buffer: pins the rings it just made.
+                    self.page_lock_dvr();
+                }
                 self.hotkeys = ChordMatcher::new(bindings(&self.settings));
                 // Switching modes must never leave the push-to-talk gate open.
                 if let Some(mic) = self.ports.mic.as_mut() {
@@ -1590,8 +1620,8 @@ impl Actor {
     }
 
     /// Marks this moment of the running recording (a manual one or the game's session), for the
-    /// editor and the player to show. The time is the wall clock since the recording started, a
-    /// fraction of a second off the video's own clock.
+    /// editor and the player to show. The time is on the video's own clock: the end of the newest
+    /// frame, from the recording's first keyframe.
     fn bookmark(&mut self) {
         let Some(recording) = self.recording.as_ref().filter(|r| r.id.is_some()) else {
             self.emit(EngineEvent::Warning(
@@ -1600,7 +1630,14 @@ impl Actor {
             ));
             return;
         };
-        let at = Hns::from_millis(recording.started.elapsed().as_millis() as i64);
+        // The file's clock starts at its first keyframe, so count from there on the session
+        // timeline. Before the first keyframe the mark is the file's start.
+        let origin = recording.origin.load(std::sync::atomic::Ordering::Relaxed);
+        let at = if origin == i64::MIN {
+            Hns::ZERO
+        } else {
+            self.recorder.video_end().saturating_sub(Hns(origin)).max(Hns::ZERO)
+        };
         match zc_core::bookmarks::add(&recording.path, at) {
             Ok(()) => self.emit(EngineEvent::BookmarkAdded { at }),
             Err(e) => self.emit(EngineEvent::Error(format!("Couldn't save the bookmark: {e}"))),
@@ -1652,6 +1689,7 @@ impl Actor {
         };
 
         let (tee_writer, reader) = spool::spool();
+        let origin = tee_writer.origin();
         let path = spool::final_path(&partial);
         let inbox = self.inbox.clone();
         let io_partial = partial.clone();
@@ -1675,12 +1713,8 @@ impl Actor {
         // Attached only once the IO thread exists, so a failed spawn never leaves a writer
         // feeding a spool that nothing reads.
         let id = self.recorder.attach(Box::new(tee_writer));
-        self.recording = Some(ActiveRecording {
-            id: Some(id),
-            path: path.clone(),
-            thread: io_thread,
-            started: Instant::now(),
-        });
+        self.recording =
+            Some(ActiveRecording { id: Some(id), path: path.clone(), thread: io_thread, origin });
         self.status.recording = true;
         self.publish_status();
         tracing::info!(path = %path.display(), "recording started");

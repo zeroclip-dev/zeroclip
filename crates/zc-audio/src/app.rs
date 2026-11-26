@@ -5,7 +5,7 @@
 //! and `loopback::setup` joins the MTA and starts Media Foundation for the track's encoder.
 //! The exe-to-pid lookup is the injected resolver, so this module does no process queries itself.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use zc_core::Hns;
@@ -18,7 +18,7 @@ use zc_core::watchdog::HealthEvent;
 use crate::capture::{Mmcss, Stream, Worker, pcm16_format};
 use crate::loopback;
 
-/// How often the capture thread asks which process to follow: a relaunched app is picked up
+/// How often the app's pid is looked up, and the capture thread reads it: a relaunched app is picked up
 /// within this long.
 const RESOLVE_EVERY: Hns = Hns::from_secs(2);
 
@@ -43,6 +43,53 @@ impl ResolveTimer {
         }
         self.next = now + self.every;
         true
+    }
+}
+
+/// Looks up the app's pid every [`RESOLVE_EVERY`] on a helper thread, so the real-time capture
+/// thread never walks the process list (which allocates). It reads the latest answer from an
+/// atomic. The thread stops and is joined when this drops.
+struct PidWatcher {
+    pid: Arc<AtomicU32>,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PidWatcher {
+    fn spawn(resolve: Arc<Mutex<PidResolver>>, exe: String) -> Self {
+        let pid = Arc::new(AtomicU32::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (cell, flag) = (Arc::clone(&pid), Arc::clone(&stop));
+        let handle = std::thread::Builder::new()
+            .name("zc-app-pid".into())
+            .spawn(move || {
+                while !flag.load(Ordering::Acquire) {
+                    cell.store(resolve_pid(&resolve, &exe).unwrap_or(0), Ordering::Relaxed);
+                    // Sliced, so a stop doesn't wait out the whole interval.
+                    for _ in 0..20 {
+                        if flag.load(Ordering::Acquire) {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            })
+            .ok();
+        // A failed spawn leaves the pid at 0: the track stays silent rather than the source failing.
+        Self { pid, stop, handle }
+    }
+
+    fn pid(&self) -> u32 {
+        self.pid.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for PidWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -140,13 +187,14 @@ impl AudioSource for AppAudioSource {
             let _mmcss = Mmcss::join();
             let format = pcm16_format(config.sample_rate, config.channels);
             let mut timer = ResolveTimer::new(RESOLVE_EVERY);
+            let watcher = PidWatcher::spawn(resolve, exe.clone());
             // The pid being captured (0: none) and its stream.
             let (mut current, mut stream) = (0u32, None::<Stream>);
             // Set once process loopback turns out to be unsupported: nothing more to try.
             let mut unsupported = false;
             while !stop.load(Ordering::Acquire) {
                 if !unsupported && timer.due(zc_win::clock::now()) {
-                    let pid = resolve_pid(&resolve, &exe).unwrap_or(0);
+                    let pid = watcher.pid();
                     if pid != current {
                         stream = None;
                         current = pid;
