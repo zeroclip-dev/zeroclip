@@ -20,7 +20,7 @@ state machine; editing never re-encodes; nothing is ever deleted unverified.
 | `zc-core` | `Hns` time, packets, codecs, DVR buffer, watchdog FSM, profiles, hotkeys, DSP, settings, **ports** | — | any |
 | `zc-mux` | container writers (fMP4/MKV), chunked writes, HDD pacing | `zc-core` | any |
 | `zc-video` | D3D11 device, WGC capture, BGRA→NV12, MF hardware encoder, screenshots | `zc-core`, `zc-win` | Windows |
-| `zc-audio` | WASAPI process loopback, mic + push-to-talk, MF AAC encoder | `zc-core`, `zc-win` | Windows |
+| `zc-audio` | WASAPI process loopback, mic + push-to-talk, MF AAC encoder, `PcmPlayer` (in-process preview playback; its device clock paces the picture, D39) | `zc-core`, `zc-win` | Windows |
 | `zc-input` | Raw Input hotkeys, foreground-window tracking | `zc-core`, `zc-win` | Windows |
 | `zc-win` | COM/MF lifetimes, QPC clock, message-only window thread, drive detection, page-locking, single-instance mutex, start-with-Windows Run key, main-window hide/show (tray) | `zc-core` | Windows |
 | `zc-store` | SQLite metadata: clips, keyframes, profiles, probe cache, waveforms, uploads | `zc-core` | any |
@@ -52,6 +52,7 @@ state machine; editing never re-encodes; nothing is ever deleted unverified.
 | Encoder (`zc-video` thread) | `zc-video` | NeedInput → `ProcessInput`; HaveOutput → `ProcessOutput` → `PacketSink::push`; repeat the last frame while the screen is static | allocate, block on I/O |
 | `zc-game-audio`, `zc-mic`, one per app track (up to 6 source tracks) | `zc-audio` | WASAPI event loop → `SampleTimeline` → AAC → `PacketSink::push` (MMCSS "Pro Audio"); the mic applies the PTT gate and compressor; both reopen a lost device; each also writes its PCM into the Master `MixBus` | allocate, block on I/O |
 | `zc-master-mix` (Master, D30, audio track 1) | `zc-audio` | every 20 ms: mix the `MixBus` up to 200 ms behind real time → AAC → `PacketSink::push` (MMCSS "Pro Audio") | allocate, block on I/O, hold the bus lock across an encode |
+| `zc-pcm-render` (one per playing preview piece, D39) | `zc-audio` (`render.rs`) | event-driven WASAPI shared-mode render: queued PCM (written by the preview's mixer thread through `PcmWriter`) into the device; publishes the audible position `Player` reads | allocate, hold the queue lock across a COM call |
 | `zc-input` (message thread) | `zc-input` | Raw Input + WinEvent hook → `OsEvent`s; never logs keystrokes | do real work in callbacks |
 | IO | engine (Phase 3) | one thread per clip dump and per recording (chunked writes; dumps paced on HDD); in disk mode a dump also reads the ring file record by record | hold the recorder lock |
 | `zc-io-ring` (disk mode, D32) | `zc-engine` (`disk_dvr.rs`) | every 250 ms: copy finished GOPs out of the staging `DvrBuffer` in short holds, write each as one record to `zeroclip-dvr.ring` (paced on HDD) | hold the recorder lock across a write |
