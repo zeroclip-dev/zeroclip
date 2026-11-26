@@ -67,15 +67,19 @@ impl Drop for Mmcss {
 }
 
 /// An auto-reset event WASAPI signals when a buffer is ready.
-struct Event(HANDLE);
+pub(crate) struct Event(HANDLE);
 
 impl Event {
-    fn new() -> Result<Self, SourceError> {
+    pub(crate) fn new() -> Result<Self, SourceError> {
         // SAFETY: plain FFI call; an unnamed auto-reset event.
         unsafe { CreateEventW(None, false, false, None) }.map(Self).context("CreateEventW")
     }
 
-    fn wait(&self, ms: u32) -> bool {
+    pub(crate) fn handle(&self) -> HANDLE {
+        self.0
+    }
+
+    pub(crate) fn wait(&self, ms: u32) -> bool {
         // SAFETY: the handle is valid until drop.
         (unsafe { WaitForSingleObject(self.0, ms) }) == WAIT_OBJECT_0
     }

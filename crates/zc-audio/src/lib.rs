@@ -23,6 +23,9 @@
 //! MMCSS (`AvSetMmThreadCharacteristicsW("Pro Audio")`) so they don't glitch
 //! under game load. WASAPI is used through the raw `windows` APIs rather than the
 //! `wasapi` crate (DECISIONS), so the audio loop's no-allocation rule stays ours.
+//!
+//! The other direction is [`PcmPlayer`]: in-process WASAPI playback for the clip player and
+//! editor preview, whose device clock paces the picture.
 
 mod aac;
 mod app;
@@ -31,8 +34,10 @@ mod game;
 mod loopback;
 mod mic;
 mod mix;
+mod render;
 
 pub use app::AppAudioSource;
 pub use game::GameAudioSource;
 pub use mic::{MicDevice, MicSource, list_microphones};
 pub use mix::MasterMix;
+pub use render::{PCM_CHANNELS, PCM_RATE, PcmPlayer, PcmWriter};
