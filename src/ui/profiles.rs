@@ -23,7 +23,7 @@ use super::components::button::{
 use super::components::exe_icon;
 use super::components::labeled_toggle::labeled_toggle;
 use super::components::open_apps::{
-    has_live_track, same_exe, set_audio_track, set_game_profile, track_slot_free,
+    has_live_track, live_tracks, same_exe, set_audio_track, set_game_profile, track_slot_free,
 };
 use super::components::slider::{SliderState, slider};
 use super::components::status_dot::status_dot;
@@ -2184,9 +2184,8 @@ impl ProfilesView {
             app.open_apps.apps().iter().map(|a| (a.exe.clone(), a.title.clone())).collect()
         });
         let app_col_w = if wide { 164.0 } else { 148.0 };
-        let used_slots = tracks.len();
-        let active_tracks = tracks.iter().filter(|t| t.enabled).count();
-        let slots_full = used_slots >= MAX_APP_TRACKS;
+        let active_tracks = live_tracks(tracks);
+        let slots_full = active_tracks >= MAX_APP_TRACKS;
 
         let mut rows: Vec<AnyElement> = Vec::new();
         for (n, (exe, title)) in listed.iter().enumerate() {

@@ -4342,7 +4342,7 @@ dependencies = [
 
 [[package]]
 name = "spike-phase0"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "windows 0.62.2",
@@ -4352,7 +4352,7 @@ dependencies = [
 
 [[package]]
 name = "spike-phase2"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "tracing",
@@ -5830,7 +5830,7 @@ dependencies = [
 
 [[package]]
 name = "zc-audio"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -5842,7 +5842,7 @@ dependencies = [
 
 [[package]]
 name = "zc-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -5851,7 +5851,7 @@ dependencies = [
 
 [[package]]
 name = "zc-destinations"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "thiserror 2.0.20",
  "zc-core",
@@ -5859,7 +5859,7 @@ dependencies = [
 
 [[package]]
 name = "zc-editor"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "thiserror 2.0.20",
  "zc-core",
@@ -5867,7 +5867,7 @@ dependencies = [
 
 [[package]]
 name = "zc-engine"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "thiserror 2.0.20",
  "time",
@@ -5878,7 +5878,7 @@ dependencies = [
 
 [[package]]
 name = "zc-input"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "windows 0.62.2",
  "zc-core",
@@ -5887,7 +5887,7 @@ dependencies = [
 
 [[package]]
 name = "zc-mux"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "tracing",
  "zc-core",
@@ -5895,7 +5895,7 @@ dependencies = [
 
 [[package]]
 name = "zc-store"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "rusqlite",
  "thiserror 2.0.20",
@@ -5904,7 +5904,7 @@ dependencies = [
 
 [[package]]
 name = "zc-video"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "image",
  "tracing",
@@ -5916,7 +5916,7 @@ dependencies = [
 
 [[package]]
 name = "zc-win"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "windows 0.62.2",
  "zc-core",
@@ -5954,7 +5954,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclip"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-channel",
