@@ -98,6 +98,10 @@ jobs:
           Compress-Archive -Path stage/* -DestinationPath "dist/$base.zip"
           # The app's installer expects exactly these names at the zip's root (update::FFMPEG_ASSET).
           Compress-Archive -Path ffmpeg/* -DestinationPath dist/ffmpeg-windows-x64.zip
+          # The installer: per-user, same files as the zip (installer/zeroclip.iss).
+          choco install innosetup --no-progress -y | Out-Null
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q "/DAppVersion=$env:VERSION" installer/zeroclip.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
           # sha256sum format: "<lowercase hex>  <file name>", LF line endings, no BOM.
           $lines = Get-ChildItem dist -File | Where-Object Name -ne 'SHA256SUMS.txt' | Sort-Object Name |
             ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" }
