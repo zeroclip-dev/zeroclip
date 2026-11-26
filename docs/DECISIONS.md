@@ -319,3 +319,17 @@ for stream-copy editing; that stays true for video.
 Consequence: export jobs use `-c:v copy`; only the audio tracks the user changed are re-encoded
 (AAC, bitrate matching the source track), untouched tracks stay stream-copied. FFmpeg is still a
 separate `ffmpeg.exe` process (D3), so its LGPL/GPL build never mixes with the app.
+
+### D39 · Preview audio plays in-process through WASAPI and is the master clock (supersedes the ffplay sink of D22)
+Why: the clip player and the editor preview piped decoded PCM to an `ffplay` child while the picture ran
+on the wall clock from the moment play was pressed. Sound became audible only after ffmpeg's seek, ffplay's
+start-up and its buffering, so it lagged the picture by a variable amount on every play.
+Decision: `zc_audio::PcmPlayer` renders the preview's 48 kHz stereo f32 PCM on the default render endpoint
+(WASAPI shared mode, event driven, auto-converted to the mix format). ffmpeg still decodes and tempo-stretches
+it, and the mixing and live gain ramp are unchanged. `IAudioClock` is the clock: while a piece has sound, the
+picture shows source time = `played() * rate`, and holds its first frame until the device has started. A piece
+with no sound (gap, muted tracks, no audio stream, device missing, failed or not started within 3 s) uses
+the wall clock as before. Muted playback in the clip player keeps the audio clock and feeds silence, so
+unmuting needs no restart. ffplay is no longer used by the app.
+Consequence: a device error degrades to "no sound" and the wall clock; the release package still ships
+`ffplay.exe` (release workflow, `update.rs`) until the owner decides to drop it.
