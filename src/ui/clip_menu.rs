@@ -182,6 +182,7 @@ pub fn layer(
                 // A screen still pointing at the deleted file would show or play a ghost.
                 app.screens.clips().clone().update(cx, |clips, cx| clips.forget(&path, cx));
                 app.screens.player().clone().update(cx, |player, cx| player.forget(&path, cx));
+                app.screens.editor().clone().update(cx, |editor, cx| editor.forget(&path, cx));
                 app.clips.invalidate();
                 app.notify(NoticeLevel::Info, "Moved to the Recycle Bin");
             }

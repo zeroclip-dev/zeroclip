@@ -327,6 +327,16 @@ impl Recorder {
         );
     }
 
+    /// Capture was stopped with the buffer kept (the game lost focus). Packets after the restart
+    /// continue the timeline from the end of the footage, so the pause leaves no hole in a clip
+    /// and doesn't use up the DVR window. Every track shares the one offset, so they stay aligned.
+    /// Call it once the sources have stopped.
+    pub fn pause(&self) {
+        let mut state = self.lock();
+        let end = state.dvr.newest_video_end();
+        state.clock.pause(end);
+    }
+
     /// Starts feeding a disk writer (manual or session recording).
     pub fn attach(&self, writer: Box<dyn PacketWriter>) -> SinkId {
         self.lock().tee.attach(writer)
@@ -410,6 +420,16 @@ impl PacketSink for Recorder {
         if meta.track == TrackId::Video && meta.keyframe && !clock.is_anchored() {
             clock.anchor(meta.pts);
         }
+        if clock.is_paused() {
+            // Capture restarted after a pause: the timeline can only resume on a video keyframe,
+            // so nothing else (a stray audio buffer, a delta frame) gets a PTS before it.
+            if meta.track == TrackId::Video && meta.keyframe {
+                clock.resume(meta.pts);
+            } else {
+                stats.early_packets += 1;
+                return;
+            }
+        }
         let Some(pts) = clock.to_pts(meta.track, meta.pts) else {
             stats.early_packets += 1;
             return;
@@ -463,6 +483,36 @@ mod tests {
             assert!(packet.data[5..].iter().all(|&b| b == 0xAB), "packet {n} was overwritten");
         }
         assert!(clip.packets.windows(2).all(|w| w[0].meta.pts <= w[1].meta.pts));
+    }
+
+    #[test]
+    fn a_pause_leaves_no_hole_and_keeps_audio_aligned_with_video() {
+        let recorder = Recorder::new(DvrConfig { video_bytes: 10_000_000, audio_bytes: 1_000_000 });
+        let mut stream = SyntheticStream::new();
+        for p in stream.take_secs(3) {
+            recorder.push(p.view());
+        }
+        recorder.pause();
+        // Capture restarts 50 s later: the same stream, on a clock that kept running. Audio that
+        // arrives before the first keyframe is dropped, like the real sources' first buffers.
+        let gap = Hns::from_secs(50);
+        for mut p in stream.take_secs(3) {
+            p.meta.pts += gap;
+            recorder.push(p.view());
+        }
+        let clip = recorder.snapshot(Hns::from_secs(10)).expect("clip");
+        let video: Vec<Hns> = clip.video().map(|p| p.meta.pts).collect();
+        assert_eq!(video.len(), 360);
+        // Video runs on without a step, even across the pause.
+        let step = SyntheticStream::new().frame_pts(1);
+        // (A frame's PTS is rounded, so a step may differ by a tick.)
+        assert!(
+            video.windows(2).all(|w| (w[1] - w[0] - step).ticks().abs() <= 1),
+            "a hole where capture was paused"
+        );
+        // Audio carries the same offset: its packets stay inside the video's span.
+        let (first, last) = (video[0], clip.video().last().unwrap().meta.end());
+        assert!(clip.packets.iter().all(|p| p.meta.pts >= first && p.meta.pts <= last));
     }
 
     #[test]

@@ -438,6 +438,19 @@ fn capture_decision(
     CaptureDecision::Start { hwnd: focus.hwnd, clear_buffer: kept.is_some() && !same_game }
 }
 
+/// Whether the video track a capture start produced can't share a clip with the one before it:
+/// another codec or size.
+fn video_format_changed(old: Option<&TrackInfo>, new: Option<&TrackInfo>) -> bool {
+    let key = |t: &TrackInfo| match t.kind {
+        TrackKind::Video { codec, width, height, .. } => Some((codec, width, height)),
+        _ => None,
+    };
+    match (old.and_then(key), new.and_then(key)) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    }
+}
+
 /// A manual recording, from its start until its IO thread has finished the file.
 struct ActiveRecording {
     /// The recorder's tee slot. `None` once the recording has been stopped: the spool is
@@ -447,8 +460,9 @@ struct ActiveRecording {
     path: PathBuf,
     /// The IO thread that drains the spool into the file.
     thread: JoinHandle<()>,
-    /// When it started, which is what a bookmark counts from.
-    started: Instant,
+    /// PTS (ticks) of the file's first video keyframe, which is what a bookmark counts from.
+    /// `i64::MIN` until the spool has taken one.
+    origin: Arc<std::sync::atomic::AtomicI64>,
 }
 
 /// Why a DVR save produced no clip, as its IO thread reports it.
@@ -533,7 +547,7 @@ fn staging_config(settings: &Settings) -> DvrConfig {
 fn dvr_for(settings: &Settings, window: Hns) -> DvrConfig {
     let max_video_bps = u64::from(settings.video.max_bitrate_kbps) * 1_000;
     let audio_bps = u64::from(settings.audio.bitrate_kbps) * 1_000;
-    DvrConfig::for_window(window, max_video_bps, audio_bps)
+    DvrConfig::for_window_gop(window, settings.video.keyframe_interval(), max_video_bps, audio_bps)
 }
 
 /// The DVR window a profile asks for, limited by the effective RAM ceiling (`ram_ceiling_mib`, the
@@ -816,6 +830,27 @@ impl Actor {
 
     /// Applies the tracked game's profile again after the settings changed, or the default when no
     /// game is tracked or its profile was removed.
+    /// The DVR was switched on or off in the settings, so the buffer follows now rather than at
+    /// the next start. Off: the rings shrink to nothing, which also releases their page locks,
+    /// and the disk writer stops. On: the ring file starts in disk mode (the staging area is
+    /// sized here), and the RAM buffer is sized by the profile that `reapply_profile` applies next.
+    fn toggle_dvr(&mut self) {
+        if self.settings.dvr.enabled {
+            self.storage = self.settings.dvr.storage;
+            self.start_ring();
+            if self.storage == DvrStorage::Disk {
+                let staging = staging_config(&self.settings);
+                self.recorder.resize(staging);
+                self.dvr_applied = staging;
+            }
+        } else {
+            drop(self.persister.take());
+            let off = DvrConfig { video_bytes: 0, audio_bytes: 0 };
+            self.recorder.resize(off);
+            self.dvr_applied = off;
+        }
+    }
+
     fn reapply_profile(&mut self) {
         let profile = self
             .tracked
@@ -1359,8 +1394,19 @@ impl Actor {
                 self.video_config = Some(config);
                 self.status.watchdog = WatchdogState::Running;
                 self.status.capturing = true;
+                let format = self.ports.video.as_ref().and_then(|video| video.format());
+                // Same game, but a new size or codec (window resized, fullscreen toggled): the
+                // buffered GOPs can't share a clip's sample description with the new ones. A
+                // rescue waiting for the dump slot still needs the old footage, as in
+                // `on_capture_focus`.
+                if self.rescue_waiting.is_none()
+                    && video_format_changed(self.video_track.as_ref(), format.as_ref())
+                {
+                    tracing::info!("video format changed; clearing the DVR buffer");
+                    self.recorder.clear();
+                }
                 self.status.codec = Some(codec);
-                self.video_track = self.ports.video.as_ref().and_then(|video| video.format());
+                self.video_track = format;
             }
             Some(Err(e)) => {
                 self.emit(EngineEvent::Error(format!("Capture couldn't start: {e}")));
@@ -1474,6 +1520,8 @@ impl Actor {
         if let Some(video) = video {
             video.stop();
         }
+        // The next start carries on from the end of the buffered footage, not from the wall clock.
+        self.recorder.pause();
         // A recovery cut short here must not restart the encoder later (a pending flush's
         // `Flushed` then finds no watchdog and is dropped).
         self.watchdog = None;
@@ -1515,8 +1563,16 @@ impl Actor {
             Command::ApplySettings(settings) => {
                 // Phase 4: also re-size the DVR buffer. Until then it keeps its startup size.
                 let video_changed = self.settings.video != settings.video;
+                let dvr_toggled = self.settings.dvr.enabled != settings.dvr.enabled;
                 self.settings = *settings;
+                if dvr_toggled {
+                    self.toggle_dvr();
+                }
                 self.reapply_profile();
+                if dvr_toggled && self.settings.dvr.enabled {
+                    // After the profile sized the RAM buffer: pins the rings it just made.
+                    self.page_lock_dvr();
+                }
                 self.hotkeys = ChordMatcher::new(bindings(&self.settings));
                 // Switching modes must never leave the push-to-talk gate open.
                 if let Some(mic) = self.ports.mic.as_mut() {
@@ -1566,8 +1622,8 @@ impl Actor {
     }
 
     /// Marks this moment of the running recording (a manual one or the game's session), for the
-    /// editor and the player to show. The time is the wall clock since the recording started, a
-    /// fraction of a second off the video's own clock.
+    /// editor and the player to show. The time is on the video's own clock: the end of the newest
+    /// frame, from the recording's first keyframe.
     fn bookmark(&mut self) {
         let Some(recording) = self.recording.as_ref().filter(|r| r.id.is_some()) else {
             self.emit(EngineEvent::Warning(
@@ -1576,7 +1632,14 @@ impl Actor {
             ));
             return;
         };
-        let at = Hns::from_millis(recording.started.elapsed().as_millis() as i64);
+        // The file's clock starts at its first keyframe, so count from there on the session
+        // timeline. Before the first keyframe the mark is the file's start.
+        let origin = recording.origin.load(std::sync::atomic::Ordering::Relaxed);
+        let at = if origin == i64::MIN {
+            Hns::ZERO
+        } else {
+            self.recorder.video_end().saturating_sub(Hns(origin)).max(Hns::ZERO)
+        };
         match zc_core::bookmarks::add(&recording.path, at) {
             Ok(()) => self.emit(EngineEvent::BookmarkAdded { at }),
             Err(e) => self.emit(EngineEvent::Error(format!("Couldn't save the bookmark: {e}"))),
@@ -1628,6 +1691,7 @@ impl Actor {
         };
 
         let (tee_writer, reader) = spool::spool();
+        let origin = tee_writer.origin();
         let path = spool::final_path(&partial);
         let inbox = self.inbox.clone();
         let io_partial = partial.clone();
@@ -1651,12 +1715,8 @@ impl Actor {
         // Attached only once the IO thread exists, so a failed spawn never leaves a writer
         // feeding a spool that nothing reads.
         let id = self.recorder.attach(Box::new(tee_writer));
-        self.recording = Some(ActiveRecording {
-            id: Some(id),
-            path: path.clone(),
-            thread: io_thread,
-            started: Instant::now(),
-        });
+        self.recording =
+            Some(ActiveRecording { id: Some(id), path: path.clone(), thread: io_thread, origin });
         self.status.recording = true;
         self.publish_status();
         tracing::info!(path = %path.display(), "recording started");
@@ -2134,6 +2194,21 @@ mod tests {
             Path::new("custom")
         );
         assert_eq!(super::resolve_output_dir(None, default), default);
+    }
+
+    #[test]
+    fn a_new_codec_or_size_changes_the_video_format() {
+        let track = |codec, width, height| TrackInfo {
+            track: TrackId::Video,
+            label: "Video".into(),
+            kind: TrackKind::Video { codec, width, height, fps: 60 },
+            codec_private: Vec::new(),
+        };
+        let base = track(Codec::H264, 1920, 1080);
+        assert!(!super::video_format_changed(Some(&base), Some(&base)));
+        assert!(super::video_format_changed(Some(&base), Some(&track(Codec::H264, 1280, 720))));
+        assert!(super::video_format_changed(Some(&base), Some(&track(Codec::Hevc, 1920, 1080))));
+        assert!(!super::video_format_changed(None, Some(&base)), "no earlier track");
     }
 
     use std::path::Path;

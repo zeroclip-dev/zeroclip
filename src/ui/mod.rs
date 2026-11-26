@@ -81,7 +81,14 @@ fn top_bar(app: &ZeroClipApp, cx: &mut Context<ZeroClipApp>) -> impl IntoElement
     let tabs =
         div().flex().flex_row().items_center().gap_1().children(Tab::ALL.into_iter().map(|tab| {
             tab_button(tab.icon(), tab.label(), app.tab == tab).on_click(cx.listener(
-                move |app, _, _, cx| {
+                move |app, _, window, cx| {
+                    // Fullscreen belongs to the Player and Editor; don't carry it to other tabs.
+                    if tab != app.tab
+                        && matches!(app.tab, Tab::Player | Tab::Editor)
+                        && window.is_fullscreen()
+                    {
+                        window.toggle_fullscreen();
+                    }
                     // Leaving the Editor stops its playback; it isn't drawn, so nothing else would.
                     if app.tab == Tab::Editor && tab != Tab::Editor {
                         app.screens.editor().clone().update(cx, |editor, cx| editor.pause(cx));

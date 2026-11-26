@@ -5,9 +5,7 @@
 //! changes apply immediately without restarting playback.
 
 use std::cell::Cell;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -32,7 +30,10 @@ use super::components::{
     slider::{SliderState, slider},
     status_dot::status_dot,
 };
-use super::editor::player::{Item, Player, Sound, pause_on_focus_loss, stop_audio_tree};
+use super::editor::player::{
+    AudioPlayback, Item, MIX_CHANNELS, Player, Sound, decode_f32le, pause_on_focus_loss,
+    read_chunk, spawn_pcm_decoder,
+};
 use super::icons::icon;
 use super::theme;
 use crate::app::ZeroClipApp;
@@ -48,9 +49,6 @@ const SPEEDS: [f64; 5] = [0.5, 1.0, 1.25, 1.5, 2.0];
 const VOLUME_STEP: i32 = 5;
 /// Debounce before flushing rapid slider/key volume changes to `settings.toml`.
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(200);
-/// PCM stream parameters for the live-volume audio pipe (`48 kHz` stereo `f32le`).
-const AUDIO_SAMPLE_RATE: u32 = 48_000;
-const AUDIO_CHANNELS: usize = 2;
 /// Frames processed per live audio chunk (~21 ms at 48 kHz for responsive volume and mute).
 const AUDIO_CHUNK_FRAMES: usize = 1024;
 /// Viewport width below which the transport and speed/volume groups split onto two tidy rows.
@@ -83,8 +81,6 @@ pub struct VideoPlayerView {
     /// Bumped on every open, so a slow probe of an earlier clip is ignored.
     generation: u64,
     player: Player,
-    /// Live PCM audio pipeline (`ffmpeg` -> scaled `f32le` -> `ffplay`), updated without restarts.
-    audio: Option<LiveAudio>,
     /// Shared linear gain (`f32::to_bits`) read by the live audio thread on every chunk.
     live_gain: Arc<AtomicU32>,
     /// The speed picked with the buttons.
@@ -118,6 +114,10 @@ pub struct VideoPlayerView {
     bar: Rc<Cell<Bounds<gpui::Pixels>>>,
     /// The seek bar is being dragged.
     scrubbing: bool,
+    /// Playback was running when the scrub started; resumes from the final position on release.
+    scrub_resume: bool,
+    /// Latest scrub time waiting for the in-flight still decode to finish (older ones are dropped).
+    scrub_pending: Option<Hns>,
     /// Cursor position along the seek bar (`0.0..=1.0`) while hovering, for the preview tooltip.
     hover_frac: Option<f32>,
     /// Subscription pausing playback when the OS window loses focus or is minimised.
@@ -126,12 +126,6 @@ pub struct VideoPlayerView {
     window_active: bool,
     /// Remembers whether playback was running when the window lost focus (never auto-resumes).
     paused_on_blur: bool,
-}
-
-impl Drop for VideoPlayerView {
-    fn drop(&mut self) {
-        self.stop_audio();
-    }
 }
 
 impl VideoPlayerView {
@@ -154,7 +148,6 @@ impl VideoPlayerView {
             loading: false,
             generation: 0,
             player: Player::default(),
-            audio: None,
             live_gain: Arc::new(AtomicU32::new(initial_gain.to_bits())),
             speed: 1.0,
             volume_percent: initial_vol,
@@ -173,6 +166,8 @@ impl VideoPlayerView {
             focused_generation: None,
             bar: Rc::new(Cell::new(Bounds::default())),
             scrubbing: false,
+            scrub_resume: false,
+            scrub_pending: None,
             hover_frac: None,
             window_activation_sub: None,
             window_active: true,
@@ -246,12 +241,6 @@ impl VideoPlayerView {
         .detach();
     }
 
-    fn stop_audio(&mut self) {
-        if let Some(audio) = self.audio.take() {
-            audio.shutdown();
-        }
-    }
-
     /// Sets volume from dragging or clicking the horizontal slider. Dragging above 0 unmutes.
     fn set_volume_from_slider(&mut self, percent: u8, cx: &mut Context<Self>) {
         let pct = clamp_volume(percent);
@@ -311,7 +300,6 @@ impl VideoPlayerView {
 
     /// Opens `path` and starts playing it.
     pub fn open(&mut self, path: PathBuf, ffmpeg_path: Option<PathBuf>, cx: &mut Context<Self>) {
-        self.stop_audio();
         self.player.reset();
         self.generation += 1;
         let generation = self.generation;
@@ -398,9 +386,7 @@ impl VideoPlayerView {
         if self.prefs_dirty {
             self.persist_audio_prefs_now(cx);
         }
-        let had_audio = self.audio.is_some();
-        self.stop_audio();
-        if self.player.playing || had_audio {
+        if self.player.playing {
             self.player.pause();
             cx.notify();
         }
@@ -414,7 +400,6 @@ impl VideoPlayerView {
             self.hold = None;
             self.boosted = false;
             self.track_menu_open = false;
-            self.stop_audio();
             self.player.pause();
             cx.notify();
         }
@@ -429,13 +414,13 @@ impl VideoPlayerView {
         let (Some(ffmpeg), Some(path)) = (self.ffmpeg.clone(), self.path.clone()) else {
             return;
         };
-        let at = at.clamp(Hns::ZERO, self.duration);
+        let at = at.clamp(Hns::ZERO, self.duration.max(Hns::ZERO));
         self.paused_on_blur = false;
-        self.stop_audio();
         let speed = self.effective_speed();
         self.player.speed = speed;
-        // Video only in `Player`: pass a muted `Sound::track` so `Player` spawns no `ffplay`
-        // while `LiveAudio` below scales PCM samples live without restarting playback.
+        // The `Player` item carries no sound of its own: `live_audio` below decodes and scales
+        // the PCM live (volume and mute apply without restarting) and the player's picture
+        // follows its device clock.
         let mut muted_track = Sound::track(0, 0.0, None);
         muted_track.mute = true;
         self.player.play(
@@ -452,15 +437,11 @@ impl VideoPlayerView {
         if self.has_sound && self.player.playing {
             self.apply_live_gain();
             let track = self.selected_track.min(self.audio_tracks.len().saturating_sub(1));
-            self.audio = LiveAudio::start(
-                &ffmpeg,
-                &path,
-                at,
-                self.duration,
-                track,
-                speed,
-                self.live_gain.clone(),
-            );
+            let audio =
+                live_audio(&ffmpeg, &path, at, self.duration, track, speed, self.live_gain.clone());
+            if let Some(audio) = audio {
+                self.player.attach_audio(audio);
+            }
         }
         self.ensure_ticking(cx);
         cx.notify();
@@ -471,7 +452,6 @@ impl VideoPlayerView {
         if self.player.playing {
             self.hold = None;
             self.boosted = false;
-            self.stop_audio();
             self.player.pause();
             cx.notify();
         } else if self.ffmpeg.is_some() {
@@ -490,9 +470,10 @@ impl VideoPlayerView {
         self.hold = None;
         self.boosted = false;
         self.scrubbing = false;
+        self.scrub_resume = false;
+        self.scrub_pending = None;
         self.track_menu_open = false;
         self.paused_on_blur = false;
-        self.stop_audio();
         self.player.pause();
         if let (Some(ffmpeg), Some(path)) = (self.ffmpeg.as_ref(), self.path.as_ref()) {
             self.player.show_at(ffmpeg, path, Hns::ZERO, Hns::ZERO);
@@ -505,15 +486,53 @@ impl VideoPlayerView {
 
     /// Moves to `t`: keeps playing if it was, else shows that frame.
     fn seek(&mut self, t: Hns, cx: &mut Context<Self>) {
-        let t = t.clamp(Hns::ZERO, self.duration);
+        let t = t.clamp(Hns::ZERO, self.duration.max(Hns::ZERO));
         if self.player.playing {
             self.play_from(t, cx);
         } else if self.ffmpeg.is_some() && self.path.is_some() {
-            self.stop_audio();
-            if let (Some(ffmpeg), Some(path)) = (self.ffmpeg.as_ref(), self.path.as_ref()) {
-                self.player.show_at(ffmpeg, path, t, t);
+            if self.scrubbing && self.player.busy() {
+                // A still is still decoding: keep only the latest time, the tick shows it next.
+                self.player.playhead = t;
+                self.scrub_pending = Some(t);
+            } else {
+                self.show_still(t);
             }
             self.ensure_ticking(cx);
+            cx.notify();
+        }
+    }
+
+    fn show_still(&mut self, t: Hns) {
+        if let (Some(ffmpeg), Some(path)) = (self.ffmpeg.as_ref(), self.path.as_ref()) {
+            self.player.show_at(ffmpeg, path, t, t);
+        }
+    }
+
+    /// Starts a seek-bar drag. Playback pauses so the drag shows stills, not a restart per move.
+    fn begin_scrub(&mut self) {
+        self.scrubbing = true;
+        self.scrub_resume = self.player.playing;
+        if self.scrub_resume {
+            self.hold = None;
+            self.boosted = false;
+            self.player.pause();
+        }
+    }
+
+    /// Ends a seek-bar drag: shows the last still, or resumes playing from it.
+    fn end_scrub(&mut self, cx: &mut Context<Self>) {
+        if !self.scrubbing {
+            return;
+        }
+        self.scrubbing = false;
+        let pending = self.scrub_pending.take();
+        if std::mem::take(&mut self.scrub_resume) {
+            self.play_from(self.player.playhead, cx);
+        } else {
+            if let Some(t) = pending {
+                self.show_still(t);
+                self.ensure_ticking(cx);
+            }
             cx.notify();
         }
     }
@@ -557,7 +576,6 @@ impl VideoPlayerView {
                 let keep = this
                     .update(cx, |this, cx| {
                         if !this.player.busy() {
-                            this.stop_audio();
                             this.ticking = false;
                             return false;
                         }
@@ -570,20 +588,10 @@ impl VideoPlayerView {
                             this.boosted = true;
                             this.restart(cx);
                         }
-                        let busy = this.player.tick();
-                        if !this.player.playing {
-                            this.stop_audio();
-                        } else if let Some(audio) = this.audio.as_mut()
-                            && this.duration - this.player.playhead > Hns::from_secs(1)
-                            && let Ok(Some(status)) = audio.try_wait_sink()
-                        {
-                            let said = std::fs::read_to_string(audio_log()).unwrap_or_default();
-                            tracing::warn!(
-                                %status,
-                                said = said.trim(),
-                                "the player's audio stopped early"
-                            );
-                            this.stop_audio();
+                        let mut busy = this.player.tick();
+                        if !busy && let Some(t) = this.scrub_pending.take() {
+                            this.show_still(t);
+                            busy = this.player.busy();
                         }
                         cx.notify();
                         if !busy {
@@ -644,206 +652,57 @@ impl VideoPlayerView {
     }
 }
 
-/// Live-volume audio playback for the video player: `ffmpeg` decodes the chosen track to raw
-/// `48 kHz` stereo `f32le` PCM, a dedicated thread scales each 21 ms chunk by the shared atomic
-/// gain with a per-frame linear ramp (so mute and slider drags apply immediately without clicks
-/// or playback restarts), and pipes the result to `ffplay`.
-struct LiveAudio {
-    sink: Child,
-    decoder: Child,
-    stop: Arc<AtomicBool>,
-}
+/// Live-volume audio for the video player: `ffmpeg` decodes the chosen track to raw `48 kHz`
+/// stereo `f32le` PCM, a dedicated thread scales each 21 ms chunk by the shared atomic gain with
+/// a per-frame linear ramp (so mute and slider drags apply immediately without clicks or
+/// playback restarts), and writes the result to a WASAPI player whose clock paces the picture.
+/// Muted playback keeps running (on silence), so unmuting needs no restart and the clock stays.
+fn live_audio(
+    ffmpeg: &Ffmpeg,
+    path: &Path,
+    from: Hns,
+    to: Hns,
+    track: usize,
+    rate: f64,
+    live_gain: Arc<AtomicU32>,
+) -> Option<AudioPlayback> {
+    let duration_secs = (to - from).as_secs_f64();
+    if duration_secs <= 0.0 {
+        return None;
+    }
+    // The device opens on its own thread while the decoder starts.
+    let pcm = zc_audio::PcmPlayer::new();
+    let writer = pcm.writer();
+    let (decoder, mut dec_out) = spawn_pcm_decoder(ffmpeg, path, from, duration_secs, track, rate)?;
 
-impl LiveAudio {
-    fn start(
-        ffmpeg: &Ffmpeg,
-        path: &Path,
-        from: Hns,
-        to: Hns,
-        track: usize,
-        rate: f64,
-        live_gain: Arc<AtomicU32>,
-    ) -> Option<Self> {
-        let duration_secs = (to - from).as_secs_f64();
-        if duration_secs <= 0.0 {
-            return None;
-        }
-        let ffplay = ffmpeg.exe.with_file_name(if cfg!(windows) { "ffplay.exe" } else { "ffplay" });
-        if !ffplay.is_file() {
-            return None;
-        }
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = stop.clone();
+    let _ = std::thread::Builder::new().name("zc-player-audio".into()).spawn(move || {
+        let chunk_samples = AUDIO_CHUNK_FRAMES * MIX_CHANNELS;
+        let frame_bytes = MIX_CHANNELS * size_of::<f32>();
+        let mut raw_buf = vec![0u8; chunk_samples * size_of::<f32>()];
+        let mut pcm_buf = vec![0.0_f32; chunk_samples];
+        let mut current_gain = f32::from_bits(live_gain.load(Ordering::Relaxed));
 
-        let mut dec_cmd = Command::new(&ffmpeg.exe);
-        dec_cmd
-            .args(["-hide_banner", "-nostdin", "-loglevel", "error"])
-            .arg("-ss")
-            .arg(format!("{:.6}", from.as_secs_f64()))
-            // `-t` before `-i` counts source time: after it, it would count output time, which
-            // `atempo` stretches, and a slow speed would cut the sound short.
-            .arg("-t")
-            .arg(format!("{duration_secs:.6}"))
-            .arg("-i")
-            .arg(zc_editor::ffmpeg::input_arg(path))
-            .args(["-vn", "-sn", "-map"])
-            .arg(format!("0:a:{track}"));
-        let tempo_filters = atempo_filters(rate);
-        if !tempo_filters.is_empty() {
-            dec_cmd.arg("-af").arg(tempo_filters.join(","));
-        }
-        dec_cmd
-            .args([
-                "-ar",
-                &AUDIO_SAMPLE_RATE.to_string(),
-                "-ac",
-                &AUDIO_CHANNELS.to_string(),
-                "-f",
-                "f32le",
-                "pipe:1",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        no_window(&mut dec_cmd);
-        let mut decoder = dec_cmd.spawn().ok()?;
-        let Some(mut dec_out) = decoder.stdout.take() else {
-            let _ = decoder.kill();
-            let _ = decoder.wait();
-            return None;
-        };
-
-        let log = std::fs::File::create(audio_log()).map_or_else(|_| Stdio::null(), Stdio::from);
-        let mut sink_cmd = Command::new(&ffplay);
-        // Low-latency raw PCM sink so audio starts in step with video and volume updates land in
-        // ~21 ms instead of sitting behind ffplay's default probe buffer.
-        sink_cmd
-            .args([
-                "-nodisp",
-                "-autoexit",
-                "-loglevel",
-                "error",
-                "-probesize",
-                "32",
-                "-analyzeduration",
-                "0",
-                "-fflags",
-                "nobuffer",
-                "-f",
-                "f32le",
-                "-sample_rate",
-                &AUDIO_SAMPLE_RATE.to_string(),
-                "-ch_layout",
-                "stereo",
-                "-i",
-                "pipe:0",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(log);
-        no_window(&mut sink_cmd);
-        let Ok(mut sink) = sink_cmd.spawn() else {
-            let _ = decoder.kill();
-            let _ = decoder.wait();
-            return None;
-        };
-        let Some(mut sink_in) = sink.stdin.take() else {
-            stop_audio_tree(sink, vec![decoder]);
-            return None;
-        };
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_flag = stop.clone();
-        let _ = std::thread::Builder::new().name("zc-player-audio".into()).spawn(move || {
-            let chunk_samples = AUDIO_CHUNK_FRAMES * AUDIO_CHANNELS;
-            let frame_bytes = AUDIO_CHANNELS * size_of::<f32>();
-            let chunk_bytes = chunk_samples * size_of::<f32>();
-            let mut raw_buf = vec![0u8; chunk_bytes];
-            let mut pcm_buf = vec![0.0_f32; chunk_samples];
-            let mut current_gain = f32::from_bits(live_gain.load(Ordering::Relaxed));
-
-            while !stop_flag.load(Ordering::Relaxed) {
-                let got = read_chunk(&mut dec_out, &mut raw_buf);
-                let aligned_bytes = (got / frame_bytes) * frame_bytes;
-                if aligned_bytes == 0 {
-                    break;
-                }
-                let samples = aligned_bytes / size_of::<f32>();
-                for (dst, bytes) in
-                    pcm_buf[..samples].iter_mut().zip(raw_buf[..aligned_bytes].as_chunks::<4>().0)
-                {
-                    *dst = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                }
-                let target_gain = f32::from_bits(live_gain.load(Ordering::Relaxed));
-                scale_pcm_chunk(&mut pcm_buf[..samples], current_gain, target_gain, AUDIO_CHANNELS);
-                current_gain = target_gain;
-                for (dst, &sample) in raw_buf[..aligned_bytes]
-                    .as_chunks_mut::<4>()
-                    .0
-                    .iter_mut()
-                    .zip(&pcm_buf[..samples])
-                {
-                    dst.copy_from_slice(&sample.to_le_bytes());
-                }
-                if sink_in.write_all(&raw_buf[..aligned_bytes]).is_err() {
-                    break;
-                }
+        while !stop_flag.load(Ordering::Relaxed) {
+            let got = read_chunk(&mut dec_out, &mut raw_buf);
+            let aligned_bytes = (got / frame_bytes) * frame_bytes;
+            if aligned_bytes == 0 {
+                break;
             }
-        });
-
-        Some(Self { sink, decoder, stop })
-    }
-
-    fn try_wait_sink(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        self.sink.try_wait()
-    }
-
-    fn shutdown(self) {
-        self.stop.store(true, Ordering::Relaxed);
-        stop_audio_tree(self.sink, vec![self.decoder]);
-    }
-}
-
-/// Keeps `ffmpeg`/`ffplay`/`taskkill` from flashing a console window in GUI builds.
-/// <https://learn.microsoft.com/windows/win32/procthread/process-creation-flags>
-fn no_window(cmd: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    #[cfg(not(windows))]
-    let _ = cmd;
-}
-
-fn read_chunk(reader: &mut impl Read, buf: &mut [u8]) -> usize {
-    let mut total = 0;
-    while total < buf.len() {
-        match reader.read(&mut buf[total..]) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => total += n,
+            let samples = decode_f32le(&raw_buf[..aligned_bytes], &mut pcm_buf);
+            let target_gain = f32::from_bits(live_gain.load(Ordering::Relaxed));
+            scale_pcm_chunk(&mut pcm_buf[..samples], current_gain, target_gain, MIX_CHANNELS);
+            current_gain = target_gain;
+            // Blocks while the device's queue is full; `false` means the player is gone.
+            if !writer.write(&pcm_buf[..samples]) {
+                break;
+            }
         }
-    }
-    total
-}
+        writer.finish();
+    });
 
-fn atempo_filters(rate: f64) -> Vec<String> {
-    let mut filters = Vec::new();
-    let mut left = if rate > 0.0 { rate } else { 1.0 };
-    while left > 2.0 {
-        filters.push("atempo=2.0".to_owned());
-        left /= 2.0;
-    }
-    while left < 0.5 {
-        filters.push("atempo=0.5".to_owned());
-        left /= 0.5;
-    }
-    if (left - 1.0).abs() > 1e-6 {
-        filters.push(format!("atempo={left:.4}"));
-    }
-    filters
-}
-
-fn audio_log() -> PathBuf {
-    std::env::temp_dir().join("zeroclip-player-ffplay.log")
+    Some(AudioPlayback::new(pcm, vec![decoder], stop))
 }
 
 /// Clamps a volume percentage into `0..=100`.
@@ -1051,6 +910,8 @@ fn disabled_transport(
 impl Render for VideoPlayerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.load_audio_prefs(cx);
+        // F11 toggles the OS window directly, so follow it for the Esc handling and header.
+        self.fullscreen = window.is_fullscreen();
         if self.window_activation_sub.is_none() {
             self.window_activation_sub =
                 Some(cx.observe_window_activation(window, |this, window, cx| {
@@ -1499,7 +1360,7 @@ impl Render for VideoPlayerView {
                     if !ready {
                         return;
                     }
-                    this.scrubbing = true;
+                    this.begin_scrub();
                     this.hover_frac = this.hover_frac_at(ev.position);
                     this.seek_to_x(ev.position.x, cx);
                 }),
@@ -1513,7 +1374,7 @@ impl Render for VideoPlayerView {
                 } else {
                     let next_hover = this.hover_frac_at(ev.position);
                     let was_scrubbing = this.scrubbing;
-                    this.scrubbing = false;
+                    this.end_scrub(cx);
                     let moved = match (this.hover_frac, next_hover) {
                         (Some(a), Some(b)) => (a - b).abs() > 0.002,
                         (None, None) => false,
@@ -1528,19 +1389,13 @@ impl Render for VideoPlayerView {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                    if this.scrubbing {
-                        this.scrubbing = false;
-                        cx.notify();
-                    }
+                    this.end_scrub(cx);
                 }),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                    if this.scrubbing {
-                        this.scrubbing = false;
-                        cx.notify();
-                    }
+                    this.end_scrub(cx);
                 }),
             );
 

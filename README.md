@@ -14,15 +14,17 @@ Free for personal use, Windows only.
 
 ## Get started
 
-1. Download the latest `ZeroClip-vX.Y.Z-windows-x64.zip` from
-   [Releases](https://github.com/zeroclip-dev/zeroclip/releases).
-2. Unzip it anywhere and run `zeroclip.exe`. Windows may show a SmartScreen warning because the
-   app isn't code-signed yet: click **More info → Run anyway**.
+1. Download the latest `ZeroClip-vX.Y.Z-setup-x64.exe` from
+   [Releases](https://github.com/zeroclip-dev/zeroclip/releases) and run it. It installs for your
+   user only (no admin) and adds a Start menu entry. Prefer no installer? Take the `.zip`, unzip
+   it anywhere and run `zeroclip.exe`.
+2. Windows may show a SmartScreen warning because the app isn't code-signed yet: click
+   **More info → Run anyway**.
 3. Start a game, play, and press **Alt+F10** when something good happens.
 
 Your clips show up in the **Clips** tab. ZeroClip lives in the system tray while it runs.
 
-ffmpeg, which the editor, thumbnails and smooth-seeking clips use, comes in the zip. If you
+ffmpeg, which the editor, thumbnails and smooth-seeking clips use, comes in the installer and the zip. If you
 downloaded only the `.exe`, ZeroClip fetches ffmpeg next to itself on first start (checked against
 the release's SHA-256 list). Recording and saving clips work without it. To use your own ffmpeg
 instead, set its path in Settings.

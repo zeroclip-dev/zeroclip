@@ -65,7 +65,8 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Completion_Impl {
 /// holding an [`AUDIOCLIENT_ACTIVATION_PARAMS`](https://learn.microsoft.com/en-us/windows/win32/api/audioclientactivationparams/ns-audioclientactivationparams-audioclient_activation_params).
 /// Include mode records the target's whole tree, so launcher and child processes are both covered.
 pub(crate) fn activate(pid: u32) -> Result<IAudioClient, SourceError> {
-    let params = AUDIOCLIENT_ACTIVATION_PARAMS {
+    // Boxed, so a timeout can leak it: COM may still read it after we give up waiting.
+    let params = Box::new(AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
             ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
@@ -73,7 +74,7 @@ pub(crate) fn activate(pid: u32) -> Result<IAudioClient, SourceError> {
                 ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
             },
         },
-    };
+    });
     // ManuallyDrop: windows-rs gives PROPVARIANT a Drop that calls
     // [`PropVariantClear`](https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-propvariantclear),
     // which would CoTaskMemFree this blob's stack pointer and corrupt the heap.
@@ -85,7 +86,7 @@ pub(crate) fn activate(pid: u32) -> Result<IAudioClient, SourceError> {
                 Anonymous: PROPVARIANT_0_0_0 {
                     blob: BLOB {
                         cbSize: size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
-                        pBlobData: (&raw const params).cast_mut().cast(),
+                        pBlobData: (&raw const *params).cast_mut().cast(),
                     },
                 },
                 ..Default::default()
@@ -96,8 +97,8 @@ pub(crate) fn activate(pid: u32) -> Result<IAudioClient, SourceError> {
     let handler: IActivateAudioInterfaceCompletionHandler = Completion { done: tx }.into();
     let unsupported =
         || SourceError::Unsupported("process loopback needs Windows 11 (build 20348+)".into());
-    // SAFETY: valid device id, IID, property and handler; `params` and `prop` live
-    // until the activation has completed (or timed out, after which nothing reads them).
+    // SAFETY: valid device id, IID, property and handler; `params` lives until the activation
+    // has completed, and is leaked on a timeout (below) because COM may still read it.
     let operation = unsafe {
         ActivateAudioInterfaceAsync(
             VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
@@ -113,8 +114,11 @@ pub(crate) fn activate(pid: u32) -> Result<IAudioClient, SourceError> {
             platform_error("ActivateAudioInterfaceAsync", &e)
         }
     })?;
-    rx.recv_timeout(Duration::from_secs(5))
-        .map_err(|_| SourceError::Other("process loopback activation timed out".into()))?;
+    if rx.recv_timeout(Duration::from_secs(5)).is_err() {
+        // 12 bytes per timeout, instead of a dangling read if COM completes late.
+        std::mem::forget(params);
+        return Err(SourceError::Other("process loopback activation timed out".into()));
+    }
     let mut hr = windows::core::HRESULT(0);
     let mut unknown: Option<IUnknown> = None;
     // SAFETY: the operation has completed; valid out-parameters.

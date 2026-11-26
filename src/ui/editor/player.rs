@@ -1,30 +1,35 @@
 //! The editor's player: decodes the timeline's pieces with ffmpeg into raw frames and shows them
-//! in step with a clock. Sound comes from `ffplay` when it sits beside ffmpeg.
+//! in step with a clock. Sound is played in-process through WASAPI ([`PcmPlayer`]).
 //!
 //! One ffmpeg video decoder runs at a time. Each unmuted audio track is decoded by `ffmpeg` to raw
 //! `f32le` stereo PCM, mixed in Rust via [`mix_audio_chunk`] (applying per-track mute, gain,
 //! volume envelopes, silence ranges and limiting), scaled by the preview's master volume (see
-//! [`scale_pcm_chunk`]) and piped straight into a single `ffplay` sink. Every piece takes this
-//! path, so the volume can change while it plays. A gap piece has no decoder and no sound: the
-//! picture is black and the clock runs on.
+//! [`scale_pcm_chunk`]) and written to the piece's [`PcmPlayer`]. Every piece takes this path, so
+//! the volume can change while it plays. A gap piece has no decoder and no sound: the picture is
+//! black and the wall clock runs on.
 //!
-//! Seeking, pausing or moving on to the next piece kills every decoder and `ffplay` tree on a
-//! background thread so pausing never stalls the UI and never leaves background decode running.
+//! One clock: while a piece has sound, the picture follows what the audio device has played
+//! (`played() * rate` is source time, because `atempo` already stretched the PCM), and holds its
+//! first frame until the device starts, so sound and picture can't drift or start apart. A piece
+//! with no sound (a gap, muted tracks, a file without audio, or a device that failed or never
+//! started) runs on the wall clock instead.
 //!
-//! ponytail: picture and sound start together but are not locked to one clock, so they can drift
-//! a little on a long play. Add a shared clock if that shows.
+//! Seeking, pausing or moving on to the next piece stops the audio device and kills every decoder
+//! on a background thread so pausing never stalls the UI and never leaves background decode
+//! running.
 
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui::RenderImage;
 use image::{Frame, Rgba, RgbaImage};
+use zc_audio::{PCM_CHANNELS, PCM_RATE, PcmPlayer};
 use zc_core::Hns;
 use zc_editor::ffmpeg::{EnvelopePoint, Ffmpeg, SILENT_DB, frames_args};
 
@@ -38,11 +43,14 @@ const FPS: u32 = 60;
 const BACKLOG: usize = 6;
 
 /// Sample rate and channel count used by the multi-track PCM mixer (`48 kHz` stereo `f32le`).
-pub const MIX_SAMPLE_RATE: u32 = 48_000;
+pub const MIX_SAMPLE_RATE: u32 = PCM_RATE;
 /// Stereo channels for the multi-track PCM mixer.
-pub const MIX_CHANNELS: usize = 2;
+pub const MIX_CHANNELS: usize = PCM_CHANNELS;
 /// Audio frames processed per mixer iteration (~21 ms at 48 kHz: low latency, small buffers).
 const MIX_CHUNK_FRAMES: usize = 1024;
+
+/// How long the picture waits for the audio device to start before it gives up on the sound.
+const AUDIO_START_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The size of the black picture a gap shows. It is stretched to fit, so only the aspect matters.
 const BLACK_SIZE: (u32, u32) = (16, 9);
@@ -340,11 +348,15 @@ impl Decoder {
         };
         let (tx, frames) = sync_channel(BACKLOG);
         std::thread::spawn(move || {
-            let mut raw = vec![0u8; (WIDTH * HEIGHT * 4) as usize];
             // Ends when ffmpeg exits or is killed (the read fails), or the player is gone.
-            while stdout.read_exact(&mut raw).is_ok() {
+            loop {
+                // Each frame gets its own buffer, which the image then owns: no copy.
+                let mut raw = vec![0u8; (WIDTH * HEIGHT * 4) as usize];
+                if stdout.read_exact(&mut raw).is_err() {
+                    break;
+                }
                 // ffmpeg's BGRA is the byte order GPUI wants, so the bytes go in as they are.
-                let Some(buffer) = RgbaImage::from_raw(WIDTH, HEIGHT, raw.clone()) else {
+                let Some(buffer) = RgbaImage::from_raw(WIDTH, HEIGHT, raw) else {
                     break;
                 };
                 if tx.send(Arc::new(RenderImage::new(vec![Frame::new(buffer)]))).is_err() {
@@ -369,31 +381,79 @@ impl Drop for Decoder {
     }
 }
 
-/// Running preview audio: either a single `ffplay` process (single-track fast path) or a mixed
-/// pipeline (`N` `ffmpeg` PCM decoders -> Rust mixer thread -> `ffplay` raw PCM sink).
-struct AudioPlayback {
-    /// The `ffplay` output process (always killed as a process tree via `taskkill /T`).
-    sink: Child,
-    /// Per-track `ffmpeg` decoder processes in multi-track mode; empty for direct single-track.
+/// Running preview audio: `ffmpeg` PCM decoders -> a mixer thread -> the piece's [`PcmPlayer`].
+pub(crate) struct AudioPlayback {
+    pcm: PcmPlayer,
+    /// The `ffmpeg` decoder processes feeding the mixer thread.
     decoders: Vec<Child>,
     /// Signals the mixer thread to stop immediately on pause/seek.
     stop: Arc<AtomicBool>,
+    began: Instant,
+}
+
+/// Where the audio clock stands.
+#[derive(Debug, PartialEq)]
+enum AudioClock {
+    /// The device hasn't started yet: the picture holds its first frame.
+    Waiting,
+    /// Output time the device has played.
+    At(Hns),
+    /// No sound will come (device failed, or never started): use the wall clock.
+    Lost,
+}
+
+/// The audio clock from the player's state. `waited` is the time since the audio was started.
+fn audio_clock(failed: bool, started: bool, waited: Duration, played: Hns) -> AudioClock {
+    if failed {
+        AudioClock::Lost
+    } else if started {
+        AudioClock::At(played)
+    } else if waited > AUDIO_START_TIMEOUT {
+        AudioClock::Lost
+    } else {
+        AudioClock::Waiting
+    }
+}
+
+/// Source seconds for `played` output time at playback `rate`: the PCM is already stretched by
+/// `atempo` (output time = source time / rate), so source time = output time * rate.
+fn source_elapsed(played: Hns, rate: f64) -> f64 {
+    played.as_secs_f64() * rate
 }
 
 impl AudioPlayback {
-    fn try_wait_sink(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        self.sink.try_wait()
+    /// Takes over a player and the decoders and mixer thread that feed it.
+    pub(crate) fn new(pcm: PcmPlayer, decoders: Vec<Child>, stop: Arc<AtomicBool>) -> Self {
+        Self { pcm, decoders, stop, began: Instant::now() }
     }
 
+    fn clock(&self) -> AudioClock {
+        let started = self.pcm.started();
+        // `played` is only read once started, so a zero is never mistaken for a position.
+        let played = if started { self.pcm.played() } else { Hns::ZERO };
+        audio_clock(self.pcm.failed(), started, self.began.elapsed(), played)
+    }
+
+    /// Stops the sound and the decoders; the waiting happens on a background thread.
     fn shutdown(self) {
         self.stop.store(true, Ordering::Relaxed);
-        stop_audio_tree(self.sink, self.decoders);
+        let Self { pcm, mut decoders, .. } = self;
+        for dec in &mut decoders {
+            let _ = dec.kill();
+        }
+        std::thread::spawn(move || {
+            // Dropping the player stops the device and joins its thread.
+            drop(pcm);
+            for dec in &mut decoders {
+                let _ = dec.wait();
+            }
+        });
     }
 }
 
 /// Keeps a child process from opening a console window (release builds are GUI-subsystem).
 /// <https://learn.microsoft.com/windows/win32/procthread/process-creation-flags>
-fn no_window(cmd: &mut Command) {
+pub(crate) fn no_window(cmd: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -423,8 +483,13 @@ pub struct Player {
     items: VecDeque<Item>,
     /// Timeline time at which the current piece began.
     base: Hns,
-    /// When the current piece began.
+    /// When the current piece began (or when the wall clock took over from the audio).
     started: Option<Instant>,
+    /// Source seconds already played when `started` was set (non-zero only after the audio clock
+    /// was lost mid-piece).
+    anchor: f64,
+    /// The last elapsed time read from the audio clock, so a lost clock hands over seamlessly.
+    last_elapsed: f64,
     /// How fast it plays: 1.0 is normal. Zero (a fresh player) reads as 1.0. Takes effect on the
     /// next `play`.
     pub speed: f64,
@@ -474,6 +539,8 @@ impl Player {
         }
         self.playing = false;
         self.started = None;
+        self.anchor = 0.0;
+        self.last_elapsed = 0.0;
     }
 
     /// Pauses where the clock is now. Stops decoding and audio immediately.
@@ -505,6 +572,8 @@ impl Player {
         if let Some(audio) = self.audio.take() {
             audio.shutdown();
         }
+        self.anchor = 0.0;
+        self.last_elapsed = 0.0;
         let (Some(item), Some(ffmpeg)) = (self.items.front(), self.ffmpeg.as_ref()) else {
             return false;
         };
@@ -523,6 +592,38 @@ impl Player {
         true
     }
 
+    /// Hands the player the sound of the piece it is playing, so the picture follows it (the
+    /// clip player decodes its own audio). Replaces any sound the piece already had.
+    pub(crate) fn attach_audio(&mut self, audio: AudioPlayback) {
+        if let Some(old) = self.audio.replace(audio) {
+            old.shutdown();
+        }
+        self.anchor = 0.0;
+        self.last_elapsed = 0.0;
+    }
+
+    /// Source seconds played in the current piece: what the audio device has played while the
+    /// piece has sound (0 until it starts), else the wall clock.
+    fn elapsed(&mut self, rate: f64) -> f64 {
+        match self.audio.as_ref().map(AudioPlayback::clock) {
+            Some(AudioClock::At(played)) => {
+                self.last_elapsed = source_elapsed(played, rate);
+                return self.last_elapsed;
+            }
+            Some(AudioClock::Waiting) => return self.last_elapsed,
+            Some(AudioClock::Lost) => {
+                tracing::warn!("the preview's sound is unavailable; using the wall clock");
+                if let Some(audio) = self.audio.take() {
+                    audio.shutdown();
+                }
+                self.anchor = self.last_elapsed;
+                self.started = Some(Instant::now());
+            }
+            None => {}
+        }
+        self.anchor + self.started.map_or(0.0, |began| began.elapsed().as_secs_f64() * rate)
+    }
+
     /// Advances the clock and picks the frame to show. Returns whether it is still busy.
     pub fn tick(&mut self) -> bool {
         if !self.busy() {
@@ -530,7 +631,9 @@ impl Player {
         }
         let mut ended = false;
         if let Some(decoder) = self.decoder.as_mut() {
-            loop {
+            // Take frames only while the queue has room, so the bounded channel pushes back on the
+            // reader thread and ffmpeg (decoding runs faster than playback; each frame is ~8 MB).
+            while self.queue.len() < BACKLOG {
                 match decoder.frames.try_recv() {
                     Ok(image) => {
                         let time = f64::from(decoder.taken) / f64::from(FPS);
@@ -547,10 +650,11 @@ impl Player {
             }
         }
         if self.playing {
-            let Some(began) = self.started else { return self.busy() };
+            if self.started.is_none() {
+                return self.busy();
+            }
             let rate = self.rate();
-            // Source seconds played: the wall clock, sped up or slowed down.
-            let mut elapsed = began.elapsed().as_secs_f64() * rate;
+            let mut elapsed = self.elapsed(rate);
             while let Some(item) = self.items.front() {
                 let len = (item.to - item.from).as_secs_f64();
                 if elapsed < len {
@@ -568,17 +672,6 @@ impl Player {
                 elapsed = 0.0;
             }
             self.playhead = self.base + Hns::from_secs_f64(elapsed);
-            // ffplay gone long before its piece ended means no sound: say why, once.
-            if let (Some(audio), Some(item)) = (self.audio.as_mut(), self.items.front())
-                && elapsed < (item.to - item.from).as_secs_f64() - 1.0
-                && let Ok(Some(status)) = audio.try_wait_sink()
-            {
-                let said = std::fs::read_to_string(audio_log()).unwrap_or_default();
-                tracing::warn!(%status, said = said.trim(), "the preview's sound stopped early");
-                if let Some(audio) = self.audio.take() {
-                    audio.shutdown();
-                }
-            }
             while self.queue.len() >= 2 && self.queue[1].0 <= elapsed {
                 self.queue.pop_front();
             }
@@ -614,44 +707,9 @@ impl Drop for Player {
     }
 }
 
-/// Stops `ffplay` (and its process tree, in case `ffplay.exe` is a Chocolatey/Scoop shim) plus
-/// any per-track `ffmpeg` decoder processes on a background thread so pausing never stalls the UI.
-/// <https://learn.microsoft.com/windows-server/administration/windows-commands/taskkill>
-pub(crate) fn stop_audio_tree(mut sink: Child, mut decoders: Vec<Child>) {
-    #[cfg(windows)]
-    let tree = {
-        let mut cmd = Command::new("taskkill");
-        cmd.args(["/F", "/T", "/PID", &sink.id().to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        no_window(&mut cmd);
-        cmd.spawn().ok()
-    };
-    for dec in &mut decoders {
-        let _ = dec.kill();
-    }
-    // `sink` is killed only after taskkill is done. A shim (Chocolatey's `ffplay.exe`) runs the
-    // real ffplay as its child: killing the shim first orphans that child before taskkill can find
-    // it through its parent, and the orphan plays on through its read-ahead buffer (seconds of
-    // sound after a pause or a speed change). taskkill is its own process, so it still finishes
-    // if the app quits right after.
-    std::thread::spawn(move || {
-        for dec in &mut decoders {
-            let _ = dec.wait();
-        }
-        #[cfg(windows)]
-        if let Some(mut tree) = tree {
-            let _ = tree.wait();
-        }
-        let _ = sink.kill();
-        let _ = sink.wait();
-    });
-}
-
 /// Starts preview audio for `item`: one `ffmpeg` PCM decoder per audible track, mixed in Rust
-/// via [`mix_audio_chunk`], scaled by the master `gain` and piped into `ffplay`. `None` when no
-/// track is audible or `ffplay` isn't beside ffmpeg.
+/// via [`mix_audio_chunk`], scaled by the master `gain` and written to a [`PcmPlayer`]. `None`
+/// when no track is audible.
 fn spawn_audio_mix(
     ffmpeg: &Ffmpeg,
     item: &Item,
@@ -662,11 +720,7 @@ fn spawn_audio_mix(
     if active.is_empty() {
         return None;
     }
-    let ffplay = ffmpeg.exe.with_file_name(if cfg!(windows) { "ffplay.exe" } else { "ffplay" });
-    if !ffplay.is_file() {
-        return None;
-    }
-    spawn_multi_track_mixer(ffmpeg, &ffplay, item, active, rate, gain.clone())
+    spawn_multi_track_mixer(ffmpeg, item, active, rate, gain.clone())
 }
 
 /// Appends chained `atempo` filters for playback speed `rate` (`atempo` accepts `0.5..=2.0`).
@@ -685,12 +739,54 @@ fn push_atempo_filters(filters: &mut Vec<String>, rate: f64) {
     }
 }
 
+/// Starts an `ffmpeg` decode of audio stream `track` of `path`, `duration_secs` of source from
+/// `from`, stretched for playback `rate`, to raw `48 kHz` stereo `f32le` on the returned pipe.
+/// Shared by the editor's mixer and the clip player's live-volume pipe.
+pub(crate) fn spawn_pcm_decoder(
+    ffmpeg: &Ffmpeg,
+    path: &Path,
+    from: Hns,
+    duration_secs: f64,
+    track: usize,
+    rate: f64,
+) -> Option<(Child, ChildStdout)> {
+    let mut tempo = Vec::new();
+    push_atempo_filters(&mut tempo, if rate > 0.0 { rate } else { 1.0 });
+    let mut cmd = Command::new(&ffmpeg.exe);
+    cmd.args(["-hide_banner", "-nostdin", "-loglevel", "error"])
+        .arg("-ss")
+        .arg(format!("{:.6}", from.as_secs_f64()))
+        // `-t` before `-i` counts source time; after it, output time, which `atempo` stretches
+        // (a slow speed would cut the sound short).
+        .arg("-t")
+        .arg(format!("{duration_secs:.6}"))
+        .arg("-i")
+        .arg(zc_editor::ffmpeg::input_arg(path))
+        .args(["-vn", "-sn", "-map"])
+        .arg(format!("0:a:{track}"));
+    if !tempo.is_empty() {
+        cmd.arg("-af").arg(tempo.join(","));
+    }
+    cmd.args(["-ar", &MIX_SAMPLE_RATE.to_string(), "-ac", &MIX_CHANNELS.to_string()])
+        .args(["-f", "f32le", "pipe:1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    no_window(&mut cmd);
+    let mut child = cmd.spawn().ok()?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    Some((child, stdout))
+}
+
 /// Spawns one `ffmpeg` PCM decoder per active track, mixes chunks on a dedicated thread with
 /// [`mix_audio_chunk`], scales each chunk by `gain` (ramped from the last chunk's value, so a
-/// volume change never clicks), and pipes interleaved stereo `f32le` to `ffplay`.
+/// volume change never clicks), and writes the stereo `f32` result to a [`PcmPlayer`].
 fn spawn_multi_track_mixer(
     ffmpeg: &Ffmpeg,
-    ffplay: &Path,
     item: &Item,
     active: Vec<Sound>,
     rate: f64,
@@ -700,51 +796,16 @@ fn spawn_multi_track_mixer(
     if duration_secs <= 0.0 {
         return None;
     }
+    // The device opens on its own thread while the decoders start.
+    let pcm = PcmPlayer::new();
+    let writer = pcm.writer();
 
     let mut decoders: Vec<Child> = Vec::with_capacity(active.len());
-    let mut pipes: Vec<std::process::ChildStdout> = Vec::with_capacity(active.len());
-    let mut tempo_filters = Vec::new();
-    push_atempo_filters(&mut tempo_filters, rate);
-
+    let mut pipes: Vec<ChildStdout> = Vec::with_capacity(active.len());
     for sound in &active {
-        let mut cmd = Command::new(&ffmpeg.exe);
-        cmd.args(["-hide_banner", "-nostdin", "-loglevel", "error"])
-            .arg("-ss")
-            .arg(format!("{:.6}", item.from.as_secs_f64()))
-            // `-t` before `-i` counts source time; after it, output time, which `atempo` stretches
-            // (a slow speed would cut the sound short).
-            .arg("-t")
-            .arg(format!("{duration_secs:.6}"))
-            .arg("-i")
-            .arg(zc_editor::ffmpeg::input_arg(&item.path))
-            .args(["-vn", "-sn", "-map"])
-            .arg(format!("0:a:{}", sound.track));
-        if !tempo_filters.is_empty() {
-            cmd.arg("-af").arg(tempo_filters.join(","));
-        }
-        cmd.args([
-            "-ar",
-            &MIX_SAMPLE_RATE.to_string(),
-            "-ac",
-            &MIX_CHANNELS.to_string(),
-            "-f",
-            "f32le",
-            "pipe:1",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-        no_window(&mut cmd);
-        let Ok(mut child) = cmd.spawn() else {
-            for mut d in decoders {
-                let _ = d.kill();
-                let _ = d.wait();
-            }
-            return None;
-        };
-        let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
+        let Some((child, stdout)) =
+            spawn_pcm_decoder(ffmpeg, &item.path, item.from, duration_secs, sound.track, rate)
+        else {
             for mut d in decoders {
                 let _ = d.kill();
                 let _ = d.wait();
@@ -754,47 +815,6 @@ fn spawn_multi_track_mixer(
         decoders.push(child);
         pipes.push(stdout);
     }
-
-    let log = std::fs::File::create(audio_log()).map_or_else(|_| Stdio::null(), Stdio::from);
-    let mut sink_cmd = Command::new(ffplay);
-    // Low-latency raw PCM sink: `-probesize 32 -analyzeduration 0 -fflags nobuffer` avoids ffplay
-    // buffering seconds of headerless PCM before starting audio output.
-    sink_cmd
-        .args([
-            "-nodisp",
-            "-autoexit",
-            "-loglevel",
-            "error",
-            "-probesize",
-            "32",
-            "-analyzeduration",
-            "0",
-            "-fflags",
-            "nobuffer",
-            "-f",
-            "f32le",
-            "-sample_rate",
-            &MIX_SAMPLE_RATE.to_string(),
-            "-ch_layout",
-            "stereo",
-            "-i",
-            "pipe:0",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(log);
-    no_window(&mut sink_cmd);
-    let Ok(mut sink) = sink_cmd.spawn() else {
-        for mut d in decoders {
-            let _ = d.kill();
-            let _ = d.wait();
-        }
-        return None;
-    };
-    let Some(mut sink_in) = sink.stdin.take() else {
-        stop_audio_tree(sink, decoders);
-        return None;
-    };
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_flag = stop.clone();
@@ -810,7 +830,6 @@ fn spawn_multi_track_mixer(
         let mut lens: Vec<usize> = vec![0; pipes.len()];
         let mut eof: Vec<bool> = vec![false; pipes.len()];
         let mut mix_out = vec![0.0_f32; chunk_samples];
-        let mut out_bytes = vec![0u8; chunk_bytes];
         let mut frame_cursor: u64 = 0;
         let mut last_gain = gain.get();
 
@@ -830,13 +849,7 @@ fn spawn_multi_track_mixer(
                 // Decode complete stereo frames only so channel alignment never drifts.
                 let frame_bytes = MIX_CHANNELS * size_of::<f32>();
                 let aligned_bytes = (got / frame_bytes) * frame_bytes;
-                let samples = aligned_bytes / size_of::<f32>();
-                for (s, b) in pcm_bufs[idx][..samples]
-                    .iter_mut()
-                    .zip(raw_bufs[idx][..aligned_bytes].as_chunks::<4>().0)
-                {
-                    *s = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                }
+                let samples = decode_f32le(&raw_bufs[idx][..aligned_bytes], &mut pcm_bufs[idx]);
                 lens[idx] = samples;
                 max_samples = max_samples.max(samples);
             }
@@ -857,28 +870,31 @@ fn spawn_multi_track_mixer(
             let target = gain.get();
             scale_pcm_chunk(&mut mix_out[..max_samples], last_gain, target, MIX_CHANNELS);
             last_gain = target;
-            let write_len = max_samples * size_of::<f32>();
-            for (dst, &sample) in out_bytes[..write_len]
-                .as_chunks_mut::<4>()
-                .0
-                .iter_mut()
-                .zip(&mix_out[..max_samples])
-            {
-                dst.copy_from_slice(&sample.to_le_bytes());
-            }
-            if sink_in.write_all(&out_bytes[..write_len]).is_err() {
+            // Blocks while the device's queue is full; `false` means the player is gone.
+            if !writer.write(&mix_out[..max_samples]) {
                 break;
             }
             frame_cursor += (max_samples / MIX_CHANNELS) as u64;
         }
+        writer.finish();
     });
 
-    Some(AudioPlayback { sink, decoders, stop })
+    Some(AudioPlayback::new(pcm, decoders, stop))
+}
+
+/// Converts little-endian `f32` bytes into `dst`; returns the samples written.
+pub(crate) fn decode_f32le(src: &[u8], dst: &mut [f32]) -> usize {
+    let mut n = 0;
+    for (sample, bytes) in dst.iter_mut().zip(src.as_chunks::<4>().0) {
+        *sample = f32::from_le_bytes(*bytes);
+        n += 1;
+    }
+    n
 }
 
 /// Reads up to `buf.len()` bytes from `reader`, looping across short pipe reads until `buf` is
 /// full or EOF/error is reached.
-fn read_chunk(reader: &mut impl Read, buf: &mut [u8]) -> usize {
+pub(crate) fn read_chunk(reader: &mut impl Read, buf: &mut [u8]) -> usize {
     let mut total = 0;
     while total < buf.len() {
         match reader.read(&mut buf[total..]) {
@@ -887,11 +903,6 @@ fn read_chunk(reader: &mut impl Read, buf: &mut [u8]) -> usize {
         }
     }
     total
-}
-
-/// Where `ffplay` writes what it says went wrong.
-fn audio_log() -> PathBuf {
-    std::env::temp_dir().join("zeroclip-ffplay.log")
 }
 
 #[cfg(test)]
@@ -1042,5 +1053,40 @@ mod tests {
         let other = gain.clone();
         other.set(0.25);
         assert_eq!(gain.get(), 0.25);
+    }
+
+    #[test]
+    fn audio_clock_waits_then_follows_the_device_and_gives_up() {
+        let t = Duration::from_millis;
+        let played = Hns::from_millis(40);
+        assert_eq!(audio_clock(false, false, t(100), played), AudioClock::Waiting);
+        assert_eq!(audio_clock(false, true, t(100), played), AudioClock::At(played));
+        assert_eq!(audio_clock(true, true, t(100), played), AudioClock::Lost);
+        assert_eq!(audio_clock(false, false, AUDIO_START_TIMEOUT + t(1), played), AudioClock::Lost);
+        // Once started, a slow start no longer matters.
+        assert_eq!(
+            audio_clock(false, true, AUDIO_START_TIMEOUT * 2, played),
+            AudioClock::At(played)
+        );
+    }
+
+    #[test]
+    fn source_time_is_output_time_times_rate() {
+        // 2x: the PCM is half as long, so 1 s heard is 2 s of source.
+        assert!((source_elapsed(Hns::from_secs(1), 2.0) - 2.0).abs() < 1e-9);
+        assert!((source_elapsed(Hns::from_secs(1), 0.5) - 0.5).abs() < 1e-9);
+        assert_eq!(source_elapsed(Hns::ZERO, 1.5), 0.0);
+    }
+
+    #[test]
+    fn f32le_bytes_decode_whole_samples_only() {
+        let mut bytes = Vec::new();
+        for v in [0.5_f32, -0.25, 1.0] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes.push(0xFF); // a stray byte is ignored
+        let mut out = [0.0_f32; 4];
+        assert_eq!(decode_f32le(&bytes, &mut out), 3);
+        assert_eq!(&out[..3], &[0.5, -0.25, 1.0]);
     }
 }

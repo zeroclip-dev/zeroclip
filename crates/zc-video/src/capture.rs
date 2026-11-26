@@ -284,6 +284,14 @@ fn capture_error(context: &str, e: &windows::core::Error) -> SourceError {
     }
 }
 
+/// WGC's minimum gap between frames for a target of `fps`, in 100 ns ticks: half a frame period.
+/// WGC rounds the gap up to whole refreshes, so anything near a full period would skip a refresh
+/// it needs (12.5 ms on a 100 Hz display means every 20 ms: 50 fps). Half a period always leaves
+/// at least one refresh per frame slot.
+fn min_update_ticks(fps: u32) -> i64 {
+    Hns::PER_SECOND / i64::from(fps.max(1)) / 2
+}
+
 /// A running capture session. Dropping it stops capture.
 ///
 /// - The frame pool is free-threaded, so frames arrive on a thread-pool thread
@@ -308,7 +316,7 @@ pub struct WgcCapture {
 }
 
 impl WgcCapture {
-    /// Starts capturing `item`, calling `on_frame` from the frame pool's thread.
+    /// Starts capturing `item` for a target of `fps`, calling `on_frame` from the frame pool's thread.
     ///
     /// # Errors
     /// Session creation failures; [`SourceError::Protected`] for protected content.
@@ -317,6 +325,7 @@ impl WgcCapture {
         item: &GraphicsCaptureItem,
         capture_cursor: bool,
         hdr_white: Option<f32>,
+        fps: u32,
         on_frame: impl FnMut(CapturedFrame) + Send + 'static,
     ) -> Result<Self, SourceError> {
         let err = |context: &'static str| move |e| capture_error(context, &e);
@@ -403,10 +412,12 @@ impl WgcCapture {
         if let Err(e) = session.SetIsCursorCaptureEnabled(capture_cursor) {
             tracing::debug!(%e, "can't change cursor capture");
         }
-        // WGC's default minimum gap between frames is ~16.7 ms, which on a 200 Hz
-        // display gave 50 fps in the Phase 0 spike. Ask for every refresh and let the
-        // `FramePacer` decimate. Windows 11 22H2+; older systems keep the default.
-        if let Err(e) = session.SetMinUpdateInterval(TimeSpan { Duration: 10_000 }) {
+        // WGC's default minimum gap between frames is ~16.7 ms, which on a 200 Hz display gave 50 fps
+        // in the Phase 0 spike. Ask for half a frame period: the `FramePacer` still picks the frames
+        // on its grid, but WGC no longer copies every refresh (200+ GPU copies a second next to a
+        // game). Windows 11 22H2+; older systems keep the default. See
+        // <https://learn.microsoft.com/uwp/api/windows.graphics.capture.graphicscapturesession.minupdateinterval>.
+        if let Err(e) = session.SetMinUpdateInterval(TimeSpan { Duration: min_update_ticks(fps) }) {
             tracing::debug!(%e, "can't lower WGC's minimum update interval");
         }
         let closed = Arc::new(AtomicBool::new(false));
@@ -445,5 +456,18 @@ impl Drop for WgcCapture {
         let _ = self.pool.RemoveFrameArrived(self.token);
         let _ = self.session.Close();
         let _ = self.pool.Close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_capture_gap_is_half_a_frame() {
+        assert_eq!(min_update_ticks(60), 83_333);
+        assert_eq!(min_update_ticks(30), 166_666);
+        // A zero fps setting can't divide by zero.
+        assert_eq!(min_update_ticks(0), Hns::PER_SECOND / 2);
     }
 }

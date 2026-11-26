@@ -114,6 +114,8 @@ impl Settings {
     /// Highest video bitrate a loaded file may ask for, kbit/s. Sizes the DVR buffer, so an
     /// absurd value would otherwise ask for terabytes.
     const MAX_LOADED_BITRATE_KBPS: u32 = 500_000;
+    /// Lowest video bitrate a loaded file may ask for, kbit/s. Zero would break the encoder.
+    const MIN_LOADED_BITRATE_KBPS: u32 = 100;
 
     /// Pulls numbers read from a hand-edited or damaged settings file into the ranges
     /// [`problems`](Self::problems) enforces, so a bad value can't size a buffer from nonsense
@@ -121,8 +123,16 @@ impl Settings {
     pub fn sanitize_loaded(&mut self) {
         let video = &mut self.video;
         video.fps = video.fps.clamp(1, 240);
-        video.max_bitrate_kbps = video.max_bitrate_kbps.clamp(1, Self::MAX_LOADED_BITRATE_KBPS);
-        video.min_bitrate_kbps = video.min_bitrate_kbps.min(video.max_bitrate_kbps);
+        video.max_bitrate_kbps = video
+            .max_bitrate_kbps
+            .clamp(Self::MIN_LOADED_BITRATE_KBPS, Self::MAX_LOADED_BITRATE_KBPS);
+        video.min_bitrate_kbps =
+            video.min_bitrate_kbps.clamp(Self::MIN_LOADED_BITRATE_KBPS, video.max_bitrate_kbps);
+        // The nearest AAC bitrate the encoder offers.
+        self.audio.bitrate_kbps = AAC_BITRATES_KBPS
+            .into_iter()
+            .min_by_key(|b| b.abs_diff(self.audio.bitrate_kbps))
+            .unwrap_or(192);
         video.keyframe_interval_ms = video.keyframe_interval_ms.clamp(500, 4_000);
         self.dvr.ram_ceiling_mib = self.dvr.ram_ceiling_mib.max(64);
         self.storage.write_chunk_mib = self.storage.write_chunk_mib.clamp(1, 64);
@@ -633,10 +643,22 @@ mod tests {
         s.video.max_bitrate_kbps = u32::MAX;
         s.video.min_bitrate_kbps = u32::MAX;
         s.video.fps = 0;
+        s.audio.bitrate_kbps = 140;
         s.sanitize_loaded();
         assert!(s.problems().is_empty(), "{:?}", s.problems());
+        assert_eq!(s.audio.bitrate_kbps, 128, "snapped to the nearest AAC rate");
         assert_eq!(s.audio.mix_gain_db.game, 0.0);
         assert_eq!(s.audio.mix_gain_db.mic, 12.0);
+    }
+
+    #[test]
+    fn a_zero_video_bitrate_is_raised_to_the_floor() {
+        let mut s = Settings::default();
+        s.video.min_bitrate_kbps = 0;
+        s.video.max_bitrate_kbps = 0;
+        s.sanitize_loaded();
+        assert_eq!(s.video.min_bitrate_kbps, 100);
+        assert_eq!(s.video.max_bitrate_kbps, 100);
     }
 
     #[test]
