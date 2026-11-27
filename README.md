@@ -8,7 +8,7 @@ beforehand.
 
 Free for personal use, Windows only.
 
-> **Early release (v0.1).** It works well on the developer's PC but hasn't been tested on many
+> **Early release (v0.1).** It works well on our PCs but hasn't been tested on many
 > other machines yet. If something breaks, please
 > [open an issue](https://github.com/zeroclip-dev/zeroclip/issues).
 
