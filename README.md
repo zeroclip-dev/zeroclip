@@ -16,27 +16,25 @@ Free for personal use, Windows only.
 
 **Home.** The replay buffer, one button to save a clip, and your latest clips.
 
-![Home: replay buffer, Save clip button and recent clips](assets/screenshots/home.jpg)
+![Home: replay buffer, Save clip button and recent clips](assets/screenshots/home.png)
 
 **Clips.** Every clip and screenshot, grouped by game, with search, sorting and a list or grid view.
 
-![Clips: library grouped by game](assets/screenshots/clips.jpg)
+![Clips: library grouped by game](assets/screenshots/clips.png)
 
 **Profiles.** Choose how much to keep and whether to record the whole session, per game.
 
-![Profiles: buffer length and whole-session recording per game](assets/screenshots/profiles.jpg)
+![Profiles: buffer length and whole-session recording per game](assets/screenshots/profiles.png)
 
 **Editor.** Preview a clip, then trim, split, reorder and mix its tracks without re-encoding.
 
-![Editor: video preview and playback controls](assets/screenshots/editor.jpg)
+![Editor: preview, timeline, waveform and per-track volume](assets/screenshots/editor.png)
 
 The timeline shows thumbnails and the audio waveform, with per-track volume and one-click export.
 
-![Editor: timeline, waveform and export](assets/screenshots/editor-timeline.jpg)
-
 **Settings.** Capture source, codec, resolution, frame rate, audio, hotkeys and storage.
 
-![Settings: capture options](assets/screenshots/settings.jpg)
+![Settings: capture options](assets/screenshots/settings.png)
 
 ## Get started
 
