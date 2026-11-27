@@ -1252,7 +1252,9 @@ impl Actor {
     }
 
     fn publish_status(&self) {
-        self.emit(EngineEvent::Status(self.status.clone()));
+        let mut status = self.status.clone();
+        status.tracked_game = self.tracked.as_ref().map(|t| t.exe.clone());
+        self.emit(EngineEvent::Status(status));
     }
 
     /// The mic's state for the status bar: `Live` while it captures, `Muted` in push-to-talk with
