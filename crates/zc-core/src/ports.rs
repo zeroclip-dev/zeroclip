@@ -51,7 +51,7 @@ pub struct VideoStart {
     pub min_bitrate_bps: u32,
     /// VBR ceiling, bits per second. Also what the DVR buffer is sized against.
     pub max_bitrate_bps: u32,
-    /// Fixed IDR interval (DESIGN §3: 1–2 s, never encoder defaults).
+    /// Fixed IDR interval.
     pub keyframe_interval: Hns,
     /// Draw the mouse cursor into the capture (WGC `IsCursorCaptureEnabled`).
     pub capture_cursor: bool,
@@ -94,7 +94,7 @@ pub enum SourceError {
     Other(String),
 }
 
-/// The GPU video pipeline: capture → hardware encode → packets (DESIGN §3).
+/// The GPU video pipeline: capture → hardware encode → packets.
 pub trait VideoSource: Send {
     /// Starts capturing and encoding. Packets go to `sink`, health signals to
     /// `health`. Returns the codec actually in use after the capability ladder.
@@ -119,14 +119,14 @@ pub trait VideoSource: Send {
     /// Asks the encoder for an IDR frame as soon as possible.
     fn request_keyframe(&mut self);
 
-    /// Writes the current frame to `path` as PNG (DESIGN §5, "Screenshots").
+    /// Writes the current frame to `path` as PNG.
     ///
     /// # Errors
     /// See [`SourceError`].
     fn screenshot(&mut self, path: &Path) -> Result<(), SourceError>;
 }
 
-/// An audio track: capture → AAC → packets (DESIGN §6).
+/// An audio track: capture → AAC → packets.
 pub trait AudioSource: Send {
     /// Which track this source produces.
     fn track(&self) -> TrackId;
@@ -158,8 +158,8 @@ pub trait AudioSource: Send {
         true
     }
 
-    /// Follows a new game: loopback capture of that process tree (include mode,
-    /// DESIGN §6). `None` means no game has focus. Default: ignored.
+    /// Follows a new game: loopback capture of that process tree (include mode).
+    /// `None` means no game has focus. Default: ignored.
     fn set_target_process(&mut self, pid: Option<u32>) {
         let _ = pid;
     }
@@ -183,7 +183,7 @@ pub enum OsEvent {
         hwnd: isize,
         /// Full path of its executable.
         exe: String,
-        /// The window covers its monitor, or is borderless on it (D35: a fullscreen app can
+        /// The window covers its monitor, or is borderless on it (a fullscreen app can
         /// prompt the user even without a profile).
         fullscreen: bool,
     },
@@ -198,7 +198,7 @@ pub enum OsEvent {
     },
 }
 
-/// The OS input thread: Raw Input hotkeys plus foreground tracking (DESIGN §7, §8).
+/// The OS input thread: Raw Input hotkeys plus foreground tracking.
 pub trait InputSource: Send {
     /// Starts the input thread, reporting through `events`.
     ///
@@ -209,7 +209,7 @@ pub trait InputSource: Send {
     /// Stops the input thread. Idempotent.
     fn stop(&mut self);
 
-    /// Reports [`OsEvent::ProcessExited`] when `pid` ends (crash rescue, DESIGN §8).
+    /// Reports [`OsEvent::ProcessExited`] when `pid` ends (crash rescue).
     /// Default: ignored.
     ///
     /// # Errors
@@ -222,14 +222,14 @@ pub trait InputSource: Send {
 
 /// The drive-type probe the app injects: whether the drive holding a path has a seek penalty,
 /// which means a spinning disk. `Ok(None)` means the drive doesn't say. The engine can't call
-/// Windows itself, so the app passes `zc_win::drive::seek_penalty` (P3.24).
+/// Windows itself, so the app passes `zc_win::drive::seek_penalty`.
 pub type SeekPenalty = fn(&Path) -> Result<Option<bool>, SourceError>;
 
-/// Pins a region of memory in RAM, so Windows can't page it out (DESIGN §4). The returned guard
+/// Pins a region of memory in RAM, so Windows can't page it out. The returned guard
 /// keeps the region pinned, and dropping it unpins the region. The engine calls this on the DVR
 /// rings, so the guard must be dropped before the memory is freed.
 pub type LockMemory = fn(&[u8]) -> Result<Box<dyn Send>, SourceError>;
 
-/// Reports this machine's physical RAM in MiB (`zc-win`, P4.20). `None` means the OS didn't say.
-/// The engine caps the DVR's RAM ceiling at a share of it (D32).
+/// Reports this machine's physical RAM in MiB (`zc-win`). `None` means the OS didn't say.
+/// The engine caps the DVR's RAM ceiling at a share of it.
 pub type TotalMemory = fn() -> Option<u64>;

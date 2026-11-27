@@ -98,19 +98,18 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-To see how it works, start with [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md). The full design is
-in [docs/DESIGN.md](docs/DESIGN.md), the crate layout in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and the plans in [docs/ROADMAP.md](docs/ROADMAP.md).
-
 ## License
 
 ZeroClip is **source-available** under the [PolyForm Noncommercial License 1.0.0](LICENSE), with
-one extra permission:
+one extra permission and a few extra terms:
 
 - ✅ You can use it for free, read and change the code, and **make money from the videos,
   clips and streams you record with it**.
 - ❌ You can't sell ZeroClip, sell software built from its code, or put either into a
   commercial product.
+- ❌ You can't rename or rebrand it, or present it as your own project. A changed version
+  keeps the ZeroClip name and credit and says it is modified.
+- ❌ The ZeroClip name and logo aren't licensed for your own use.
 
 This is a summary; [LICENSE](LICENSE) has the exact terms.
 

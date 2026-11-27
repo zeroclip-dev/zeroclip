@@ -1,4 +1,4 @@
-//! Mic dynamics compressor (DESIGN §6, "Audio track 3 — microphone").
+//! Mic dynamics compressor.
 //!
 //! Mic track only: it stops shouting from clipping and lifts quiet callouts.
 //! Game audio is never compressed — flattening its dynamic range is exactly what
@@ -12,7 +12,7 @@
 
 use crate::time::Hns;
 
-/// Compressor settings. The defaults are the starting point from DESIGN §6.
+/// Compressor settings. The defaults are the starting point
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CompressorParams {
     /// Level above which gain reduction starts, in dBFS.

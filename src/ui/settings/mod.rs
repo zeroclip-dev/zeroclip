@@ -1692,7 +1692,7 @@ impl Render for SettingsView {
                             setting_row(
                                 "Container",
                                 "Crash-safe fragmented MP4 so power loss never corrupts footage.",
-                                // Fragmented MP4 is the only container written (D18). A settings
+                                // Fragmented MP4 is the only container written. A settings
                                 // file that still says Matroska shows no chip selected, and
                                 // Settings::problems blocks saving it.
                                 segmented(
@@ -1750,7 +1750,7 @@ impl Render for SettingsView {
             }
 
             SettingsSection::Advanced => vec![
-                // Tray and startup (P4.15, P4.16)
+                // Tray and startup
                 section_block(
                     "App behavior",
                     "Control window closing and Windows startup behavior.",

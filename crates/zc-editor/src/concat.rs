@@ -1,4 +1,4 @@
-//! Stitch compatibility (DESIGN §9, "Stitching").
+//! Stitch compatibility.
 //!
 //! FFmpeg's concat demuxer joins clips instantly only when their streams match.
 //! Clips from different profiles, or from after a codec-ladder fallback, won't —

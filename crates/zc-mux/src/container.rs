@@ -1,15 +1,15 @@
-//! Container writers (DESIGN §1 "Crash-survivable containers", §5 recording modes).
+//! Container writers.
 //!
 //! Standard MP4 writes its index at the end of the file, so a crash mid-session
 //! leaves an unplayable file. Every recording and DVR dump is therefore written as
-//! fragmented MP4 (D18): an init segment, then one `moof` and `mdat` pair per GOP.
+//! fragmented MP4: an init segment, then one `moof` and `mdat` pair per GOP.
 //! A file cut at a fragment boundary still plays. Export remuxes to plain MP4, a
 //! stream copy, so it is still instant.
 //!
 //! [`create`] returns the fMP4 [`ContainerWriter`]. It is pure Rust over
 //! `std::io::Write`, so it can sit on top of the
 //! [`ChunkedWriter`](crate::chunked::ChunkedWriter) and be tested with synthetic
-//! packets. Matroska is not implemented (D18).
+//! packets. Matroska is not implemented.
 
 use std::io;
 
@@ -55,7 +55,7 @@ pub trait ContainerWriter: Send {
 
 /// Creates a writer for `format` over `out`, declaring `tracks` up front.
 ///
-/// Fragmented MP4 is the only format written (D18). The header is written with the first
+/// Fragmented MP4 is the only format written. The header is written with the first
 /// fragment, because it needs parameter sets from the first keyframe.
 ///
 /// # Errors
@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn master_is_declared_before_game_and_mic_whatever_the_input_order() {
-        // Players and Discord read only the first audio track, so Master must come first (D30).
+        // Players and Discord read only the first audio track, so Master must come first.
         let audio = |track: TrackId, label: &str| TrackInfo {
             track,
             label: label.into(),

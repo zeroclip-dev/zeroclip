@@ -1,7 +1,7 @@
 //! The Editor tab: put one or more clips on a timeline, split them into pieces (A, B, C...), delete
 //! or reorder pieces, set the volume or mute of each audio track per piece, and save the result
 //! as a new file or as one file per piece. Video is always stream-copied; only an edited audio
-//! track is re-encoded (D38), so every cut lands on a keyframe.
+//! track is re-encoded, so every cut lands on a keyframe.
 //!
 //! The picture and sound come from the in-app player (`player.rs`).
 //!
@@ -51,7 +51,7 @@ use super::icons::icon;
 use super::{human_duration, theme};
 use crate::app::{NoticeLevel, ZeroClipApp};
 
-/// Peaks stored per waveform, and the sample rate they are computed from (P5.10).
+/// Peaks stored per waveform, and the sample rate they are computed from.
 const BUCKETS: usize = 1_000;
 const SAMPLE_RATE: u32 = 8_000;
 /// Bar width before the first paint has measured the real one.

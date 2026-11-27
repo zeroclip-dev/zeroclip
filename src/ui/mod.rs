@@ -250,12 +250,12 @@ pub fn human_duration(t: Hns) -> String {
     }
 }
 
-/// Approximate DVR memory for `secs` at `max_kbps`, in MB (DESIGN §4 table).
+/// Approximate DVR memory for `secs` at `max_kbps`, in MB.
 pub fn dvr_megabytes(secs: u32, max_kbps: u32) -> u64 {
     u64::from(max_kbps) * 1_000 / 8 * u64::from(secs) / 1_000_000
 }
 
-/// Size of the disk-mode ring file for `secs` (P4.21), in MB. The engine sizes it the same way.
+/// Size of the disk-mode ring file for `secs`, in MB. The engine sizes it the same way.
 pub fn dvr_ring_megabytes(secs: u32, max_kbps: u32, audio_kbps: u32) -> u64 {
     let window = zc_core::Hns::from_secs(i64::from(secs));
     let config = zc_core::dvr::DvrConfig::for_window(
@@ -267,7 +267,7 @@ pub fn dvr_ring_megabytes(secs: u32, max_kbps: u32, audio_kbps: u32) -> u64 {
 }
 
 /// The DVR memory limit the engine really runs under: the setting, capped at a share of this
-/// machine's RAM (D32, P4.20). The engine and the UI must agree on it, or the Profiles tab shows
+/// machine's RAM. The engine and the UI must agree on it, or the Profiles tab shows
 /// windows the engine then cuts.
 pub fn effective_ceiling(setting_mib: u32) -> zc_core::profile::RamCeiling {
     zc_core::profile::effective_ram_ceiling(setting_mib, zc_win::memory::total_physical_mib())
@@ -286,8 +286,8 @@ mod tests {
     }
 
     #[test]
-    fn dvr_memory_matches_the_design_doc() {
-        // DESIGN §4: 20 Mbps → 150 MB per minute.
+    fn dvr_memory_matches_the_bitrate_rule() {
+        // 20 Mbps → 150 MB per minute.
         assert_eq!(dvr_megabytes(60, 20_000), 150);
         assert_eq!(dvr_megabytes(300, 20_000), 750);
     }

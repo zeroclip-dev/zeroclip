@@ -1,4 +1,4 @@
-//! The system tray (notification area) icon and its menu (P4.15).
+//! The system tray (notification area) icon and its menu.
 //!
 //! The icon and menu come from the `tray-icon` crate, which calls
 //! [`Shell_NotifyIconW`](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shell_notifyiconw)

@@ -1,5 +1,5 @@
 //! In-process audio playback for the previews: a WASAPI shared-mode render stream fed from a
-//! bounded queue, and the device's own clock for "what is audible now" (see DECISIONS).
+//! bounded queue, and the device's own clock for "what is audible now".
 //!
 //! The caller's decode thread writes `48 kHz` stereo `f32` PCM through a [`PcmWriter`]; the
 //! player's thread moves it into the device. The UI reads [`PcmPlayer::played`] to pace the

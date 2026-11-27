@@ -1,4 +1,4 @@
-//! Startup repair for recordings that a crash left unfinished (D18, DESIGN §8).
+//! Startup repair for recordings that a crash left unfinished.
 //!
 //! A recording is written as `<name>.mp4.partial`, and the fMP4 writer syncs it after every
 //! fragment. If ZeroClip crashes, the game crashes or the power fails, the file can end in the

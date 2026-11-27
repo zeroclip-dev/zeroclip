@@ -293,7 +293,7 @@ impl FrameHandler {
 
     /// Called by the encoder thread about every millisecond: answers screenshot
     /// requests from the latest frame, and on a static screen (WGC delivers nothing)
-    /// repeats the last frame to keep GOPs on time (DESIGN §4).
+    /// repeats the last frame to keep GOPs on time.
     fn tick(&mut self, now: Hns) {
         if let Some((texture, _, size)) = &self.latest
             && self.shared.screenshot_wanted.swap(false, Ordering::Acquire)

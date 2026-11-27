@@ -1,9 +1,9 @@
-//! Driving `ffmpeg.exe` (DESIGN §9).
+//! Driving `ffmpeg.exe`.
 //!
 //! Every job is a stream copy (`-c copy`): no decoding, no encoding, so a
 //! 5-minute clip trims in well under a second. Output is written to a new file;
 //! the source is never overwritten, and is only removed once the export has been
-//! verified to play (DESIGN §9, "Worth adding").
+//! verified to play.
 
 use std::ffi::OsString;
 use std::io::Read as _;
@@ -177,7 +177,7 @@ impl Ffmpeg {
         run(&self.exe, &thumbnail_args(input, at, width, output)).map(drop)
     }
 
-    /// Edits audio tracks and stream-copies the video (D38); see [`audio_edit_args`].
+    /// Edits audio tracks and stream-copies the video; see [`audio_edit_args`].
     ///
     /// # Errors
     /// See [`FfmpegError`].
@@ -190,7 +190,7 @@ impl Ffmpeg {
         run(&self.exe, &audio_edit_args(input, output, tracks)?).map(drop)
     }
 
-    /// Like [`edit_audio`](Self::edit_audio), but rebuilds track 0 (Master, D30) by mixing the
+    /// Like [`edit_audio`](Self::edit_audio), but rebuilds track 0 (Master) by mixing the
     /// edited per-source tracks `1..`; see [`audio_edit_args_rebuilding_master`].
     ///
     /// # Errors
@@ -570,7 +570,7 @@ fn f32_samples(bytes: &[u8]) -> Vec<f32> {
 }
 
 /// Flags every job starts with: quiet, never read stdin, and never overwrite. Exports are
-/// always new files (DESIGN §9), so `-n` makes a name clash an error instead of data loss.
+/// always new files, so `-n` makes a name clash an error instead of data loss.
 fn common_args() -> Vec<OsString> {
     ["-hide_banner", "-nostdin", "-loglevel", "error", "-n"]
         .into_iter()
@@ -866,7 +866,7 @@ pub fn frames_args(
     args
 }
 
-/// What the editor does to one audio track (D38). Anything but `Keep` re-encodes that track to
+/// What the editor does to one audio track. Anything but `Keep` re-encodes that track to
 /// AAC; video is never re-encoded.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AudioEdit {
@@ -924,7 +924,7 @@ pub struct AudioTrack {
     pub bitrate_bps: u32,
 }
 
-/// Arguments that edit audio tracks and stream-copy the video (D38). `tracks` lists every audio
+/// Arguments that edit audio tracks and stream-copy the video. `tracks` lists every audio
 /// track of `input` in order. Untouched tracks are stream-copied. Each edited track gets its own
 /// `-filter_complex` chain and is re-encoded to AAC at its source bitrate.
 ///
@@ -938,8 +938,7 @@ pub fn audio_edit_args(
     build_audio_edit_args(input, output, tracks, None)
 }
 
-/// Like [`audio_edit_args`], but when `tracks.len() > 1` replaces output audio track 0 (Master,
-/// D30) with the mix of the individually edited tracks `1..`, re-encoded to AAC at
+/// Like [`audio_edit_args`], but when `tracks.len() > 1` replaces output audio track 0 (Master) with the mix of the individually edited tracks `1..`, re-encoded to AAC at
 /// `master_bitrate_bps`.
 ///
 /// Players play track 0 by default, so muting or silencing a per-source track (Game, Mic, app)
@@ -948,7 +947,7 @@ pub fn audio_edit_args(
 ///   (`normalize=0` keeps unity gain so levels match the original mix instead of dividing by `N`;
 ///   `duration=longest` keeps the mix full length if one track was shortened by
 ///   [`AudioEdit::Remove`]), followed by `alimiter=limit=1:level=disabled` so summing unity-gain
-///   tracks above 0 dBFS cannot clip the AAC encoder (matching D30's live soft-clipper, while
+///   tracks above 0 dBFS cannot clip the AAC encoder (matching the live soft-clipper, while
 ///   leaving audio below 0 dBFS untouched).
 /// - **1 unmuted source track:** passed directly to `[a0]` without `amix`; an edited track uses
 ///   `asplit=2` so its chain runs once for both its own output stream and Master.

@@ -26,7 +26,7 @@ pub enum Command {
     PushToTalk(bool),
     /// Settings changed; apply what can be applied live.
     ApplySettings(Box<Settings>),
-    /// The user answered the focus prompt (D35). Clip desktop is not a choice here: the UI
+    /// The user answered the focus prompt. Clip desktop is not a choice here: the UI
     /// sends `ApplySettings` with capture mode Screen.
     FocusChoice(FocusChoice),
     /// Suspend global hotkey dispatch while the UI is capturing a new hotkey binding.
@@ -35,12 +35,12 @@ pub enum Command {
     Shutdown,
 }
 
-/// The user's answer to a focus prompt (D35).
+/// The user's answer to a focus prompt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FocusChoice {
     /// Keep clipping the tracked game.
     Keep,
-    /// Track the candidate: its profile applies, as on a profiled focus (D33).
+    /// Track the candidate: its profile applies, as on a profiled focus.
     Switch,
 }
 
@@ -100,7 +100,7 @@ pub enum EngineEvent {
         /// How much footage the rescue holds.
         duration: Hns,
     },
-    /// A second game took focus while another is tracked (D35). Ask whether to switch. The engine
+    /// A second game took focus while another is tracked. Ask whether to switch. The engine
     /// emits it once per pair per session; it names the tracked game and the candidate by file name.
     FocusPrompt {
         /// The game being clipped.
@@ -122,11 +122,11 @@ pub enum EngineEvent {
     /// Something failed.
     Error(String),
     /// A requested feature isn't built yet. Scaffolding only: this disappears as
-    /// the roadmap phases land.
+    /// the features land.
     NotImplemented {
         /// What was requested.
         feature: &'static str,
-        /// Roadmap phase that delivers it.
+        /// Phase that delivers it.
         phase: u8,
     },
 }

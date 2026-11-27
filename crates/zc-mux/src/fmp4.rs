@@ -1,6 +1,6 @@
 //! Fragmented MP4 boxes (ISO/IEC 14496-12, with the AVC and HEVC sample descriptions of
 //! 14496-15 and the AAC ones of 14496-3). This is the container every recording and DVR dump
-//! is written in (D18).
+//! is written in.
 //!
 //! A file is an init segment, `ftyp` and `moov`, which declares the tracks. Its `mvex` says
 //! that fragments follow, and its `mehd` holds the file's length, which is filled in once the
@@ -17,7 +17,7 @@ use zc_core::time::Hns;
 use crate::bitstream;
 use crate::container::ContainerWriter;
 
-/// Ticks per second. Hns ticks are 100 ns, so every track uses them directly (D7).
+/// Ticks per second. Hns ticks are 100 ns, so every track uses them directly.
 const TIMESCALE: u32 = 10_000_000;
 
 /// The unity transformation matrix (ISO/IEC 14496-12 §8.2.2.2), in 16.16 fixed point.

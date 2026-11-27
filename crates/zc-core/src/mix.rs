@@ -1,4 +1,4 @@
-//! The Master mix core (D30): one absolute 48 kHz sample timeline with a ring per source.
+//! The Master mix core: one absolute 48 kHz sample timeline with a ring per source.
 //!
 //! Each audio source writes the PCM it captured at the sample its own track gets, and the
 //! mixer reads back the sum of all sources, [`MIX_LAG`] behind real time. A source whose block
@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::time::Hns;
 
-/// Sample rate of the mix timeline, Hz. Every source runs at this rate (D30).
+/// Sample rate of the mix timeline, Hz. Every source runs at this rate.
 pub const MIX_RATE: u32 = 48_000;
 
 /// How far behind real time the mix runs. A block that arrives within this still lands in place.

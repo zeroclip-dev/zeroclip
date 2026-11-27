@@ -1,4 +1,4 @@
-//! Track 1, Master: a live mix of every enabled source, encoded once more as AAC (D30).
+//! Track 1, Master: a live mix of every enabled source, encoded once more as AAC.
 //!
 //! The sources write their PCM into a shared [`MixBus`]. One mixer thread wakes every 20 ms,
 //! mixes everything up to 200 ms behind real time, and encodes the result, so the first audio

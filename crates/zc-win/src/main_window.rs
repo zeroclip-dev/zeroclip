@@ -1,4 +1,4 @@
-//! Hides and shows the app's main window, for the tray (P4.15).
+//! Hides and shows the app's main window, for the tray.
 //!
 //! The window is hidden with [`ShowWindow`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindow)
 //! (`SW_HIDE`): it leaves the screen and the taskbar, and the process keeps running. The window

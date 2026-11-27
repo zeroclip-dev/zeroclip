@@ -1,13 +1,13 @@
-//! # zc-store — the metadata store (DESIGN §2 "Metadata", Phase 4)
+//! # zc-store — the metadata store
 //!
 //! An embedded SQLite database (via `rusqlite` with the `bundled` feature, added
 //! in Phase 4) holding everything that isn't a video file:
 //!
-//! - clips and their keyframe positions (snap points for the editor, DESIGN §9);
-//! - game profiles (DESIGN §7), once they outgrow the settings file;
-//! - the encoder capability probe, re-run only on GPU or driver change (DESIGN §3);
-//! - waveform peaks keyed by file hash, so reopening a clip is instant (DESIGN §9);
-//! - uploads and their verification state (DESIGN §10).
+//! - clips and their keyframe positions (snap points for the editor);
+//! - game profiles, once they outgrow the settings file;
+//! - the encoder capability probe, re-run only on GPU or driver change;
+//! - waveform peaks keyed by file hash, so reopening a clip is instant;
+//! - uploads and their verification state.
 //!
 //! The schema is in `migrations/`. Never edit a migration that has shipped; add
 //! the next numbered file instead.

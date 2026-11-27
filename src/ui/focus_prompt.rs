@@ -1,4 +1,4 @@
-//! The focus prompt banner (D35): a second game has focus while one is clipped. Non-modal, under
+//! The focus prompt banner: a second game has focus while one is clipped. Non-modal, under
 //! the top bar. It never takes keyboard focus, and the window is never raised for it.
 
 use gpui::{
@@ -22,7 +22,7 @@ pub struct FocusPrompt {
 
 /// Drops the prompt once its candidate is no longer the focused app. The engine's status names
 /// the focused app, so the banner clears when focus moves on. Focus on the shell (taskbar, Start,
-/// alt-tab) never clears it (D35): that is the way back to ZeroClip. Focus on ZeroClip itself
+/// alt-tab) never clears it: that is the way back to ZeroClip. Focus on ZeroClip itself
 /// doesn't send a foreground event, so it never clears the banner either.
 pub fn clear_if_left(app: &mut ZeroClipApp) {
     if has_left(app.status.game.as_deref(), app.focus_prompt.as_ref()) {
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn prompt_stays_when_focus_goes_to_the_shell() {
-        // Taskbar, Start and alt-tab are the way back to ZeroClip (D35).
+        // Taskbar, Start and alt-tab are the way back to ZeroClip.
         assert!(!has_left(Some("C:\\Windows\\explorer.exe"), Some(&prompt())));
     }
 

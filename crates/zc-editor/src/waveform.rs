@@ -1,4 +1,4 @@
-//! Waveform peaks for the editor timeline (DESIGN §9, "Waveform").
+//! Waveform peaks for the editor timeline.
 //!
 //! A background task decodes the audio (ffmpeg → raw f32 PCM on stdout), computes
 //! one RMS value per bucket, and hands the array to the UI to draw. Results are

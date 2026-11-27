@@ -19,14 +19,14 @@ CREATE TABLE clips (
 );
 CREATE INDEX clips_by_created_at ON clips (created_at DESC);
 
--- Keyframe positions: the editor's snap points (DESIGN §9).
+-- Keyframe positions: the editor's snap points.
 CREATE TABLE clip_keyframes (
     clip_id  INTEGER NOT NULL REFERENCES clips (id) ON DELETE CASCADE,
     pts_hns  INTEGER NOT NULL,
     PRIMARY KEY (clip_id, pts_hns)
 ) WITHOUT ROWID;
 
--- Per-game profiles (DESIGN §7).
+-- Per-game profiles.
 CREATE TABLE game_profiles (
     exe                TEXT    PRIMARY KEY COLLATE NOCASE,
     buffer_secs        INTEGER NOT NULL,
@@ -34,7 +34,7 @@ CREATE TABLE game_profiles (
     last_seen_at       INTEGER
 );
 
--- The encoder capability ladder, re-probed only on GPU or driver change (DESIGN §3).
+-- The encoder capability ladder, re-probed only on GPU or driver change.
 CREATE TABLE encoder_probe (
     adapter_luid    TEXT    NOT NULL,
     driver_version  TEXT    NOT NULL,
@@ -43,14 +43,14 @@ CREATE TABLE encoder_probe (
     PRIMARY KEY (adapter_luid, driver_version)
 );
 
--- Waveform peaks, keyed by a hash of the file, so reopening a clip is instant (DESIGN §9).
+-- Waveform peaks, keyed by a hash of the file, so reopening a clip is instant.
 CREATE TABLE waveform_cache (
     file_hash  TEXT    PRIMARY KEY,
     buckets    INTEGER NOT NULL,
     peaks      BLOB    NOT NULL  -- little-endian f32 per bucket
 );
 
--- Uploads (DESIGN §10). `verified_at` is set only after a status check confirms the
+-- Uploads. `verified_at` is set only after a status check confirms the
 -- remote copy is processed and not rejected; local deletion requires it.
 CREATE TABLE uploads (
     id           INTEGER PRIMARY KEY,

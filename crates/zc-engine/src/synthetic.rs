@@ -1,4 +1,4 @@
-//! Synthetic sources: the synthetic-load test harness (DESIGN §12).
+//! Synthetic sources: the synthetic-load test harness.
 //!
 //! A [`SyntheticVideoSource`] implements the same [`VideoSource`] port as the real
 //! GPU pipeline, but produces numbered [`SyntheticStream`] packets on its own
@@ -205,7 +205,7 @@ impl VideoSource for SyntheticVideoSource {
     }
 }
 
-/// A fake OS input thread (DESIGN §12): the test injects [`OsEvent`]s the way Raw Input and
+/// A fake OS input thread: the test injects [`OsEvent`]s the way Raw Input and
 /// the foreground hook would. Clones share state, so the test keeps one clone and gives the
 /// engine another.
 #[derive(Clone, Default)]

@@ -1,4 +1,4 @@
-//! Focus prompt (D35): what a focus change to another app means while a game is tracked.
+//! Focus prompt: what a focus change to another app means while a game is tracked.
 //!
 //! Pure decision logic. The engine owns the 3 s debounce and the banner state; this module says
 //! what each focus change means, and which pairs have been asked about.
@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::profile::exe_name;
 
-/// How long a candidate must keep focus before the user is asked (D35), so alt-tab flicks don't
+/// How long a candidate must keep focus before the user is asked, so alt-tab flicks don't
 /// prompt.
 pub const DEBOUNCE: Duration = Duration::from_secs(3);
 
@@ -30,12 +30,12 @@ pub struct Focused<'a> {
     pub ours: bool,
 }
 
-/// What a focus change does to the tracked game (D35).
+/// What a focus change does to the tracked game.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FocusAction {
     /// Nothing changes: not a candidate, the tracked game itself, or a pair already asked.
     Ignore,
-    /// Nothing is tracked and a profiled game took focus, so it is tracked at once (D33).
+    /// Nothing is tracked and a profiled game took focus, so it is tracked at once.
     Track,
     /// A candidate for a game other than the tracked one: ask once it keeps focus for
     /// [`DEBOUNCE`].
@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn focus_prompt_unprofiled_app_is_never_tracked() {
         assert_eq!(on_focus(None, app(DISCORD), false), FocusAction::Ignore);
-        assert_eq!(on_focus(None, fullscreen(GAME), false), FocusAction::Ignore, "D33");
+        assert_eq!(on_focus(None, fullscreen(GAME), false), FocusAction::Ignore, "");
     }
 
     #[test]

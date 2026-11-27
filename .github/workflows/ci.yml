@@ -13,7 +13,7 @@ env:
 jobs:
   check:
     # The Windows adapters only compile on Windows. Runners have no GPU, so CI
-    # compiles them but never runs them (see docs/plan/README.md).
+    # compiles them but never runs them.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5

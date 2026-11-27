@@ -1,4 +1,4 @@
-//! # zc-input — hotkeys and foreground tracking (DESIGN §7, §8)
+//! # zc-input — hotkeys and foreground tracking
 //!
 //! One [`MessageThread`](zc_win::message_thread::MessageThread) hosts both:
 //!
@@ -13,7 +13,7 @@
 //! where the hotkey matcher and the profile engine live.
 //!
 //! - **Process watch** ([`process_watch`]): one parked thread per watched game reports its
-//!   exit code, so the engine can tell a crash from a clean quit (DESIGN §8).
+//!   exit code, so the engine can tell a crash from a clean quit.
 
 pub mod foreground;
 pub mod process_watch;

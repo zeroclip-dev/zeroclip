@@ -1,7 +1,7 @@
-//! Retry schedule for protected (HDCP/DRM) content (DESIGN §3).
+//! Retry schedule for protected (HDCP/DRM) content.
 //!
 //! Windows.Graphics.Capture gives no event when protected (DRM) content comes and
-//! goes, and usually keeps delivering frames anyway (D23). If starting capture does
+//! goes, and usually keeps delivering frames anyway. If starting capture does
 //! fail with access denied, it is retried on this schedule: 250 ms doubling up to
 //! 5 s.
 
@@ -22,7 +22,7 @@ impl Backoff {
         Self { initial, max, next: initial }
     }
 
-    /// The HDCP schedule from DESIGN §3: 250 ms up to 5 s.
+    /// The HDCP schedule: 250 ms up to 5 s.
     #[must_use]
     pub fn hdcp() -> Self {
         Self::new(Hns::from_millis(250), Hns::from_secs(5))

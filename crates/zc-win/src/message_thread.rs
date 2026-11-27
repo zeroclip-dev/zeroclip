@@ -3,7 +3,7 @@
 //! Raw Input delivers `WM_INPUT` to a window, and `SetWinEventHook` with
 //! `WINEVENT_OUTOFCONTEXT` calls back on the thread that installed it — both need
 //! a running message loop. Don't rely on the egui window for that: it sleeps when
-//! backgrounded, which is exactly when a game has focus (DESIGN §8). This thread
+//! backgrounded, which is exactly when a game has focus. This thread
 //! owns a message-only window (`HWND_MESSAGE`) whose only job is to pump messages.
 
 use std::sync::mpsc;

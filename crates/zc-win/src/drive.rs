@@ -1,4 +1,4 @@
-//! Drive-type detection (DESIGN §4, "Detect drive type at startup").
+//! Drive-type detection.
 
 use std::path::Path;
 use std::ptr;

@@ -1,4 +1,4 @@
-//! Discord webhooks: the first destination (DESIGN §10, "Destination 1").
+//! Discord webhooks: the first destination.
 //!
 //! A webhook upload is a multipart POST to a URL — no OAuth, no quota, no API
 //! project, no audit. The catch is size: the free per-file cap has changed four

@@ -8,9 +8,9 @@
 //! - Phase 2 (done): `input` → `zc_input::RawInputSource`; `game_audio` →
 //!   `zc_audio::GameAudioSource` (if enabled); `mic` → `zc_audio::MicSource`
 //!   (unless the mic is off)
-//! - Phase 3 (P3.24, P3.25): `seek_penalty` → `zc_win::drive::seek_penalty`, the drive probe
+//! - Phase 3: `seek_penalty` → `zc_win::drive::seek_penalty`, the drive probe
 //!   that sets DVR dump pacing; `lock_memory` → `zc_win::memory::lock`, which pins the DVR rings
-//! - Per-app audio (P2.24, D26): each enabled app track → `zc_audio::AppAudioSource`, on track
+//! - Per-app audio: each enabled app track → `zc_audio::AppAudioSource`, on track
 //!   `3 + i` for the i-th enabled app, found by its executable's process tree
 //!
 //! Ports are built once at startup, so turning game audio, the mic or an app track on or off
@@ -29,7 +29,7 @@ use zc_engine::Ports;
 
 /// Builds the adapters for the current settings.
 ///
-/// The enabled sources share one Master mix bus (D30): the game is input 0 when it is on, the
+/// The enabled sources share one Master mix bus: the game is input 0 when it is on, the
 /// microphone follows it, and the app tracks come after both. Each source's level in the mix is
 /// set here, so it applies from the next start.
 pub fn ports(settings: &Settings) -> Ports {
@@ -100,7 +100,7 @@ pub fn ports(settings: &Settings) -> Ports {
     }
 }
 
-/// Pins a DVR ring in RAM with `zc_win::memory::lock` (P3.25). Dropping the guard unpins it.
+/// Pins a DVR ring in RAM with `zc_win::memory::lock`. Dropping the guard unpins it.
 fn pin_memory(region: &[u8]) -> Result<Box<dyn Send>, SourceError> {
     Ok(Box::new(zc_win::memory::lock(region)?))
 }

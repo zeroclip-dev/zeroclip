@@ -1,4 +1,4 @@
-//! The recorder: where every packet lands (DESIGN §4, §5).
+//! The recorder: where every packet lands.
 //!
 //! Sources push packets through the [`PacketSink`] impl. Under one short lock the
 //! recorder:
@@ -25,7 +25,7 @@ use zc_core::time::{Hns, MasterClock};
 use crate::disk_dvr::{DiskClip, DiskPlan, DiskRing};
 
 /// Payload copied per lock hold by [`Recorder::snapshot`]. Each hold stays well under the
-/// 5 ms target from D29, so encoder and audio threads never wait long for the lock.
+/// 5 ms target, so encoder and audio threads never wait long for the lock.
 const SNAPSHOT_CHUNK_BYTES: usize = 4 << 20;
 
 /// Counters for things that went wrong on the hot path. Read by the engine and
@@ -38,7 +38,7 @@ pub struct RecorderStats {
     pub dvr_errors: u64,
     /// Failed writes to disk writers.
     pub writer_errors: u64,
-    /// Failed writes to the DVR ring file (disk mode, P4.21).
+    /// Failed writes to the DVR ring file (disk mode).
     pub ring_errors: u64,
 }
 
@@ -46,12 +46,12 @@ struct State {
     /// Page locks on the DVR rings. Declared before `dvr`, so they drop first: fields drop in
     /// declaration order, and a ring must be unpinned before its memory is freed.
     locks: Vec<Box<dyn Send>>,
-    /// The last page-lock request, so a resize can pin the new rings the same way (P4.6).
+    /// The last page-lock request, so a resize can pin the new rings the same way.
     pin: Option<(LockMemory, Vec<TrackId>)>,
     clock: MasterClock,
     /// The whole buffer in RAM mode. In disk mode only the staging area in front of `disk`.
     dvr: DvrBuffer,
-    /// The ring file that holds the older footage, in disk mode (P4.21).
+    /// The ring file that holds the older footage, in disk mode.
     disk: Option<Arc<DiskRing>>,
     tee: Tee,
     stats: RecorderStats,
@@ -131,7 +131,7 @@ impl Recorder {
     ///
     /// The lock is held only to plan the copy and then for each chunk of at most
     /// `SNAPSHOT_CHUNK_BYTES`, so sources keep pushing in between. A packet the writer
-    /// laps during the copy is left out, and the clip starts at the next keyframe (D29).
+    /// laps during the copy is left out, and the clip starts at the next keyframe.
     /// The longest hold and the total time are logged at debug level.
     ///
     /// # Errors
@@ -151,7 +151,7 @@ impl Recorder {
     }
 
     /// Where a clip cut now would end: the end of the newest video frame. Zero when the buffer
-    /// holds no video. A save takes this at the press, so the clip ends there (D30).
+    /// holds no video. A save takes this at the press, so the clip ends there.
     #[must_use]
     pub fn video_end(&self) -> Hns {
         self.lock().dvr.newest_video_end()
@@ -169,7 +169,7 @@ impl Recorder {
         plan
     }
 
-    /// The second half: copies the staged footage out in short lock holds (D29). That is all of
+    /// The second half: copies the staged footage out in short lock holds. That is all of
     /// it in RAM mode. In disk mode the older footage stays in the ring file for the caller to
     /// stream, so this copies at most the staging area, and the ring isn't read at all here.
     /// A packet the writer laps during the copy is left out, and the clip starts at the next
@@ -237,7 +237,7 @@ impl Recorder {
         })
     }
 
-    /// Switches to disk mode: `ring` holds the footage older than the staging area (P4.21).
+    /// Switches to disk mode: `ring` holds the footage older than the staging area.
     /// [`Persister::start`](crate::disk_dvr::Persister::start) calls this and starts the thread
     /// that fills the ring.
     pub(crate) fn attach_ring(&self, ring: Arc<DiskRing>) {
@@ -268,8 +268,7 @@ impl Recorder {
     }
 
     /// Empties the DVR buffer, for when the video format changes or the watchdog resumes after a
-    /// re-init: GOPs from the old encoder can't share a clip with the new one (DESIGN §8, "buffer
-    /// restarts from empty"). The [`MasterClock`] stays anchored, so the new encoder's packets
+    /// re-init: GOPs from the old encoder can't share a clip with the new one. The [`MasterClock`] stays anchored, so the new encoder's packets
     /// carry on the session timeline instead of starting again at zero.
     pub fn clear(&self) {
         let mut state = self.lock();
@@ -280,7 +279,7 @@ impl Recorder {
         }
     }
 
-    /// Pins the DVR rings of `tracks` in RAM with `lock` (P3.25, DESIGN §4). Replaces any pins
+    /// Pins the DVR rings of `tracks` in RAM with `lock`. Replaces any pins
     /// taken before.
     ///
     /// Only the tracks named are pinned, so pass the video track and the audio tracks that are
@@ -301,7 +300,7 @@ impl Recorder {
         Ok(bytes)
     }
 
-    /// Changes the DVR buffer to `config` when a game profile asks for another window (D21). The
+    /// Changes the DVR buffer to `config` when a game profile asks for another window. The
     /// lock is held for the whole resize, so pushes wait: that is the brief writer pause. The time
     /// it took is logged, to check it against the watchdog's limit.
     ///

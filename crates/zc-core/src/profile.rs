@@ -1,4 +1,4 @@
-//! Game profiles (DESIGN §7).
+//! Game profiles.
 //!
 //! When the foreground window changes, the input adapter reports the executable;
 //! the engine resolves a profile for it and applies it: DVR window length, and
@@ -37,7 +37,7 @@ pub struct ProfileSet {
 }
 
 impl Default for ProfileSet {
-    /// The examples from DESIGN §7.
+    /// The starter profiles.
     fn default() -> Self {
         Self {
             default: GameProfile { exe: "*".into(), buffer_secs: 60, session_recording: false },
@@ -68,7 +68,7 @@ impl ProfileSet {
     ///
     /// Matching is on the file name only and ignores ASCII case (Windows paths are
     /// case-insensitive). `None` means "no explicit profile", so the engine keeps the
-    /// current profile in that case (sticky profiles, see P4.6).
+    /// current profile in that case (sticky profiles).
     #[must_use]
     pub fn find(&self, exe: &str) -> Option<&GameProfile> {
         let name = exe_name(exe);
@@ -107,8 +107,7 @@ pub struct WindowClamp {
 }
 
 /// Limits a requested DVR window so the video ring fits under `ram_ceiling_bytes`
-/// at `max_video_bitrate_bps` (DESIGN §7: "clamp it and tell the user rather than
-/// silently allocating 2 GB").
+/// at `max_video_bitrate_bps`.
 #[must_use]
 pub fn clamp_window(
     requested: Hns,
@@ -132,7 +131,7 @@ pub fn clamp_window(
     }
 }
 
-/// The share of physical RAM the DVR's RAM part may use, in percent (D32).
+/// The share of physical RAM the DVR's RAM part may use, in percent.
 const RAM_CEILING_PERCENT: u64 = 5;
 
 /// The lowest ceiling the RAM share can set, in MiB. The settings check refuses less too.
@@ -147,8 +146,8 @@ pub struct RamCeiling {
     pub from_system_ram: bool,
 }
 
-/// The DVR RAM ceiling: the user's setting, capped at 5% of physical RAM and never below 64 MiB
-/// (D32). With no RAM reading (`None`), the setting stands unchanged.
+/// The DVR RAM ceiling: the user's setting, capped at 5% of physical RAM and never below 64 MiB.
+/// With no RAM reading (`None`), the setting stands unchanged.
 #[must_use]
 pub fn effective_ram_ceiling(setting_mib: u32, total_physical_mib: Option<u64>) -> RamCeiling {
     let Some(total) = total_physical_mib else {
@@ -168,7 +167,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_profiles_match_the_design_doc() {
+    fn default_profiles_have_the_expected_values() {
         let set = ProfileSet::default();
         assert_eq!(set.default.buffer(), Hns::from_secs(60));
         assert_eq!(set.games.len(), 2);

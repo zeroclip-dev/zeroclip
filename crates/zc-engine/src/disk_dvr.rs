@@ -1,10 +1,10 @@
-//! The disk-backed DVR buffer (D32 "Disk", P4.21).
+//! The disk-backed DVR buffer.
 //!
 //! In disk mode the recorder's [`DvrBuffer`](zc_core::dvr::DvrBuffer) is only a small staging
 //! area (about [`STAGING_BYTES`]): the hot path pushes into it exactly as in RAM mode and never
 //! touches the disk (CONTRIBUTING.md rule 2). A [`Persister`] thread tails it. Once a GOP is
 //! finished, and the audio that goes with it has had `PERSIST_LAG` to arrive, the thread copies
-//! it out in short lock holds (D29) and writes it to the [`DiskRing`] as one record. Staging keeps
+//! it out in short lock holds and writes it to the [`DiskRing`] as one record. Staging keeps
 //! its copy until it evicts it as it would in RAM mode, so a snapshot never sees a hole between
 //! "written" and "still staged".
 //!
@@ -48,7 +48,7 @@
 //!
 //! If a record is overwritten after packets were written, the clip has a hole: the writer reports
 //! `Lapped` and the caller starts over from a fresh plan.
-// TODO(P4.11): teach crash rescue to read the ring file after a crash. The records are
+// TODO: teach crash rescue to read the ring file after a crash. The records are
 // self-describing, but nothing reads them yet. `DiskRing::create` truncates an old ring, so
 // rescue-after-restart has to read the file before the engine creates the ring.
 
@@ -78,7 +78,7 @@ pub const STAGING_BYTES: usize = 32 << 20;
 pub const RING_FILE_NAME: &str = "zeroclip-dvr.ring";
 
 /// How long a finished GOP waits before it is written, so late audio (the Master mix trails real
-/// time, D30) lands in the same record as its video.
+/// time) lands in the same record as its video.
 const PERSIST_LAG: Hns = Hns::from_secs(1);
 
 /// How often the persister looks for a finished GOP.
@@ -566,7 +566,7 @@ pub struct Persister {
 
 impl Persister {
     /// Hands `ring` to `recorder` (clips read it, `clear` empties it) and starts the thread that
-    /// fills it. `pacer` limits the write rate on an HDD (P3.24).
+    /// fills it. `pacer` limits the write rate on an HDD.
     ///
     /// # Errors
     /// The OS refused to start the thread.

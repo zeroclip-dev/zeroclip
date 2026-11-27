@@ -1,5 +1,4 @@
-//! The output stack: where clips and recordings go, and how their bytes reach the disk
-//! (DESIGN §1 "Crash-survivable containers", §4 "Disk strategy").
+//! The output stack: where clips and recordings go, and how their bytes reach the disk.
 //!
 //! Each file is written through one stack, built and driven on an IO thread:
 //!
@@ -32,9 +31,9 @@ use crate::spool;
 pub(crate) struct OutputConfig {
     /// Folder that new files go in.
     pub(crate) dir: PathBuf,
-    /// Container to write. Only fragmented MP4 is written (D18).
+    /// Container to write. Only fragmented MP4 is written.
     pub(crate) format: ContainerFormat,
-    /// Bytes per buffered write (DESIGN §4: 8–16 MiB).
+    /// Bytes per buffered write.
     pub(crate) chunk_bytes: usize,
     /// Throttle for the writes. Unlimited unless the drive is a spinning disk.
     pub(crate) pacer: WritePacer,
@@ -44,7 +43,7 @@ impl OutputConfig {
     /// The output settings for a file in `dir`, on a drive of kind `drive`.
     ///
     /// The caller probes the drive kind. Pacing applies only to spinning disks, and only while
-    /// `pace_hdd_writes` is on (DESIGN §4).
+    /// `pace_hdd_writes` is on.
     pub(crate) fn from_settings(settings: &Settings, dir: PathBuf, drive: DriveKind) -> Self {
         let storage = &settings.storage;
         let pacer = if storage.pace_hdd_writes {
@@ -55,7 +54,7 @@ impl OutputConfig {
         let format = match settings.recording.container {
             ContainerFormat::Matroska => {
                 // Settings::problems flags such a file when it is saved. Writing MP4 beats failing.
-                warn!("Matroska isn't written; this file goes out as fragmented MP4 (D18)");
+                warn!("Matroska isn't written; this file goes out as fragmented MP4");
                 ContainerFormat::FragmentedMp4
             }
             format => format,
@@ -189,7 +188,7 @@ fn name_stamp(when: OffsetDateTime) -> io::Result<String> {
 /// When a file's bytes are synced to disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Durability {
-    /// Sync at every fragment, so a crash loses about one fragment (D18). Recordings.
+    /// Sync at every fragment, so a crash loses about one fragment. Recordings.
     PerFragment,
     /// Sync once, when the file is finished. DVR dumps.
     AtFinish,
@@ -232,7 +231,7 @@ pub(crate) fn write_clip(
 
 /// [`write_clip`] for a clip that isn't in RAM whole: `feed` is given the function that writes a
 /// packet, and calls it for every packet in order (a disk-mode clip reads its ring file as it
-/// goes, P4.21). Returns what `feed` returns.
+/// goes). Returns what `feed` returns.
 ///
 /// # Errors
 /// As for [`write_clip`], and whatever `feed` fails with. The container is not finished then.
