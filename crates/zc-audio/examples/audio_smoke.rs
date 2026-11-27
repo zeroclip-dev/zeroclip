@@ -2,7 +2,7 @@
 //! `cargo run -p zc-audio --example audio_smoke --release -- [secs=5] [game pid]`
 //!
 //! Runs the mic (always on) and, given a pid, process-loopback game audio, and the Master mix
-//! of both (D30); logs how many AAC packets each track produced and their timestamp span. Saves
+//! of both; logs how many AAC packets each track produced and their timestamp span. Saves
 //! nothing.
 
 use std::sync::{Arc, Mutex};
@@ -42,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sink = Arc::new(Count::default());
     let health = Arc::new(|_| {});
 
-    // The mic is input 0 of the Master mix, the game input 1; Master starts after both (D30).
+    // The mic is input 0 of the Master mix, the game input 1; Master starts after both.
     let bus = Arc::new(Mutex::new(MixBus::new(2, 2)));
     let mut mic = zc_audio::MicSource::new(true, true, None)
         .with_mix(Some(MixInput::new(Arc::clone(&bus), 0)));

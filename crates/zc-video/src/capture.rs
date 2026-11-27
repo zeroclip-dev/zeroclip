@@ -299,7 +299,7 @@ fn min_update_ticks(fps: u32) -> i64 {
 ///   on every display refresh (up to 200 times a second).
 /// - When the content size changes, the pool is recreated (Microsoft's documented
 ///   pattern); the converter letterboxes the new size into the fixed encode size.
-/// - Protected content: WGC keeps delivering frames (D23). Errors that do say
+/// - Protected content: WGC keeps delivering frames. Errors that do say
 ///   "access denied" become [`SourceError::Protected`], and `GpuVideoSource`
 ///   retries with backoff.
 /// - The item can close under us: a monitor switched off or re-assigned (e.g.

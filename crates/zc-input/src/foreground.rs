@@ -1,4 +1,4 @@
-//! Foreground-window tracking for the profile engine (DESIGN §7).
+//! Foreground-window tracking for the profile engine.
 
 use std::cell::RefCell;
 
@@ -41,7 +41,7 @@ fn report(hwnd: HWND) {
     }
 }
 
-/// Whether the window covers its whole monitor: fullscreen, or borderless on it (D35). A
+/// Whether the window covers its whole monitor: fullscreen, or borderless on it. A
 /// maximised window doesn't count, even when it overshoots the monitor by its frame (no taskbar
 /// on that monitor, or an auto-hide taskbar): it is checked with
 /// [IsZoomed](https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-iszoomed) first.

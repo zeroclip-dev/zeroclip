@@ -1,4 +1,4 @@
-//! YouTube with bring-your-own credentials (DESIGN §10, "Destination 2").
+//! YouTube with bring-your-own credentials.
 //!
 //! Two API constraints shape this:
 //!

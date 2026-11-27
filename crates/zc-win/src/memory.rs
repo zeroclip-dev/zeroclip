@@ -1,4 +1,4 @@
-//! Page-locking the DVR buffer (DESIGN §4).
+//! Page-locking the DVR buffer.
 //!
 //! The DVR rings are large and mostly cold, so Windows may page them out when memory runs short.
 //! A dump would then fault them back in from the pagefile at the moment the user wants the clip.
@@ -78,7 +78,7 @@ pub fn lock(region: &[u8]) -> Result<PageLock, SourceError> {
 }
 
 /// This machine's physical RAM in MiB, or `None` if Windows doesn't say. The engine caps the DVR's
-/// RAM ceiling at a share of it (D32).
+/// RAM ceiling at a share of it.
 ///
 /// Reads `ullTotalPhys` from
 /// [`GlobalMemoryStatusEx`](https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-globalmemorystatusex).

@@ -1,4 +1,4 @@
-//! Chunked writes (DESIGN §4, "Chunked writes").
+//! Chunked writes.
 //!
 //! Buffer in RAM and hand the file system 8–16 MB at a time instead of one frame
 //! at a time: far fewer head repositions on an HDD, and fewer syscalls everywhere.

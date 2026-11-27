@@ -1,4 +1,4 @@
-//! How encoded packets flow from sources to consumers (DESIGN §5).
+//! How encoded packets flow from sources to consumers.
 //!
 //! ```text
 //!  GPU video pipeline ─┐
@@ -53,7 +53,7 @@ pub enum SinkError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SinkId(u32);
 
-/// Fan-out: delivers every packet to all attached writers (DESIGN §5, "one encode, two sinks").
+/// Fan-out: delivers every packet to all attached writers.
 ///
 /// Running DVR and session recording at the same time is expected for cs2-style
 /// profiles, so the tee exists from the start instead of being retrofitted.

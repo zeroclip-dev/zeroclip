@@ -4,23 +4,23 @@
 //! and tests on any OS in seconds. The Windows adapter crates (`zc-video`,
 //! `zc-audio`, `zc-input`) and the engine (`zc-engine`) are built on top of it.
 //!
-//! | Module | What it owns | Design doc |
-//! |---|---|---|
-//! | [`time`] | [`Hns`] (100 ns ticks), the [`FramePacer`](time::FramePacer) and the [`MasterClock`](time::MasterClock) | §3, §6 |
-//! | [`media`] | codecs and the capability ladder, tracks, encoded packets | §3 |
-//! | [`mix`] | the Master mix: one sample timeline with a ring per source, mixed 200 ms behind | §6 |
-//! | [`sink`] | how packets flow: [`PacketSink`](sink::PacketSink), [`Tee`](sink::Tee) | §5 |
-//! | [`dvr`] | the GOP-aware retrospective ring buffer | §4, §6 |
-//! | [`ring`] | allocation-free packet FIFO in one byte ring, for the DVR buffer and the recording spool | §4, §5 |
-//! | [`watchdog`] | the encoder watchdog state machine | §8 |
-//! | [`profile`] | per-game profiles and RAM clamping | §7 |
-//! | [`focus_prompt`] | what a focus change means while a game is tracked (D35) | §7 |
-//! | [`hotkey`] | keys, chords and the chord matcher | §8 |
-//! | [`backoff`] | retry schedule for HDCP-protected content | §3 |
-//! | [`dsp`] | the mic dynamics compressor | §6 |
-//! | [`ports`] | the traits Windows adapters implement | — |
-//! | [`control`] | commands to, and events from, the engine | — |
-//! | [`settings`] | user settings (serde) | — |
+//! | Module | What it owns |
+//! |---|---|
+//! | [`time`] | [`Hns`] (100 ns ticks), the [`FramePacer`](time::FramePacer) and the [`MasterClock`](time::MasterClock) |
+//! | [`media`] | codecs and the capability ladder, tracks, encoded packets |
+//! | [`mix`] | the Master mix: one sample timeline with a ring per source, mixed 200 ms behind |
+//! | [`sink`] | how packets flow: [`PacketSink`](sink::PacketSink), [`Tee`](sink::Tee) |
+//! | [`dvr`] | the GOP-aware retrospective ring buffer |
+//! | [`ring`] | allocation-free packet FIFO in one byte ring, for the DVR buffer and the recording spool |
+//! | [`watchdog`] | the encoder watchdog state machine |
+//! | [`profile`] | per-game profiles and RAM clamping |
+//! | [`focus_prompt`] | what a focus change means while a game is tracked |
+//! | [`hotkey`] | keys, chords and the chord matcher |
+//! | [`backoff`] | retry schedule for HDCP-protected content |
+//! | [`dsp`] | the mic dynamics compressor |
+//! | [`ports`] | the traits Windows adapters implement |
+//! | [`control`] | commands to, and events from, the engine |
+//! | [`settings`] | user settings (serde) |
 //!
 //! Behaviour that is designed but not built yet is pinned down by tests marked
 //! `#[ignore = "spec: …"]`. Run `cargo test -p zc-core -- --ignored` to see what is

@@ -1,5 +1,5 @@
 //! Turning pieces of the timeline into files with ffmpeg. Runs on a background thread. Video is
-//! stream-copied; only a piece with an audio edit has that track re-encoded (D38).
+//! stream-copied; only a piece with an audio edit has that track re-encoded.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -238,7 +238,7 @@ fn build(
             ffmpeg.concat(&paths, output)?;
         }
     }
-    // Opening the output proves it is a real file before we report success (DESIGN §9).
+    // Opening the output proves it is a real file before we report success.
     ffmpeg.probe(output).map(drop)?;
     Ok(())
 }

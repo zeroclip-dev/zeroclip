@@ -1,4 +1,4 @@
-//! The retrospective DVR buffer: "save the last N minutes" (DESIGN §4, §5, §6).
+//! The retrospective DVR buffer: "save the last N minutes".
 //!
 //! # Rules this buffer must follow
 //!
@@ -16,7 +16,7 @@
 //!    from the newest GOP until the requested window is covered, then starts at
 //!    that GOP's IDR.
 //!
-//! The buffer lives in system RAM, never VRAM (DESIGN §4, "Why RAM, not VRAM"), and
+//! The buffer lives in system RAM, never VRAM, and
 //! the engine page-locks it (`VirtualLock`) after allocation. Size it with
 //! [`DvrConfig::for_window`] against the *maximum* bitrate.
 
@@ -41,7 +41,7 @@ impl DvrConfig {
 
     /// Sizes the buffer to hold `window` of footage at the worst-case bitrates.
     ///
-    /// The ring must fit the *maximum* VBR bitrate (DESIGN §4): 20 Mbps is 2.5 MB/s,
+    /// The ring must fit the *maximum* VBR bitrate: 20 Mbps is 2.5 MB/s,
     /// so one minute needs ~150 MB. The headroom (a keyframe interval and 1 s) lets
     /// a full window survive whole-GOP eviction.
     #[must_use]
@@ -70,7 +70,7 @@ impl DvrConfig {
         Self { video_bytes: bytes(max_video_bitrate_bps), audio_bytes: bytes(audio_bitrate_bps) }
     }
 
-    /// Size of the ring file in disk mode (P4.21): the video ring plus every audio slot, as a
+    /// Size of the ring file in disk mode: the video ring plus every audio slot, as a
     /// record holds a GOP's video and the audio that goes with it. The slack covers record headers.
     #[must_use]
     pub fn ring_file_bytes(&self) -> u64 {
@@ -148,7 +148,7 @@ pub enum DvrError {
     /// The buffer was cleared or resized while a snapshot was being copied.
     #[error("the buffer changed while saving; try again")]
     Changed,
-    /// The ring file (disk mode, P4.21) couldn't be read.
+    /// The ring file (disk mode) couldn't be read.
     #[error("the DVR ring file couldn't be read: {0}")]
     Disk(String),
 }
@@ -263,7 +263,7 @@ impl DvrBuffer {
         self.rings[track.index()].used()
     }
 
-    /// The bytes reserved for `track`, for page-locking (DESIGN §4). The address stays put until
+    /// The bytes reserved for `track`, for page-locking. The address stays put until
     /// [`resize`](Self::resize) frees the rings, so release any page lock on them first.
     #[must_use]
     pub fn memory(&self, track: TrackId) -> &[u8] {
@@ -276,7 +276,7 @@ impl DvrBuffer {
     /// If less than `window` is buffered, returns everything.
     ///
     /// This is [`plan_snapshot`](Self::plan_snapshot) and a [`SnapshotCopy`] run in one go,
-    /// so the whole copy happens here. The engine copies in short holds instead (D29).
+    /// so the whole copy happens here. The engine copies in short holds instead.
     ///
     /// # Errors
     /// [`DvrError::Empty`] if there's no video yet.
@@ -301,7 +301,7 @@ impl DvrBuffer {
 
     /// [`plan_snapshot`](Self::plan_snapshot) for a clip that ends at `end` instead of at the
     /// newest frame. Every track is cut at `end`, and the window is counted back from it. A
-    /// save uses this, so the clip ends where the press was, and the Master mix (D30) has time
+    /// save uses this, so the clip ends where the press was, and the Master mix has time
     /// to catch up to that point before the copy.
     ///
     /// # Errors
@@ -368,7 +368,7 @@ impl DvrBuffer {
         CopyOutcome::Copied
     }
 
-    /// Changes capacity when a game profile asks for a different window (DESIGN §7).
+    /// Changes capacity when a game profile asks for a different window.
     /// Growing keeps everything; shrinking evicts the oldest GOPs first. The engine
     /// pauses the writer around this call, so it may allocate.
     ///
@@ -396,7 +396,7 @@ impl DvrBuffer {
     }
 
     /// Drops everything. The next stored packet must again be a keyframe.
-    /// Used after a watchdog re-init (DESIGN §8: "buffer restarts from empty").
+    /// Used after a watchdog re-init.
     pub fn clear(&mut self) {
         for ring in &mut self.rings {
             ring.clear();
@@ -555,7 +555,7 @@ enum CopyOutcome {
     Stale,
 }
 
-/// A snapshot copy spread over several short lock holds (D29).
+/// A snapshot copy spread over several short lock holds.
 ///
 /// Plan under the lock with [`DvrBuffer::plan_snapshot`], then call [`copy_chunk`](Self::copy_chunk)
 /// once per hold, releasing the lock between calls. Pushes may happen in between. The writer
@@ -690,7 +690,7 @@ mod tests {
     #[test]
     fn dvr_config_sizes_for_the_worst_case_bitrate() {
         let cfg = DvrConfig::for_window(Hns::from_secs(60), 20_000_000, 192_000);
-        // 20 Mbps = 2.5 MB/s → 150 MB for one minute (DESIGN §4 table), plus ≤ 2 s headroom.
+        // 20 Mbps = 2.5 MB/s → 150 MB for one minute, plus ≤ 2 s headroom.
         assert!((150_000_000..=155_000_000).contains(&cfg.video_bytes), "{cfg:?}");
         // 192 kbps = 24 KB/s → 1.44 MB per track, plus ≤ 2 s headroom.
         assert!((1_440_000..=1_488_000).contains(&cfg.audio_bytes), "{cfg:?}");

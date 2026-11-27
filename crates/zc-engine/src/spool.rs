@@ -1,5 +1,4 @@
-//! The recording spool: a hand-off from the hot path to the IO thread (CONTRIBUTING.md rule 2,
-//! DESIGN §5).
+//! The recording spool: a hand-off from the hot path to the IO thread (CONTRIBUTING.md rule 2).
 //!
 //! A recording's [`PacketWriter`] runs under the recorder's lock, on the encoder and
 //! audio threads, so it may not touch the disk or allocate. [`SpoolWriter`] therefore
@@ -156,7 +155,7 @@ pub fn spool_with_capacity(bytes: usize) -> (SpoolWriter, SpoolReader) {
 ///
 /// `partial` must end in `.partial` (for example `clip.mp4.partial`). The final name
 /// drops that suffix. If anything fails, the `.partial` file is left in place for the
-/// startup repair (P3.22a).
+/// startup repair.
 ///
 /// The rename replaces whatever is at the final name (`std::fs::rename` does on Windows),
 /// so `drain` refuses to rename over a file that has data in it. `output::create_recording`

@@ -5,7 +5,7 @@
 //! The "flight recorder" ([`FlightRecorder`]) is an in-memory ring of the last few
 //! thousand events (watchdog transitions, encoder results, profile changes) dumped
 //! next to crash-rescue files and on panic: capture bugs are often unreproducible,
-//! and "it stuttered once last Tuesday" is unfixable without a trace (DESIGN §12).
+//! and "it stuttered once last Tuesday" is unfixable without a trace.
 //!
 //! The ring allocates a `String` per event, so hot-path threads (capture, encode,
 //! audio) must log only at `trace`, which the default filter drops.

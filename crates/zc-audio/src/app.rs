@@ -1,4 +1,4 @@
-//! Per-app audio (D26): one app's process tree on its own track, via WASAPI process loopback.
+//! Per-app audio: one app's process tree on its own track, via WASAPI process loopback.
 //!
 //! The Windows calls are in `loopback`: `loopback::activate` asks for process loopback
 //! with [`ActivateAudioInterfaceAsync`](https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/nf-mmdeviceapi-activateaudiointerfaceasync),
@@ -97,7 +97,7 @@ impl Drop for PidWatcher {
 /// isn't running.
 type PidResolver = Box<dyn Fn(&str) -> Option<u32> + Send + 'static>;
 
-/// Per-app audio (D26): the process tree of one app (for example `Discord.exe`), captured with
+/// Per-app audio: the process tree of one app (for example `Discord.exe`), captured with
 /// WASAPI process loopback in include mode onto its own track. The track has no holes: while
 /// the app isn't running, the thread writes silence, as the game track does.
 ///
@@ -110,7 +110,7 @@ pub struct AppAudioSource {
     /// Maps the exe name to the root pid of its process tree, or `None` if it isn't running.
     /// Behind a mutex so the capture thread can call it and `start` can run again after `stop`.
     resolve: Arc<Mutex<PidResolver>>,
-    /// This source's input in the Master mix (D30), if it has one.
+    /// This source's input in the Master mix, if it has one.
     mix: Option<MixInput>,
     worker: Option<Worker>,
     /// When the app was last audible (clock ticks), or `i64::MIN` for never.

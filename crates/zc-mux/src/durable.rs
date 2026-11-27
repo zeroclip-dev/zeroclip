@@ -1,4 +1,4 @@
-//! Files that survive a power cut (D18, DESIGN §1 "Crash-survivable containers").
+//! Files that survive a power cut.
 //!
 //! [`File::flush`] does nothing. Written bytes sit in the Windows file cache until Windows
 //! decides to write them, so a power cut loses them. [`File::sync_data`] calls

@@ -1,4 +1,4 @@
-//! The Profiles screen (DESIGN §7): how much footage to keep, and whether to record the whole
+//! The Profiles screen: how much footage to keep, and whether to record the whole
 //! session, per game. Edits go to `app.draft`; the save bar at the bottom writes them.
 
 use std::cell::Cell;

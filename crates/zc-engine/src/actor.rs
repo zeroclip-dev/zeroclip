@@ -45,21 +45,21 @@ pub struct Ports {
     pub game_audio: Option<Box<dyn AudioSource>>,
     /// Microphone (`zc-audio`, Phase 2).
     pub mic: Option<Box<dyn AudioSource>>,
-    /// Per-app audio tracks (`zc-audio`, D26), one per enabled `AppTrack` in settings order, each
+    /// Per-app audio tracks (`zc-audio`), one per enabled `AppTrack` in settings order, each
     /// with the label its container track gets. They start after the mic and before Master.
     pub app_audio: Vec<(String, Box<dyn AudioSource>)>,
-    /// The Master mix, track 1 (`zc-audio`, D30). Starts after the sources above, and only if
+    /// The Master mix, track 1 (`zc-audio`). Starts after the sources above, and only if
     /// one of them started.
     pub master_audio: Option<Box<dyn AudioSource>>,
     /// Raw Input hotkeys + foreground tracking (`zc-input`, Phase 2).
     pub input: Option<Box<dyn InputSource>>,
-    /// Drive-type probe for the output folder (`zc-win`, P3.23). Without it the drive is
+    /// Drive-type probe for the output folder (`zc-win`). Without it the drive is
     /// unknown, and DVR dumps are not paced.
     pub seek_penalty: Option<SeekPenalty>,
-    /// Pins the DVR rings in RAM (`zc-win`, P3.25). Without it the rings can be paged out.
+    /// Pins the DVR rings in RAM (`zc-win`). Without it the rings can be paged out.
     pub lock_memory: Option<LockMemory>,
-    /// Reports the machine's physical RAM (`zc-win`, P4.20). Without it the settings' RAM ceiling
-    /// stands unchanged (D32).
+    /// Reports the machine's physical RAM (`zc-win`). Without it the settings' RAM ceiling
+    /// stands unchanged.
     pub total_memory: Option<TotalMemory>,
 }
 
@@ -251,19 +251,19 @@ impl Drop for EngineHandle {
 const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How long a save waits before it copies the buffer, when the Master mix runs. The mix trails
-/// real time by 200 ms (D30). Waiting this long lets it reach the press, where the clip ends,
+/// real time by 200 ms. Waiting this long lets it reach the press, where the clip ends,
 /// and the extra 100 ms covers a late wake-up of the mixer thread.
 const MASTER_CATCH_UP: Duration = Duration::from_millis(300);
 
 /// State owned by the engine thread.
 struct Actor {
     settings: Settings,
-    /// The machine's physical RAM in MiB, if the port could read it (D32).
+    /// The machine's physical RAM in MiB, if the port could read it.
     total_mib: Option<u64>,
     /// Where the DVR buffer really lives this run. Starts as the setting; `start_ring` drops it to
     /// RAM if the ring file can't be made, and a change in settings applies at the next start.
     storage: DvrStorage,
-    /// The thread that writes finished GOPs to the ring file, in disk mode (P4.21).
+    /// The thread that writes finished GOPs to the ring file, in disk mode.
     persister: Option<Persister>,
     output_dir: PathBuf,
     /// The size the RAM buffer was last given, so a change of bitrate or of `enabled` resizes it
@@ -282,15 +282,15 @@ struct Actor {
     /// The recorder's counters at the last tick, so a rise is reported once.
     stats_seen: RecorderStats,
     /// Audio tracks that started: Master first when it runs, then the sources. The containers
-    /// take them (P3.19).
+    /// take them.
     audio_tracks: Vec<TrackInfo>,
     hotkeys: ChordMatcher<HotkeyAction>,
     /// Ignore matched hotkey actions while the UI is capturing a new hotkey binding.
     hotkeys_suspended: bool,
-    /// The one recording in progress, if any (D20).
+    /// The one recording in progress, if any.
     recording: Option<ActiveRecording>,
     /// The IO thread of the clip being snapshotted and written. One at a time, so a dump's copy
-    /// of the window never exists twice at once (D29). Joined at shutdown, so a clip the user
+    /// of the window never exists twice at once. Joined at shutdown, so a clip the user
     /// asked for is never cut short by quitting.
     saving: Option<thread::JoinHandle<()>>,
     /// What kind of drive the output folder is on, which sets the write pacing for dumps.
@@ -301,17 +301,17 @@ struct Actor {
     /// Whether the push-to-talk key is down, as the last `Command::PushToTalk` said.
     ptt_held: bool,
     /// The video track of the encoder that last started. Kept while capture is paused, so a clip
-    /// can still be cut from the buffer (D31).
+    /// can still be cut from the buffer.
     video_track: Option<TrackInfo>,
     /// The game whose buffer is held: its window and exe file name. Set when capture starts for a
-    /// profiled game, and kept while paused. Only used in Game mode (D31).
+    /// profiled game, and kept while paused. Only used in Game mode.
     game_capture: Option<GameCapture>,
-    /// The game whose profile is in effect (P4.6). Sticky: other apps don't change it, so the
+    /// The game whose profile is in effect. Sticky: other apps don't change it, so the
     /// buffer keeps the game's window while the user is elsewhere.
     tracked: Option<Tracked>,
     /// Whether the audio sources are running. Set by `start_audio`, cleared by `stop_capture`.
     audio_running: bool,
-    /// Decides the encoder recovery sequence (DESIGN §8). Created when the video source starts
+    /// Decides the encoder recovery sequence. Created when the video source starts
     /// and dropped when capture stops, so it is `Some` exactly while video is meant to run, also
     /// mid-recovery when the encoder itself is down.
     watchdog: Option<Watchdog>,
@@ -321,22 +321,22 @@ struct Actor {
     /// The clip being written is the watchdog's flush, so its end moves recovery on (`Flushed`).
     flushing: bool,
     /// The watchdog saw a slow disk: dumps are paced at the HDD rate whatever the drive probe
-    /// said (DESIGN §8: pace the writes, don't re-init).
+    /// said.
     pace_dumps: bool,
-    /// A crash rescue that found the dump slot busy (D29). It runs when that dump ends, before a
+    /// A crash rescue that found the dump slot busy. It runs when that dump ends, before a
     /// flush waiting there too, because the flush ends in RESUMING, which clears the buffer.
     rescue_waiting: Option<WaitingRescue>,
-    /// An app that is a candidate for a prompt and has focus, waiting out the debounce (D35). Its
+    /// An app that is a candidate for a prompt and has focus, waiting out the debounce. Its
     /// due time says when the prompt is emitted.
     focus_pending: Option<(Candidate, Instant)>,
     /// The candidate the user was asked about. Switch applies to it; it is dropped once focus
-    /// moves to another app (D35).
+    /// moves to another app.
     focus_prompt: Option<Candidate>,
-    /// (tracked, candidate) pairs already prompted this session, by lowercase file name (D35).
+    /// (tracked, candidate) pairs already prompted this session, by lowercase file name.
     prompted: HashSet<(String, String)>,
 }
 
-/// An app that could take over the tracked game (D35): what a switch needs.
+/// An app that could take over the tracked game: what a switch needs.
 #[derive(Clone, Debug)]
 struct Candidate {
     pid: u32,
@@ -346,7 +346,7 @@ struct Candidate {
 }
 
 /// A tracked game that died while another dump was being written: what its rescue needs once the
-/// slot is free (D34).
+/// slot is free.
 struct WaitingRescue {
     pid: u32,
     game: String,
@@ -358,7 +358,7 @@ struct WaitingRescue {
 enum Dump {
     /// A clip: the user's save, or the watchdog's flush (`Actor::flushing` tells them apart).
     Clip,
-    /// The tracked game died: its window, rescued to a `recovery-*.tmp` file (P4.11, D34).
+    /// The tracked game died: its window, rescued to a `recovery-*.tmp` file.
     Rescue { game: String, exit_code: u32 },
 }
 
@@ -372,7 +372,7 @@ struct GameCapture {
 struct Tracked {
     pid: u32,
     exe: String,
-    /// The tee slot of the session recording this game's profile started (P4.7). Kept so the
+    /// The tee slot of the session recording this game's profile started. Kept so the
     /// game's exit stops that recording, and not a manual one the user started after stopping it.
     session: Option<SinkId>,
     /// The profile wants a session but the recording slot was still finishing the previous
@@ -391,7 +391,7 @@ struct Focus<'a> {
     exe: &'a str,
 }
 
-/// What a foreground change does to capture in Game mode (D31).
+/// What a foreground change does to capture in Game mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureDecision {
     /// Capture this window. `clear_buffer` when the buffer holds a different game.
@@ -402,13 +402,13 @@ enum CaptureDecision {
     Keep,
 }
 
-/// Decides what a focus change does to capture (D31). `tracked` is the game with a profile in
+/// Decides what a focus change does to capture. `tracked` is the game with a profile in
 /// effect, if any, and `kept` is the game whose buffer is held (window, exe file name), and
 /// `capturing` says whether its window is being captured now.
 ///
 /// In Screen mode nothing changes. In Game mode, a profiled game starts capture (or moves it to
 /// its new window), and any other app pauses it. While a game is tracked, another profiled game
-/// doesn't move capture: it is a candidate for a prompt (D35), so it pauses like any other app.
+/// doesn't move capture: it is a candidate for a prompt, so it pauses like any other app.
 /// ZeroClip's own windows and the shell are ignored, so opening ZeroClip or the Start menu
 /// mid-game doesn't pause capture.
 fn capture_decision(
@@ -514,9 +514,9 @@ fn bindings(settings: &Settings) -> Vec<Binding<HotkeyAction>> {
 }
 
 /// Sizes the DVR for these settings, and says how the RAM ceiling clamped the window the
-/// profile asks for (DESIGN §7). With the DVR off, both rings are zero bytes, which
+/// profile asks for. With the DVR off, both rings are zero bytes, which
 /// `DvrBuffer` treats as off. In disk mode the buffer is only the staging area, and the window
-/// isn't limited by RAM (D32, P4.21).
+/// isn't limited by RAM.
 fn dvr_config(settings: &Settings, total_mib: Option<u64>) -> (DvrConfig, WindowClamp) {
     let disk = settings.dvr.storage == DvrStorage::Disk;
     let ceiling = if disk {
@@ -559,7 +559,7 @@ fn clamp_for(settings: &Settings, profile: &GameProfile, ram_ceiling_mib: u32) -
 }
 
 /// The container track for an audio source that has started. `codec_private` stays
-/// empty: the muxer builds the AAC config from the rate and channel count (P3.19).
+/// empty: the muxer builds the AAC config from the rate and channel count.
 fn audio_track(track: TrackId, label: &str, config: &AudioStart) -> TrackInfo {
     TrackInfo {
         track,
@@ -599,12 +599,12 @@ fn file_stamp(t: OffsetDateTime) -> String {
     t.format(format).unwrap_or_else(|_| t.unix_timestamp().to_string())
 }
 
-/// How many times a save starts over when the ring file is overwritten under it (P4.21).
+/// How many times a save starts over when the ring file is overwritten under it.
 const RING_RETRIES: u32 = 2;
 
 /// Copies the DVR window that ends at `end` and writes it to a new clip file. Runs on the clip's
 /// IO thread, so the copy's short lock holds, the ring reads and the paced disk write all stay
-/// off the actor (D29).
+/// off the actor.
 fn save_clip_file(
     recorder: &Recorder,
     window: Hns,
@@ -624,7 +624,7 @@ fn save_clip_file(
     write_copied(copied, create, tracks, cfg)
 }
 
-/// Writes a crash rescue that was already copied out of the DVR to `path`, a new file (P4.11).
+/// Writes a crash rescue that was already copied out of the DVR to `path`, a new file.
 /// Runs on the clip's IO thread. `create_new` means an unanswered rescue is never overwritten.
 fn save_rescue_file(
     copied: Copied,
@@ -732,7 +732,7 @@ impl Actor {
             if self.focus_pending.as_ref().is_some_and(|(_, due)| now >= *due) {
                 self.on_focus_settled();
             }
-            // Wake for the next tick, or for a candidate's debounce if that comes first (D35).
+            // Wake for the next tick, or for a candidate's debounce if that comes first.
             let wake =
                 self.focus_pending.as_ref().map_or(next_tick, |(_, due)| next_tick.min(*due));
             let msg = match rx.recv_timeout(wake.saturating_duration_since(now)) {
@@ -760,7 +760,7 @@ impl Actor {
 
     /// At shutdown, waits for the dump being written, then writes a crash rescue that was waiting
     /// for it. Quitting right after Alt+F10 must not cut the clip short, and quitting right after a
-    /// game crash must not lose the rescue: its file stays for the next start's scan (P4.12).
+    /// game crash must not lose the rescue: its file stays for the next start's scan.
     fn finish_dumps(&mut self) {
         loop {
             if let Some(thread) = self.saving.take() {
@@ -782,7 +782,7 @@ impl Actor {
     }
 
     /// Makes `profile` the one in effect: the DVR window is the profile's, limited by the RAM
-    /// ceiling. A window that changed resizes the buffer (D21). `announce` says a game took focus,
+    /// ceiling. A window that changed resizes the buffer. `announce` says a game took focus,
     /// so the UI hears about it. A settings change re-applies quietly. The status keeps the active
     /// window, so there is only one copy of it to go stale.
     fn apply_profile(&mut self, profile: &GameProfile, exe: &str, announce: bool) {
@@ -861,12 +861,12 @@ impl Actor {
         self.apply_profile(&profile, "", false);
     }
 
-    /// Handles a focus change for profiles (P4.6). A profiled game becomes the tracked game when
+    /// Handles a focus change for profiles. A profiled game becomes the tracked game when
     /// nothing is tracked: its profile applies, and its process gets the input watch and the game
-    /// audio. Any other app keeps the current profile (sticky, D33), so alt-tabbing to Discord or
+    /// audio. Any other app keeps the current profile (sticky), so alt-tabbing to Discord or
     /// opening Task Manager can't shrink the buffer before a crash rescue. Such an app is listed
     /// as a recent game instead. A second game, or a fullscreen app without a profile, is a
-    /// candidate: after the debounce the user is asked (D35), and nothing moves until they answer.
+    /// candidate: after the debounce the user is asked, and nothing moves until they answer.
     ///
     /// Returns whether this focus started tracking a game, so the caller can start its session
     /// recording once capture is running.
@@ -901,9 +901,9 @@ impl Actor {
         }
     }
 
-    /// Makes the app behind `pid` the tracked game (D33): its process gets the input watch and
+    /// Makes the app behind `pid` the tracked game: its process gets the input watch and
     /// the game audio, and its profile (the default for an app without one) applies. Used for a
-    /// profiled game when nothing is tracked, and for a switch the user picked (D35).
+    /// profiled game when nothing is tracked, and for a switch the user picked.
     fn track_game(&mut self, pid: u32, exe: &str) {
         let name = exe_name(exe);
         let profile = self.settings.profiles.resolve(exe).clone();
@@ -924,8 +924,8 @@ impl Actor {
     }
 
     /// A focus change to `exe` ends a candidate's wait and its prompt, unless `exe` is that
-    /// candidate (D35). The tracked game is unchanged either way. The shell never ends them: a
-    /// fullscreen player reaches ZeroClip through the taskbar or alt-tab (D35).
+    /// candidate. The tracked game is unchanged either way. The shell never ends them: a
+    /// fullscreen player reaches ZeroClip through the taskbar or alt-tab.
     fn settle_candidates(&mut self, exe: &str) {
         if is_shell(exe) {
             return;
@@ -940,7 +940,7 @@ impl Actor {
         }
     }
 
-    /// The candidate kept focus for the debounce (D35): ask the user, once per pair per session.
+    /// The candidate kept focus for the debounce: ask the user, once per pair per session.
     fn on_focus_settled(&mut self) {
         let Some((candidate, _)) = self.focus_pending.take() else { return };
         let Some(current) = self.tracked.as_ref().map(|t| t.exe.clone()) else { return };
@@ -949,8 +949,8 @@ impl Actor {
         self.focus_prompt = Some(candidate);
     }
 
-    /// The user's answer to the focus prompt (D35). Switch tracks the candidate as a profiled
-    /// focus would (D33), and starts its capture. Keep, or a prompt that already went away, does
+    /// The user's answer to the focus prompt. Switch tracks the candidate as a profiled
+    /// focus would, and starts its capture. Keep, or a prompt that already went away, does
     /// nothing to the tracked game.
     fn on_focus_choice(&mut self, choice: FocusChoice) {
         let Some(candidate) = self.focus_prompt.take() else { return };
@@ -966,8 +966,7 @@ impl Actor {
         self.publish_status();
     }
 
-    /// Starts the tracked game's session recording when its profile asks for one (P4.7, formerly
-    /// P3.26). It takes the one recording slot (D20), so it gets the same `.partial` + repair
+    /// Starts the tracked game's session recording when its profile asks for one. It takes the one recording slot, so it gets the same `.partial` + repair
     /// robustness as a manual recording, and the DVR keeps buffering alongside it. A recording
     /// already running is left alone: the user started it, so it isn't ours to replace.
     fn start_session(&mut self) {
@@ -1006,8 +1005,8 @@ impl Actor {
         }
     }
 
-    /// A watched process ended (P4.7). Only the tracked game's exit matters: an unexpected exit
-    /// rescues the buffer first (P4.11), then its session recording stops, game audio lets go of
+    /// A watched process ended. Only the tracked game's exit matters: an unexpected exit
+    /// rescues the buffer first, then its session recording stops, game audio lets go of
     /// its process, and the default profile applies again. Any other pid is a game tracked
     /// earlier, whose profile has already been replaced.
     fn on_process_exited(&mut self, pid: u32, exit_code: u32) {
@@ -1020,9 +1019,9 @@ impl Actor {
         tracing::info!(pid, exit_code, "the tracked game exited");
         // 0 is a clean quit. Task Manager's End task (Details tab) and `taskkill` report 1, and a
         // crash reports its NTSTATUS, such as 0xC0000005 for an access violation. So anything but
-        // 0 is unexpected (D34).
+        // 0 is unexpected.
         if exit_code != 0 {
-            // One dump at a time (D29). The game stays tracked while the rescue waits, so its
+            // One dump at a time. The game stays tracked while the rescue waits, so its
             // profile keeps the buffer at the game's window; `on_clip_written` comes back for it.
             if self.saving.is_some() {
                 tracing::info!(pid, "crash rescue waits for the dump being written");
@@ -1039,7 +1038,7 @@ impl Actor {
     /// Runs a rescue that waited for the dump slot, then lets go of its game, unless another
     /// profiled game took over while it waited. That game's focus already replaced the tracking,
     /// and its buffer is what the rescue gets. A different game's focus skips the Game-mode clear
-    /// (D31) while a rescue waits, so the dead game's footage is still there.
+    /// while a rescue waits, so the dead game's footage is still there.
     fn run_waiting_rescue(&mut self, waiting: WaitingRescue) {
         self.rescue(&waiting.game, waiting.exit_code);
         if self.tracked.as_ref().is_some_and(|tracked| tracked.pid == waiting.pid) {
@@ -1047,14 +1046,14 @@ impl Actor {
         }
     }
 
-    /// Crash rescue (P4.11, D34): copies the game's window out of the DVR and starts the clip IO
+    /// Crash rescue: copies the game's window out of the DVR and starts the clip IO
     /// thread writing it to `recovery-<unix_ms>.<ext>.tmp` in the output folder. The file stays
     /// there so Keep is a same-volume rename, and `.tmp` keeps it out of the Clips list until the
-    /// user answers (P4.12). `RecoveryReady` goes out once the file is on disk.
+    /// user answers. `RecoveryReady` goes out once the file is on disk.
     ///
-    /// The copy runs here, not on the IO thread as a save's does (D29): the caller reverts to the
+    /// The copy runs here, not on the IO thread as a save's does: the caller reverts to the
     /// default profile right after, and a resize under a copy in progress would fail it
-    /// (`DvrError::Changed`). It is a few short lock holds (D29), once per crash. The caller
+    /// (`DvrError::Changed`). It is a few short lock holds, once per crash. The caller
     /// checks the dump slot is free, so this is the only copy of the window.
     ///
     /// In disk mode only the staged part is copied here (at most the staging area). The older
@@ -1116,7 +1115,7 @@ impl Actor {
             self.stop_capture();
         }
         self.tracked = None;
-        // A prompt about the game that just exited has nothing left to switch away from (D35).
+        // A prompt about the game that just exited has nothing left to switch away from.
         self.focus_pending = None;
         self.focus_prompt = None;
         self.status.game = None;
@@ -1135,7 +1134,7 @@ impl Actor {
     }
 
     /// Asks the drive probe whether the output folder is on a spinning disk, which sets the
-    /// pacing for DVR dumps (P3.24, DESIGN §4). Runs on the engine thread: it makes a few quick
+    /// pacing for DVR dumps. Runs on the engine thread: it makes a few quick
     /// device calls, at startup and when the output folder changes. An unknown or failed answer
     /// leaves the writes unpaced.
     fn detect_drive(&mut self) {
@@ -1164,7 +1163,7 @@ impl Actor {
         }
     }
 
-    /// Disk mode (P4.21): creates the ring file and starts the thread that fills it. If the file
+    /// Disk mode: creates the ring file and starts the thread that fills it. If the file
     /// can't be created or sized (disk full, no permission), says so and keeps the buffer in RAM
     /// for this run: `apply_profile` then sizes the RAM buffer as it always does.
     fn start_ring(&mut self) {
@@ -1207,7 +1206,7 @@ impl Actor {
         }
     }
 
-    /// Ring writes are paced like dumps on a spinning disk (P3.24). The ring may sit on another
+    /// Ring writes are paced like dumps on a spinning disk. The ring may sit on another
     /// drive than the clips, so it asks the probe about its own folder.
     fn ring_pacer(&self, dir: &Path) -> WritePacer {
         let storage = &self.settings.storage;
@@ -1220,12 +1219,12 @@ impl Actor {
     }
 
     /// Pins the DVR rings of the tracks that have a source: video, and each audio source this run
-    /// was built with (P3.25, DESIGN §4). The other audio slots stay unpinned (pitfall 26). Runs
+    /// was built with. The other audio slots stay unpinned (pitfall 26). Runs
     /// once, before the sources start; a video restart keeps the same rings, so their pins stay.
     /// A ring that can't be pinned is reported once, and recording goes on unpinned.
     fn page_lock_dvr(&mut self) {
         let Some(lock) = self.ports.lock_memory else { return };
-        // Disk mode keeps almost nothing in RAM, so there is nothing worth pinning (P4.21).
+        // Disk mode keeps almost nothing in RAM, so there is nothing worth pinning.
         if !self.settings.dvr.enabled || self.storage == DvrStorage::Disk {
             return;
         }
@@ -1290,7 +1289,7 @@ impl Actor {
     }
 
     fn start_sources(&mut self) {
-        // Game mode starts nothing here: capture begins when a profiled game takes focus (D31).
+        // Game mode starts nothing here: capture begins when a profiled game takes focus.
         if let Some(target) = self.capture_target() {
             self.start_capture(target);
         }
@@ -1306,7 +1305,7 @@ impl Actor {
     }
 
     /// The audio tracks: 48 kHz stereo AAC at the configured bitrate. The sources start first,
-    /// then the Master mix, which runs only if one of them did (D30). Master leads
+    /// then the Master mix, which runs only if one of them did. Master leads
     /// `audio_tracks`, so it is the first audio track: browsers and Discord play only that one.
     fn start_audio(&mut self) {
         let config = AudioStart {
@@ -1343,7 +1342,7 @@ impl Actor {
             }
         }
         // Only when a source runs, so Master is never a track of silence alone. It starts after
-        // them, so its mix point is set before any source writes (D30).
+        // them, so its mix point is set before any source writes.
         if !tracks.is_empty()
             && let Some(master) = self.ports.master_audio.as_mut()
         {
@@ -1454,7 +1453,7 @@ impl Actor {
         }
     }
 
-    /// Starts, pauses or keeps capture for the window that took focus (D31).
+    /// Starts, pauses or keeps capture for the window that took focus.
     fn on_capture_focus(&mut self, focus: Focus<'_>) {
         let kept = self.game_capture.as_ref().map(|game| (game.hwnd, game.exe.as_str()));
         // `status.capturing` is false mid-recovery, but the capture session is still alive.
@@ -1505,7 +1504,7 @@ impl Actor {
     }
 
     /// Stops the video and audio sources and keeps the DVR buffer. The input thread keeps running,
-    /// so the hotkeys work and the next game focus can start capture again (D31).
+    /// so the hotkeys work and the next game focus can start capture again.
     fn stop_capture(&mut self) {
         let Ports { video, game_audio, mic, app_audio, master_audio, .. } = &mut self.ports;
         // Master last: it still mixes what the sources wrote before they stopped.
@@ -1646,7 +1645,7 @@ impl Actor {
         }
     }
 
-    /// Starts a manual recording, or stops it. One recording at a time (D20).
+    /// Starts a manual recording, or stops it. One recording at a time.
     fn toggle_recording(&mut self) {
         match &self.recording {
             None => self.start_recording("recording"),
@@ -1669,7 +1668,7 @@ impl Actor {
     }
 
     /// Starts a recording into a new file in the output folder. Packets reach it through the
-    /// spool, which an IO thread drains into the file (P3.21). The DVR keeps buffering.
+    /// spool, which an IO thread drains into the file. The DVR keeps buffering.
     fn start_recording(&mut self, label: &str) {
         let Some(video) = self.ports.video.as_ref().and_then(|video| video.format()) else {
             self.emit(EngineEvent::Warning("Nothing to record yet.".into()));
@@ -1779,7 +1778,7 @@ impl Actor {
 
     /// Saves the DVR's last `buffer_window` to a new clip file. The actor only checks the state
     /// and starts the IO thread. The snapshot and the disk write happen there, and the result
-    /// comes back as `Msg::ClipWritten` (D19, D29).
+    /// comes back as `Msg::ClipWritten`.
     fn save_clip(&mut self) {
         if !self.settings.dvr.enabled {
             self.emit(EngineEvent::Warning("The DVR buffer is off (Settings, DVR buffer).".into()));
@@ -1791,7 +1790,7 @@ impl Actor {
             self.emit(EngineEvent::Warning("Still saving the previous clip.".into()));
             return;
         }
-        // The buffer outlives a pause (D31), so the track comes from the last encoder, not the
+        // The buffer outlives a pause, so the track comes from the last encoder, not the
         // running one.
         let Some(video) = self.video_track.clone() else {
             self.emit(EngineEvent::Warning("Nothing to save yet: capture hasn't started.".into()));
@@ -1806,7 +1805,7 @@ impl Actor {
     /// not, the error has been reported.
     fn spawn_clip(&mut self, label: &'static str, window: Hns, video: TrackInfo) -> bool {
         let (tracks, cfg) = self.dump_output(video, Some(window));
-        // The clip ends at the press. The Master mix trails real time (D30), so when it runs the
+        // The clip ends at the press. The Master mix trails real time, so when it runs the
         // copy waits until the mix has reached that point.
         let end = self.recorder.video_end();
         let catch_up = if self.audio_tracks.iter().any(|t| t.track == TrackId::Master) {
@@ -1850,7 +1849,7 @@ impl Actor {
     }
 
     /// Starts the clip IO thread on `job`, which writes one dump, and reports what it returns as
-    /// `Msg::ClipWritten` with `dump`. Takes the one dump slot (`saving`, D29), so callers check
+    /// `Msg::ClipWritten` with `dump`. Takes the one dump slot (`saving`), so callers check
     /// it is free. Returns whether the thread started; if not, the error has been reported.
     fn spawn_dump(
         &mut self,
@@ -1878,13 +1877,13 @@ impl Actor {
         }
     }
 
-    /// The watchdog's FLUSHING step (DESIGN §8): writes everything the DVR holds to its own
+    /// The watchdog's FLUSHING step: writes everything the DVR holds to its own
     /// `recovered` file, because the buffer restarts empty when capture resumes. It is a normal
     /// dump on the clip IO thread, so `Flushed` comes from [`on_clip_written`](Self::on_clip_written)
     /// and the actor never waits on the disk. Returns `Flushed` at once when there is nothing to
     /// write, and `None` while the write (or a save it waits behind) runs.
     fn start_flush(&mut self) -> Option<HealthEvent> {
-        // One dump at a time (D29): a save already running finishes first, and its end starts this.
+        // One dump at a time: a save already running finishes first, and its end starts this.
         if self.saving.is_some() {
             return None;
         }
@@ -2014,7 +2013,7 @@ impl Actor {
                 if newly_tracked {
                     self.start_session();
                 }
-                // The status holds the file name, not the full path (P4.6).
+                // The status holds the file name, not the full path.
                 self.status.game = Some(exe_name(&exe).to_owned());
                 self.publish_status();
             }
@@ -2022,7 +2021,7 @@ impl Actor {
         }
     }
 
-    /// Feeds a health signal to the watchdog and carries out what it decides (DESIGN §8). Most
+    /// Feeds a health signal to the watchdog and carries out what it decides. Most
     /// steps finish at once and answer with the next event, which goes straight back in. The
     /// flush and the first IDR come back later through the inbox. Without a watchdog (video not
     /// started, or capture paused) the signal is dropped.
@@ -2071,7 +2070,7 @@ impl Actor {
             WatchdogAction::Reinit { codec } => Some(self.reinit(codec)),
             WatchdogAction::Resume => {
                 // The old GOPs are in the flushed file. `clear` keeps the master clock anchored,
-                // so PTS carries on from before the fault rather than from zero (DESIGN §8). The
+                // so PTS carries on from before the fault rather than from zero. The
                 // DVR skips frames until the IDR asked for here, which the source reports.
                 self.recorder.clear();
                 if let Some(video) = self.ports.video.as_mut() {
@@ -2104,7 +2103,7 @@ impl Actor {
     }
 
     /// The watchdog's REINIT step: starts the video source again as it was last started, with
-    /// `codec`, which is lower on the ladder after repeated failures (DESIGN §3, §8).
+    /// `codec`, which is lower on the ladder after repeated failures.
     fn reinit(&mut self, codec: Codec) -> HealthEvent {
         let Some(config) = self.video_config else { return HealthEvent::ReinitFailed };
         let config = VideoStart { codec, ..config };
@@ -2490,7 +2489,7 @@ mod tests {
 
     #[test]
     fn a_candidate_game_does_not_move_capture_while_one_is_tracked() {
-        // D35: the prompt decides, so capture stays off the second game and keeps its buffer.
+        // The prompt decides, so capture stays off the second game and keeps its buffer.
         let decision = capture_decision(
             CaptureMode::Game,
             &ProfileSet::default(),

@@ -1,4 +1,4 @@
-//! The rescue prompt: footage dumped after a game died (P4.12). A non-modal banner under the
+//! The rescue prompt: footage dumped after a game died. A non-modal banner under the
 //! focus prompt. It never takes keyboard focus, and the window is never raised for it.
 
 use std::io;

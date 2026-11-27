@@ -22,7 +22,7 @@ use zc_win::mf::MediaFoundation;
 
 use crate::capture::{Encode, Mmcss, Stream, Worker, pcm16_format};
 
-/// Audio track 3: the microphone, gated by push-to-talk (D30).
+/// Audio track 3: the microphone, gated by push-to-talk.
 ///
 /// The chosen capture device, or the default *communications* one (the headset
 /// mic, usually), in shared mode. The communications role is the one voice apps use, so
@@ -30,7 +30,7 @@ use crate::capture::{Encode, Mmcss, Stream, Worker, pcm16_format};
 /// [`IMMDeviceEnumerator::GetDefaultAudioEndpoint`](https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/nf-mmdeviceapi-immdeviceenumerator-getdefaultaudioendpoint)
 /// with [`ERole`](https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/ne-mmdeviceapi-erole).
 /// Device selection goes through the [MMDevice API](https://learn.microsoft.com/en-us/windows/win32/coreaudio/mmdevice-api). A closed gate writes silence, so the track keeps its length and
-/// timestamps (DESIGN §6). The optional compressor has no lookahead, so the Mic
+/// timestamps. The optional compressor has no lookahead, so the Mic
 /// track needs no offset (`Compressor::latency`, `MasterClock::set_track_offset`).
 /// If the mic is unplugged or the default device changes, capture reopens every
 /// second; the gap becomes silence. A chosen device that is missing is waited for,
@@ -42,7 +42,7 @@ pub struct MicSource {
     compressor: bool,
     /// Endpoint id of the chosen mic; `None` is the Windows default.
     device: Option<String>,
-    /// This source's input in the Master mix (D30), if it has one.
+    /// This source's input in the Master mix, if it has one.
     mix: Option<MixInput>,
     worker: Option<Worker>,
 }

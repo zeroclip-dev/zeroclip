@@ -1,4 +1,4 @@
-//! Write pacing for spinning disks (DESIGN §4, "Pace DVR dumps on HDD").
+//! Write pacing for spinning disks.
 //!
 //! The HDD problem isn't throughput — 2.5 MB/s of capture is nothing — it's seek
 //! contention with the game's own asset streaming. A 750 MB DVR dump written flat

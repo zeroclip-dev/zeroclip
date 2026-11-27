@@ -1,5 +1,5 @@
-//! Hot-path code must not allocate (CONTRIBUTING.md rule 2; DESIGN §5: "All modes share
-//! one zero-allocation encode loop"). These tests swap in a counting global
+//! Hot-path code must not allocate (CONTRIBUTING.md rule 2): all modes share
+//! one zero-allocation encode loop. These tests swap in a counting global
 //! allocator and check the DVR push, the packet ring, hotkey matching, the mic DSP,
 //! the audio timeline and the Master mix bus.
 //!

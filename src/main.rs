@@ -2,8 +2,7 @@
 //!
 //! This crate is the composition root: it resolves paths, starts logging, loads
 //! settings, builds the platform adapters ([`wiring`]) and hands them to the
-//! engine, then runs the GPUI UI. All recording logic lives in `crates/`; see
-//! docs/ARCHITECTURE.md.
+//! engine, then runs the GPUI UI. All recording logic lives in `crates/`.
 
 // Release builds are GUI apps: no console window. Debug builds keep the console
 // so logs are visible while developing.
@@ -55,7 +54,7 @@ fn main() -> anyhow::Result<()> {
     update::cleanup_leftovers();
 
     let settings = settings_store::load(&paths.settings_file);
-    // Windows starts ZeroClip with `--tray` at sign-in (P4.16): the window stays hidden.
+    // Windows starts ZeroClip with `--tray` at sign-in: the window stays hidden.
     let start_hidden = std::env::args().any(|arg| arg == "--tray");
 
     gpui_platform::application().with_assets(ui::icons::Icons).run(move |cx| {
@@ -83,7 +82,7 @@ fn main() -> anyhow::Result<()> {
                         std::process::exit(1);
                     }
                 });
-                // Close-to-tray (P4.15): the app decides whether this close hides or quits.
+                // Close-to-tray: the app decides whether this close hides or quits.
                 let weak = app.downgrade();
                 window.on_window_should_close(cx, move |_, cx| {
                     weak.update(cx, |app, cx| app.close_requested(cx)).unwrap_or(true)

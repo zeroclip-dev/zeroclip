@@ -1,5 +1,5 @@
-//! Deterministic test fixtures (DESIGN §11: "write the disk writer and muxer
-//! against synthetic frames before wiring real capture into them").
+//! Deterministic test fixtures: the disk writer and muxer are built against synthetic
+//! frames before real capture is wired into them.
 //!
 //! Debugging a ring buffer is far easier when frames are numbered 1, 2, 3 than
 //! when they're real video: every synthetic payload starts with its sequence
@@ -94,7 +94,7 @@ impl SyntheticStream {
         self
     }
 
-    /// Adds the Master track (audio slot 0, D30) to the output, ahead of the other audio
+    /// Adds the Master track (audio slot 0) to the output, ahead of the other audio
     /// tracks. Off by default, so existing output doesn't change.
     #[must_use]
     pub fn with_master(mut self) -> Self {

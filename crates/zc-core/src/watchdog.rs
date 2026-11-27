@@ -1,4 +1,4 @@
-//! The encoder watchdog, as an explicit state machine (DESIGN §8).
+//! The encoder watchdog, as an explicit state machine.
 //!
 //! Rebuilding a D3D11 device and encoder mid-session while the ring buffer is
 //! live will corrupt the buffer if done ad hoc. So recovery is a fixed sequence,
@@ -14,7 +14,7 @@
 //! FLUSHING   write every complete GOP to disk (nothing is lost)
 //!   ▼
 //! REINIT     tear down and rebuild the D3D11 device + MF encoder;
-//!   │        on repeated failure, step down the codec ladder (§3)
+//!   │        on repeated failure, step down the codec ladder
 //!   ▼
 //! RESUMING   new IDR; buffer restarts from empty; PTS continues from the
 //!   │        master clock, not from zero
@@ -108,7 +108,7 @@ pub enum WatchdogAction {
 /// Tuning knobs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WatchdogConfig {
-    /// Consecutive dropped frames that trigger recovery (DESIGN §8: 10).
+    /// Consecutive dropped frames that trigger recovery.
     pub max_consecutive_drops: u32,
     /// Re-init attempts with one codec before stepping down the ladder.
     pub reinit_attempts_per_codec: u32,

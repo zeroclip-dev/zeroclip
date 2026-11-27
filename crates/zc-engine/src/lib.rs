@@ -19,7 +19,7 @@
 //!
 //! The engine never depends on Windows. Real adapters are injected by the app;
 //! tests inject [`synthetic`] sources, which is how the watchdog and recording
-//! modes get tested deterministically (DESIGN §12, "synthetic-load test harness").
+//! modes get tested deterministically.
 
 mod actor;
 pub mod disk_dvr;

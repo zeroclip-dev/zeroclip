@@ -1,4 +1,4 @@
-//! End-to-end specs for the engine, driven by synthetic sources (DESIGN §12).
+//! End-to-end specs for the engine, driven by synthetic sources.
 //! These are the "done when" checks of Phases 3 and 4, runnable on any OS.
 
 use std::path::{Path, PathBuf};
@@ -153,7 +153,7 @@ fn disk_mode_saves_a_clip_from_the_ring_file() {
     let ring = scratch.0.join("zeroclip-dvr.ring");
     assert!(ring.metadata().expect("the ring file exists").len() > 20_000_000);
     engine.shutdown();
-    assert!(ring.is_file(), "the ring file is kept on a clean shutdown (D32)");
+    assert!(ring.is_file(), "the ring file is kept on a clean shutdown");
 }
 
 #[test]
@@ -258,8 +258,7 @@ fn watchdog_recovers_from_an_injected_encoder_fault() {
     let engine = Engine::spawn(config, ports, Arc::new(|()| {})).expect("spawn");
 
     // No footage is lost: the frames from before the fault are flushed to their own file
-    // during recovery, before the re-init. The buffer then restarts empty at RESUMING
-    // (DESIGN §8), so a later clip holds only frames from the new encoder.
+    // during recovery, before the re-init. The buffer then restarts empty at RESUMING, so a later clip holds only frames from the new encoder.
     let mut flushed = None;
     wait_for(&engine, |e| match e {
         EngineEvent::ClipSaved { path, .. } => {
@@ -311,7 +310,7 @@ fn crash_rescue_waits_for_a_save_in_progress() {
     let engine = engine_with_input(SyntheticVideoSource::new(), &input, &dir.0);
     start_game(&engine, &input);
 
-    // The game dies while the save is being written: one dump at a time (D29), so the rescue
+    // The game dies while the save is being written: one dump at a time, so the rescue
     // waits for the save, and neither is lost.
     engine.send(Command::SaveClip).unwrap();
     input.inject(OsEvent::ProcessExited { pid: GAME_PID, exit_code: 0xC000_0005 });

@@ -1,4 +1,4 @@
-//! Keyframe snapping (DESIGN §9, "Instant trimming").
+//! Keyframe snapping.
 //!
 //! A stream copy can only start on a keyframe (IDR), so the in-point snaps *back*
 //! to the nearest keyframe at or before it — never forward, which would cut off

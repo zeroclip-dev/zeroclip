@@ -1,4 +1,4 @@
-//! Open windows and running processes, for per-app audio tracks (DESIGN §6, D26).
+//! Open windows and running processes, for per-app audio tracks.
 //!
 //! Everything here is a read-only query. Nothing is injected, suspended or
 //! terminated, and no admin rights are needed for the processes we can open.

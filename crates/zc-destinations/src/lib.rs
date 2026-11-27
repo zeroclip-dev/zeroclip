@@ -1,10 +1,10 @@
-//! # zc-destinations — where clips go (DESIGN §10, Phase 6)
+//! # zc-destinations — where clips go
 //!
 //! Every upload target implements one trait, [`Destination`], and the editor's
 //! drop-target row is rendered from the [`Registry`] — adding a platform is one
 //! `impl`, not a UI change.
 //!
-//! Build order (DESIGN §10): **Discord first** — a webhook POST, no OAuth, no
+//! Build order: **Discord first** — a webhook POST, no OAuth, no
 //! quota — to prove the drag → upload → copy-link plumbing in an afternoon; then
 //! **YouTube with bring-your-own credentials**, so the feature never waits on
 //! Google's compliance audit.

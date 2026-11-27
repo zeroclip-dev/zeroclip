@@ -19,7 +19,7 @@ use zc_win::error::WinResultExt;
 /// - `BGRA_SUPPORT` for WGC's frames, `VIDEO_SUPPORT` for the video processor and
 ///   the encoder.
 /// - Multithread protection on, so the capture callback and the encoder thread
-///   can't collide on the immediate context (DESIGN §3).
+///   can't collide on the immediate context.
 /// - The default adapter. On a hybrid laptop that's usually the discrete GPU; the
 ///   adapter is logged so bug reports say which GPU they came from.
 ///

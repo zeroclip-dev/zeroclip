@@ -1,4 +1,4 @@
-//! Keys, chords and hotkey matching (DESIGN §2 "Input", §8 "Raw Input needs a message pump").
+//! Keys, chords and hotkey matching.
 //!
 //! The input adapter (`zc-input`) reads the keyboard and mouse through the Raw
 //! Input API — invisible to anti-cheat, no `SetWindowsHookEx` — and reports every

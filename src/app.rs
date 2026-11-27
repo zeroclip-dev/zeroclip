@@ -101,15 +101,15 @@ pub struct ZeroClipApp {
     /// The metadata database (waveform cache). `None` when it couldn't be opened.
     pub store: Option<Arc<Mutex<zc_store::Store>>>,
     pub open_apps: ui::components::open_apps::OpenAppsList,
-    /// The focus prompt on screen, if a second game asked to take over (D35).
+    /// The focus prompt on screen, if a second game asked to take over.
     pub focus_prompt: Option<ui::focus_prompt::FocusPrompt>,
-    /// Footage waiting for Keep / Discard / Later (P4.12); the first one is on screen.
+    /// Footage waiting for Keep / Discard / Later; the first one is on screen.
     pub rescues: Vec<ui::rescue::Rescue>,
-    /// Recent log lines, dumped next to a rescue (P4.13).
+    /// Recent log lines, dumped next to a rescue.
     flight: Arc<crate::logging::FlightRecorder>,
     /// The startup scan's result, moved into `notices` and `rescues` when it arrives.
     repairs: mpsc::Receiver<StartupScan>,
-    /// The tray icon (P4.15). `None` when it couldn't be created: the app then quits on close.
+    /// The tray icon. `None` when it couldn't be created: the app then quits on close.
     tray: Option<tray::Tray>,
     /// Set by the tray's Quit, so the window closes for real instead of hiding.
     quitting: bool,
@@ -150,7 +150,7 @@ impl ZeroClipApp {
         };
         let engine = Engine::spawn(config, crate::wiring::ports(&settings), wake)?;
 
-        // Repairing reads the output folder, so it runs off the UI thread (D18).
+        // Repairing reads the output folder, so it runs off the UI thread.
         let (repairs_tx, repairs) = mpsc::channel();
         let output_dir = settings
             .recording
@@ -554,7 +554,7 @@ impl ZeroClipApp {
         });
     }
 
-    /// The window's close button (P4.15). With close-to-tray on and a tray icon to come back from,
+    /// The window's close button. With close-to-tray on and a tray icon to come back from,
     /// the window hides and the app keeps running. Otherwise the window closes and the app quits.
     /// Returns whether the window may close.
     pub fn close_requested(&mut self, cx: &mut Context<Self>) -> bool {
@@ -576,7 +576,7 @@ impl ZeroClipApp {
         false
     }
 
-    /// Handles the tray's menu and icon commands (P4.15).
+    /// Handles the tray's menu and icon commands.
     fn drain_tray(&mut self, cx: &mut Context<Self>) {
         let commands: Vec<TrayCommand> = match &self.tray {
             Some(tray) => tray.commands.try_iter().collect(),
@@ -602,7 +602,7 @@ impl ZeroClipApp {
         }
     }
 
-    /// The focus prompt's "Clip desktop" (D35): the capture mode becomes the whole screen, the
+    /// The focus prompt's "Clip desktop": the capture mode becomes the whole screen, the
     /// same as choosing it in Settings.
     pub fn clip_desktop(&mut self) {
         let mut settings = self.settings.clone();
@@ -648,7 +648,7 @@ impl ZeroClipApp {
         }
     }
 
-    /// Answers the focus prompt (D35). Keep and Switch tell the engine; Clip desktop changes the
+    /// Answers the focus prompt. Keep and Switch tell the engine; Clip desktop changes the
     /// capture mode. Any answer closes the banner.
     pub fn answer_focus_prompt(&mut self, choice: FocusChoice) {
         self.focus_prompt = None;
@@ -737,7 +737,7 @@ impl ZeroClipApp {
                 EngineEvent::FocusPrompt { current, candidate } => {
                     self.focus_prompt = Some(ui::focus_prompt::FocusPrompt { current, candidate });
                     // ponytail: egui flashed the taskbar here; GPUI has no equivalent yet.
-                    // Never raise or activate the window (D35).
+                    // Never raise or activate the window.
                 }
                 EngineEvent::ClipSaving => {
                     self.saving_since = Some(Instant::now());
@@ -864,7 +864,7 @@ struct StartupScan {
     rescues: Vec<PathBuf>,
 }
 
-/// Adds or removes ZeroClip's Run value, so Windows starts it at sign-in (P4.16).
+/// Adds or removes ZeroClip's Run value, so Windows starts it at sign-in.
 fn set_start_with_windows(enabled: bool) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     zc_win::autostart::set(enabled, &zc_win::autostart::run_value(&exe))?;
@@ -887,7 +887,7 @@ fn spawn_repair(dir: PathBuf, result: mpsc::Sender<StartupScan>, wake: async_cha
 
 const MAX_SCAN_DEPTH: usize = 4;
 
-/// One pass over `dir`: repairs every `*.partial` file (D18, one notice per file) and collects
+/// One pass over `dir`: repairs every `*.partial` file and collects
 /// the `recovery-*.tmp` files for the rescue prompt. A folder that doesn't exist yet has nothing.
 fn startup_scan(dir: &Path) -> StartupScan {
     let mut scan = StartupScan::default();

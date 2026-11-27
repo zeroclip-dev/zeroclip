@@ -1,4 +1,4 @@
-//! Screenshots (DESIGN §5): one frame, uncompressed, independent of recording.
+//! Screenshots: one frame, uncompressed, independent of recording.
 //!
 //! The capture callback only queues a GPU copy into a staging texture
 //! ([`staging_copy`]); the caller (the engine thread, off the hot path) maps it and

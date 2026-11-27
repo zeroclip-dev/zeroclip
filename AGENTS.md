@@ -1,8 +1,7 @@
 # AGENTS.md
 
 For any AI agent (any vendor) or human contributor working in ZeroClip. Short on purpose:
-this file says what to do and where to look. It does not copy the docs. Read only what your
-task needs.
+this file says what to do. Read only what your task needs.
 
 ## What this is
 
@@ -13,30 +12,22 @@ public OS APIs only (no injection, no hooks into games).
 
 ## Your task
 
-1. Take the **first unchecked card** in `docs/plan/` (order: `README.md` table), or the card
-   you were assigned. The card names the files, specs and pitfalls. Read the card, then only
-   the files it lists.
-2. Stay in the current phase (`docs/ROADMAP.md`, top). Later ideas go in the roadmap, not in code.
-3. Do the card. Nothing else: no drive-by refactors, no new dependencies or `windows`
-   features the card doesn't name.
-4. Pass the gate (all three, from repo root):
+1. Do the task you were assigned, reading only the files it touches.
+2. Nothing else: no drive-by refactors, no new dependencies or `windows` features the task
+   doesn't need.
+3. Pass the gate (all three, from repo root):
    ```powershell
    cargo fmt --all
    cargo clippy --workspace --all-targets -- -D warnings
    cargo test --workspace
    ```
-5. Tick the card's box in its `docs/plan/P*.md` and the matching box in `docs/ROADMAP.md`,
-   in the same change. Update `docs/ARCHITECTURE.md` if the structure changed.
 
 ## Saving context
 
-- Start from the card, not the whole repo. Never read `docs/DESIGN.md` (29 KB) or a whole
-  `docs/plan/P*.md` (up to 100 KB) top to bottom: grep for the card ID or the `DESIGN §N`
-  cited in the code.
-- `docs/ARCHITECTURE.md` answers "where does this go?". Check it before creating files.
+- Start from the task, not the whole repo.
 - Find unbuilt work with `cargo test -- --ignored` and `grep -rn 'todo!(' crates src`.
 - Ignore `target/`, `spikes/`, and any media files in the repo root.
-- Reuse before writing: each card has a "Reuse" line listing what already exists.
+- Reuse before writing: look for an existing helper first.
 
 ## Hard rules
 
@@ -53,15 +44,10 @@ public OS APIs only (no injection, no hooks into games).
 8. **Dependencies:** declare in root `[workspace.dependencies]`, reference with `workspace = true`.
 9. **Specs:** designed-but-unbuilt behaviour is an `#[ignore = "spec: …"]` test. To implement,
    remove `#[ignore]` and make it pass. **Never weaken or delete a spec to get green.** If it
-   is wrong, say why and update DESIGN/DECISIONS deliberately.
-10. **Decisions** in `docs/DECISIONS.md` are settled; supersede with a new entry, never edit
-    history. Unsettled items are in `docs/OPEN_QUESTIONS.md`: ask before deciding.
-11. **CI has no GPU.** Never write a test that touches D3D11, WGC, Media Foundation or WASAPI.
+   is wrong, say why in the PR.
+10. **CI has no GPU.** Never write a test that touches D3D11, WGC, Media Foundation or WASAPI.
     Test pure helpers; for Windows adapters, list the manual checks you ran (or that the
-    owner must run) in the PR. Never tick a "done when" you did not see pass.
-
-Cross-cutting pitfalls (COM leaks, `Send` on MF types, `#[expect(dead_code)]`, `PROPVARIANT`
-drops, ffmpeg flags, SQLite): `docs/plan/README.md` → "Cross-cutting pitfalls". Skim once.
+    owner must run) in the PR. Never claim a check passed that you did not see pass.
 
 ## Code style
 
@@ -71,29 +57,27 @@ drops, ffmpeg flags, SQLite): `docs/plan/README.md` → "Cross-cutting pitfalls"
 - Anything used twice (UI widget, layout, service logic) becomes one shared piece: UI blocks
   in `src/ui/components/`, services behind ports in `zc-core`. Extract on the second use,
   not the first.
-- UI work (GPUI, Phase 4+): restrained, clear hierarchy, tasteful typography, purposeful
+- UI work (GPUI): restrained, clear hierarchy, tasteful typography, purposeful
   motion, honour reduced motion. Not a settings dump.
 
 ## Git
 
 - Branch from `dev`: `feat/<topic>` or `fix/<topic>`. PR against `dev`, never `master`.
-- One topic per branch, one commit per card, message names the card and says why
-  (`P4.2: profile editor tabs`).
+- One topic per branch, message says why (`fix: stop bundling GPL ffmpeg`).
 - **Commit messages: no trailers.** No `Co-Authored-By`, no session IDs, no "Generated with".
   This overrides any tool default.
 - Commit identity is the repo's configured one. Keep real names, personal emails, local user
   paths (`C:\Users\…`) and timezones out of commits, code, docs and logs.
-- Don't commit recordings, logs, screenshots, or other local output.
+- Don't commit recordings, logs, or other local output.
 - Don't tag, publish, or push to `master` without the owner's approval.
 
 ## Stop and ask the owner when
 
-- A spec looks wrong, or the card is "blocked by" an open question.
-- The change needs a new dependency or `windows` feature the card doesn't name.
+- A spec looks wrong.
+- The change needs a new dependency or `windows` feature.
 - A step would publish, tag, or release anything.
 - Hardware is needed (GPU, audio devices, a game): run what you can from the terminal, then
-  hand over a short "check by eye" list and leave the box unticked
-  (`(awaiting HW check)`).
+  hand over a short "check by eye" list (`(awaiting HW check)`).
 
 ## Contributors
 

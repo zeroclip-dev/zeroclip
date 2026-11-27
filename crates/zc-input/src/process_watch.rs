@@ -1,4 +1,4 @@
-//! Watching a game process until it exits, for crash rescue (DESIGN §8).
+//! Watching a game process until it exits, for crash rescue.
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 

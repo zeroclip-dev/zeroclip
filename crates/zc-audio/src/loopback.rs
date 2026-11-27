@@ -1,4 +1,4 @@
-//! WASAPI process loopback (include mode, D9), shared by [`GameAudioSource`](crate::GameAudioSource)
+//! WASAPI process loopback (include mode), shared by [`GameAudioSource`](crate::GameAudioSource)
 //! and [`AppAudioSource`](crate::AppAudioSource): activation of one process tree, and the
 //! start-up every process-loopback capture thread shares.
 //!

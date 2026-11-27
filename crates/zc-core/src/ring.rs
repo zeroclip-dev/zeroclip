@@ -1,5 +1,4 @@
-//! An allocation-free FIFO of encoded packets, stored in one pre-allocated byte ring
-//! (DESIGN §4, §5).
+//! An allocation-free FIFO of encoded packets, stored in one pre-allocated byte ring.
 //!
 //! The DVR buffer keeps one [`PacketRing`] per track, and the recording spool uses one
 //! too. Packet bytes go into a single `Box<[u8]>`. A packet may run past the end of the
@@ -67,7 +66,7 @@ impl PacketRing {
     }
 
     /// The whole byte ring. Its address and length stay fixed for the ring's life, so the
-    /// engine can page-lock it (DESIGN §4).
+    /// engine can page-lock it.
     #[must_use]
     pub fn memory(&self) -> &[u8] {
         &self.bytes

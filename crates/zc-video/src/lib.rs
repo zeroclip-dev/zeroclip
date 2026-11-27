@@ -1,4 +1,4 @@
-//! # zc-video — the GPU video pipeline (DESIGN §3)
+//! # zc-video — the GPU video pipeline
 //!
 //! ```text
 //! Windows.Graphics.Capture ──ID3D11Texture2D (BGRA, VRAM)──► convert (BGRA→NV12 on the GPU)

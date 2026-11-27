@@ -10,17 +10,6 @@ step on each other.
   paid-content permission described there. Your contribution is licensed the same way.
 - Open an issue first for anything bigger than a bug fix, so we agree on the approach.
 
-## Where things are
-
-- [docs/ROADMAP.md](docs/ROADMAP.md): phases and what is left. Stay in the current phase.
-- [docs/plan/](docs/plan/README.md): one task card per remaining item. Pick the first
-  unchecked card, read the files it names, and tick it in the same PR.
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): crates, threads, "where does this go?".
-- [docs/DESIGN.md](docs/DESIGN.md): the design. Code comments cite it as `DESIGN §N`.
-- [docs/DECISIONS.md](docs/DECISIONS.md): settled choices. To change one, add a new entry
-  that supersedes it; don't edit history.
-- [docs/OPEN_QUESTIONS.md](docs/OPEN_QUESTIONS.md): unsettled. Ask before deciding.
-
 ## Git
 
 `master` (finished, hardware-checked phases) ← `dev` ← `feat/<topic>` or `fix/<topic>`.
@@ -58,8 +47,7 @@ list the manual checks you did in the PR.
 
 Designed-but-unbuilt behaviour is an `#[ignore = "spec: …"]` test next to the code it
 describes. To implement it: remove `#[ignore]`, make it pass, run clippy and the full
-suite. Don't weaken or delete a spec to get green; if it is wrong, say why and update
-DESIGN or DECISIONS in the same PR.
+suite. Don't weaken or delete a spec to get green; if it is wrong, say why in the PR.
 
 ## Reuse and design
 

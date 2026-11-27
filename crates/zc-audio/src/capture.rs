@@ -185,7 +185,7 @@ impl Drop for Stream {
 pub(crate) const SILENCE_MARGIN: Hns = Hns::from_millis(100);
 
 /// Timestamps (via [`SampleTimeline`]) and encodes one track. The PCM also goes to the Master
-/// mix, when there is one (D30).
+/// mix, when there is one.
 pub(crate) struct Encode {
     timeline: SampleTimeline,
     encoder: AacEncoder,

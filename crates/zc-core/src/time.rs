@@ -140,7 +140,7 @@ impl fmt::Display for Hns {
 /// jittery 60 Hz source recorded at 60 fps isn't thinned. A tuning knob.
 const EARLY_SLACK_DIVISOR: i64 = 4;
 
-/// Turns a capture stream into exactly `fps` frames per second (DESIGN §3).
+/// Turns a capture stream into exactly `fps` frames per second.
 ///
 /// WGC delivers a frame on every display refresh where something changed, which
 /// gives two problems the encoder must never see:
@@ -148,7 +148,7 @@ const EARLY_SLACK_DIVISOR: i64 = 4;
 ///   [`accept`](Self::accept) keeps one per interval, on a fixed grid, so the
 ///   average is exact even when arrivals sit on a coarse 5 ms grid.
 /// - **No frames at all.** A static screen delivers nothing, which would stretch
-///   GOPs far past their 1–2 s and break the DVR's eviction (DESIGN §4).
+///   GOPs far past their 1–2 s and break the DVR's eviction.
 ///   [`repeat_due`](Self::repeat_due) says when to re-submit the last frame.
 #[derive(Clone, Copy, Debug)]
 pub struct FramePacer {
@@ -203,17 +203,17 @@ impl FramePacer {
     }
 }
 
-/// Maps raw capture timestamps onto the session timeline (DESIGN §6, "Master clock and PTS").
+/// Maps raw capture timestamps onto the session timeline.
 ///
 /// The clock is anchored once, to the `SystemRelativeTime` of the first captured
 /// video frame. Every track (video, game audio, mic) is aligned against that
 /// anchor — never against each other — so they cannot drift apart. WASAPI's
 /// `u64QPCPosition` and WGC's `SystemRelativeTime` are both QPC-based 100 ns
 /// values, so the mapping is a subtraction, plus an optional constant per-track
-/// offset for latency compensation (e.g. a mic limiter's lookahead, DESIGN §6).
+/// offset for latency compensation (e.g. a mic limiter's lookahead).
 ///
 /// The anchor survives encoder re-initialisation: after the watchdog rebuilds the
-/// pipeline, PTS continues from this clock rather than restarting at zero (DESIGN §8).
+/// pipeline, PTS continues from this clock rather than restarting at zero.
 #[derive(Clone, Debug, Default)]
 pub struct MasterClock {
     origin: Option<Hns>,
@@ -303,7 +303,7 @@ pub struct Placement {
     pub restart: bool,
 }
 
-/// Keeps a stream of PCM buffers continuous and on the QPC timeline (DESIGN §6).
+/// Keeps a stream of PCM buffers continuous and on the QPC timeline.
 ///
 /// The sound card's sample clock and QPC disagree by 10-100 ppm, up to 180 ms over
 /// 30 minutes. Timestamps here count samples, so they are exact and contiguous,
@@ -532,7 +532,7 @@ mod tests {
     #[test]
     fn master_clock_anchor_is_set_once() {
         // A pipeline re-init re-anchoring would restart PTS at zero, which makes
-        // files seek incorrectly (DESIGN §8). The first anchor wins.
+        // files seek incorrectly. The first anchor wins.
         let mut clock = MasterClock::new();
         clock.anchor(Hns(100));
         clock.anchor(Hns(900));
@@ -550,7 +550,7 @@ mod tests {
 
     #[test]
     fn master_clock_applies_per_track_offsets() {
-        // DESIGN §6: a lookahead limiter delays the mic by a constant; that delay is
+        // A lookahead limiter delays the mic by a constant; that delay is
         // compensated explicitly, per track, instead of being discovered later as drift.
         let mut clock = MasterClock::new();
         clock.anchor(Hns::ZERO);

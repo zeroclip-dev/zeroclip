@@ -103,7 +103,7 @@ fn recorder_push_never_allocates() {
     assert!(written.load(Ordering::Relaxed) > 0, "the tee never reached its writer");
 }
 
-/// Disk mode (P4.21): the hot path still only copies into the staging area, while the persister
+/// Disk mode: the hot path still only copies into the staging area, while the persister
 /// thread writes GOPs to the ring file at the same time. Only the pushing thread is counted.
 #[test]
 fn recorder_push_never_allocates_in_disk_mode() {

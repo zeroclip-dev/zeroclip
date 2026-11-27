@@ -17,21 +17,21 @@ use zc_win::error::WinResultExt;
 use crate::capture::{Mmcss, Stream, Worker, pcm16_format};
 use crate::loopback;
 
-/// Track 1: the focused game's audio via WASAPI *process loopback*, include mode
-/// (D9): only the target process and its children are captured, so Discord, music
+/// Track 1: the focused game's audio via WASAPI *process loopback*, include mode:
+/// only the target process and its children are captured, so Discord, music
 /// and notifications stay out.
 ///
 /// Activation goes through `ActivateAudioInterfaceAsync` with
 /// [`AUDIOCLIENT_ACTIVATION_PARAMS`](https://learn.microsoft.com/windows/win32/api/audioclientactivationparams/ns-audioclientactivationparams-audioclient_activation_params)
 /// (see Microsoft's ApplicationLoopback sample). Needs Windows 11 (build 20348+).
 /// Retargeting is live: the capture thread notices a new pid within 100 ms. The track has
-/// no holes (D27): while the game is quiet, or nothing is targeted, the thread writes silence,
+/// no holes: while the game is quiet, or nothing is targeted, the thread writes silence,
 /// so the track runs from the moment capture starts.
 #[derive(Debug, Default)]
 pub struct GameAudioSource {
     /// The target pid; 0 means none (pid 0 is the Idle process, never a game).
     target: Arc<AtomicU32>,
-    /// This source's input in the Master mix (D30), if it has one.
+    /// This source's input in the Master mix, if it has one.
     mix: Option<MixInput>,
     worker: Option<Worker>,
 }
@@ -59,7 +59,7 @@ impl GameAudioSource {
 }
 
 /// Whole-system loopback of the default playback device: the fallback before
-/// Windows 11 build 20348 (D9). It records everything, Discord included, and
+/// Windows 11 build 20348. It records everything, Discord included, and
 /// delivers nothing while nothing plays; the capture loop pads those gaps with
 /// silence (`Encode::pad_silence`).
 fn open_endpoint_loopback(

@@ -1,4 +1,4 @@
-//! Media Foundation hardware encoding and the codec capability ladder (DESIGN §3).
+//! Media Foundation hardware encoding and the codec capability ladder.
 //!
 //! Hardware encoders are asynchronous MFTs
 //! ([Asynchronous MFTs](https://learn.microsoft.com/windows/win32/medfound/asynchronous-mfts)):
@@ -143,8 +143,8 @@ pub enum EncoderEvent {
 /// A hardware encoder MFT, fed NV12 textures from the converter's ring, producing
 /// encoded packets.
 ///
-/// Configured with peak-constrained VBR, a fixed GOP (never scene-adaptive, D5), no
-/// B-frames (D6) and low latency. Input is zero-copy: the MFT gets our D3D11 device
+/// Configured with peak-constrained VBR, a fixed GOP (never scene-adaptive), no
+/// B-frames and low latency. Input is zero-copy: the MFT gets our D3D11 device
 /// through a DXGI device manager, and each NV12 texture is wrapped in a sample once,
 /// up front.
 #[derive(Debug)]
@@ -231,7 +231,7 @@ impl HwEncoder {
             let gop = gop_frames(config.fps, config.keyframe_interval);
             codec_api
                 .SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(gop))
-                .context("CODECAPI_AVEncMPVGOPSize")?; // DESIGN §3: a fixed GOP is required.
+                .context("CODECAPI_AVEncMPVGOPSize")?; // A fixed GOP is required.
             let optional: [(&GUID, VARIANT, &str); 6] = [
                 (
                     &CODECAPI_AVEncCommonRateControlMode,

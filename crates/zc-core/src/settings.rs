@@ -33,10 +33,10 @@ pub struct Settings {
     pub uploads: UploadSettings,
     /// Per-game profiles.
     pub profiles: ProfileSet,
-    /// The lightning editor's external tools (P5.5).
+    /// The lightning editor's external tools.
     #[serde(default)]
     pub editor: EditorSettings,
-    /// Tray and startup behaviour (P4.15, P4.16).
+    /// Tray and startup behaviour.
     #[serde(default)]
     pub app: AppSettings,
     /// Simple mode ("clip the last N minutes") or the full settings.
@@ -212,7 +212,7 @@ impl Settings {
     }
 }
 
-/// Tray and startup behaviour (P4.15, P4.16).
+/// Tray and startup behaviour.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -228,7 +228,7 @@ impl Default for AppSettings {
     }
 }
 
-/// The editor's external tools (P5.5).
+/// The editor's external tools.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EditorSettings {
@@ -276,7 +276,7 @@ pub enum FinishChoice {
 pub struct RecordingSettings {
     /// Output folder. `None` means `<Videos>\ZeroClip`.
     pub output_dir: Option<PathBuf>,
-    /// Container for recordings. Only fragmented MP4 is written (D18).
+    /// Container for recordings. Only fragmented MP4 is written.
     pub container: ContainerFormat,
     /// How files are laid out inside the output folder.
     pub layout: StorageLayout,
@@ -301,7 +301,7 @@ pub struct DvrSettings {
     pub enabled: bool,
     /// Upper bound on the buffer's RAM, in MiB. Profiles asking for more are clamped.
     pub ram_ceiling_mib: u32,
-    /// Where the buffer lives (D32). Applies when the engine starts.
+    /// Where the buffer lives. Applies when the engine starts.
     pub storage: DvrStorage,
     /// Folder of the ring file in [`DvrStorage::Disk`] mode. `None` is the recordings folder.
     pub ring_dir: Option<PathBuf>,
@@ -318,14 +318,14 @@ impl Default for DvrSettings {
     }
 }
 
-/// Where the DVR buffer is kept (D32). Hybrid (P4.22) is not built yet.
+/// Where the DVR buffer is kept. Hybrid is not built yet.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DvrStorage {
-    /// Pre-allocated, page-locked RAM (D4).
+    /// Pre-allocated, page-locked RAM.
     #[default]
     Ram,
-    /// A fixed-size ring file on disk; only a small staging area stays in RAM (P4.21).
+    /// A fixed-size ring file on disk; only a small staging area stays in RAM.
     Disk,
 }
 
@@ -333,22 +333,22 @@ pub enum DvrStorage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VideoSettings {
-    /// Force a codec. `None` picks the best one the GPU supports (DESIGN §3 ladder).
+    /// Force a codec. `None` picks the best one the GPU supports.
     pub codec: Option<Codec>,
     /// Target frame rate.
     pub fps: u32,
-    /// VBR floor, kbit/s (DESIGN §3: ~5 Mbps).
+    /// VBR floor, kbit/s.
     pub min_bitrate_kbps: u32,
-    /// VBR ceiling, kbit/s (DESIGN §3: ~20 Mbps). Drives the DVR buffer's RAM use.
+    /// VBR ceiling, kbit/s. Drives the DVR buffer's RAM use.
     pub max_bitrate_kbps: u32,
-    /// Fixed keyframe interval, ms (DESIGN §3: 1–2 s). Also the editor's trim granularity.
+    /// Fixed keyframe interval, ms. Also the editor's trim granularity.
     pub keyframe_interval_ms: u32,
     /// Draw the mouse cursor into the capture.
     pub capture_cursor: bool,
     /// The screen to record, as an index in the order Windows lists displays. `None` is
     /// the primary display. An index that isn't connected falls back to the primary.
     pub monitor: Option<u32>,
-    /// What to record: only profiled games (default), or the whole screen (D31).
+    /// What to record: only profiled games (default), or the whole screen.
     #[serde(default)]
     pub capture_mode: CaptureMode,
     /// The height the video is encoded at. Smaller means smaller files.
@@ -398,7 +398,7 @@ impl OutputResolution {
 
     /// The encode size for a `source` of `(width, height)`: scaled down to the target height
     /// with the source's aspect ratio, never up, and rounded down to even numbers (encoders
-    /// need even sizes, D24).
+    /// need even sizes).
     #[must_use]
     pub fn output_size(self, source: (u32, u32)) -> (u32, u32) {
         let (w, h) = source;
@@ -429,7 +429,7 @@ impl Default for VideoSettings {
     }
 }
 
-/// What the video source records (D31).
+/// What the video source records.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CaptureMode {
@@ -465,7 +465,7 @@ pub enum MicMode {
 /// The AAC bitrates the Microsoft encoder supports, in kbit/s.
 pub const AAC_BITRATES_KBPS: [u32; 4] = [96, 128, 160, 192];
 
-/// Each source's level in the Master mix, in dB (D30). Zero is the level the source is recorded at.
+/// Each source's level in the Master mix, in dB. Zero is the level the source is recorded at.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MixGains {
@@ -487,7 +487,7 @@ pub const MIX_GAIN_DB: RangeInclusive<f32> = -60.0..=12.0;
 /// Audio slots left after Master, Game and Mic: the most per-app tracks a recording can hold.
 pub const MAX_APP_TRACKS: usize = MAX_AUDIO_TRACKS as usize - 3;
 
-/// One app whose audio is recorded as its own track (D26). The app is found by its
+/// One app whose audio is recorded as its own track. The app is found by its
 /// executable name; a tree of processes counts as one app.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppTrack {
@@ -499,7 +499,7 @@ pub struct AppTrack {
     pub enabled: bool,
 }
 
-/// The per-app tracks a fresh install records: Discord and Spotify (D27).
+/// The per-app tracks a fresh install records: Discord and Spotify.
 fn default_app_tracks() -> Vec<AppTrack> {
     vec![
         AppTrack { label: "Discord".to_owned(), exe: "Discord.exe".to_owned(), enabled: true },
@@ -547,13 +547,13 @@ pub struct AudioSettings {
     /// Which microphone, as a Windows endpoint id. `None` follows the Windows
     /// default communications device.
     pub mic_device: Option<String>,
-    /// Run the mic through the dynamics compressor (DESIGN §6).
+    /// Run the mic through the dynamics compressor.
     pub mic_compressor: bool,
     /// AAC bitrate per track, kbit/s.
     pub bitrate_kbps: u32,
     /// Each source's level in the Master track (track 1). Read when the sources start.
     pub mix_gain_db: MixGains,
-    /// Apps recorded as their own tracks (D26). Settings files from before this field
+    /// Apps recorded as their own tracks. Settings files from before this field
     /// get the defaults.
     #[serde(default = "default_app_tracks")]
     pub app_tracks: Vec<AppTrack>,
@@ -604,15 +604,15 @@ impl Default for HotkeySettings {
     }
 }
 
-/// Disk behaviour (DESIGN §4, "Disk strategy").
+/// Disk behaviour.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StorageSettings {
     /// On a spinning disk, write DVR dumps at a gentle pace so the game doesn't stutter.
     pub pace_hdd_writes: bool,
-    /// Pacing rate on HDDs, MB/s (DESIGN §4: 30–50).
+    /// Pacing rate on HDDs, MB/s.
     pub hdd_write_mb_per_sec: u32,
-    /// Size of each buffered write, MiB (DESIGN §4: 8–16).
+    /// Size of each buffered write, MiB.
     pub write_chunk_mib: u32,
 }
 
@@ -622,7 +622,7 @@ impl Default for StorageSettings {
     }
 }
 
-/// Upload behaviour (DESIGN §10).
+/// Upload behaviour.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UploadSettings {
@@ -662,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_follow_the_design_doc() {
+    fn defaults_have_the_expected_values() {
         let s = Settings::default();
         assert_eq!(s.video.max_bitrate_kbps, 20_000);
         assert_eq!(s.video.keyframe_interval(), Hns::from_secs(1));

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::time::Hns;
 
-/// Hardware video codecs, best compression first (DESIGN §3, "encoder capability ladder").
+/// Hardware video codecs, best compression first.
 ///
 /// Hardware AV1 encode needs Arc, RTX 40-series or RDNA3+; assuming it exists would
 /// be a hard failure on launch for a large slice of users. At first run the video
@@ -35,7 +35,7 @@ impl Codec {
     }
 
     /// The next codec down the ladder, or `None` if this is already the fallback.
-    /// The watchdog uses this when re-initialisation keeps failing (DESIGN §8).
+    /// The watchdog uses this when re-initialisation keeps failing.
     #[must_use]
     pub fn step_down(self) -> Option<Self> {
         let i = Self::LADDER.iter().position(|&c| c == self)?;
@@ -57,9 +57,9 @@ impl Codec {
     }
 }
 
-/// Container formats that survive a crash mid-write (DESIGN §1, "crash-survivable containers").
+/// Container formats that survive a crash mid-write.
 ///
-/// Which one becomes the default is an open question (docs/OPEN_QUESTIONS.md):
+/// Which one becomes the default is an open question:
 /// MKV tooling is more forgiving; fragmented MP4 plays in browsers without a remux.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -68,7 +68,7 @@ pub enum ContainerFormat {
     #[default]
     #[serde(rename = "fmp4")]
     FragmentedMp4,
-    /// Matroska. Not written (D18); the variant stays so older settings files still parse.
+    /// Matroska. Not written; the variant stays so older settings files still parse.
     #[serde(rename = "mkv")]
     Matroska,
 }
@@ -128,7 +128,7 @@ pub struct TrackInfo {
     pub codec_private: Vec<u8>,
 }
 
-/// Most audio tracks a recording can carry. Video is always one more track (DESIGN §6).
+/// Most audio tracks a recording can carry. Video is always one more track.
 pub const MAX_AUDIO_TRACKS: u8 = 16;
 
 /// An audio track's slot, below [`MAX_AUDIO_TRACKS`]. The field is private, so the only
@@ -137,18 +137,18 @@ pub const MAX_AUDIO_TRACKS: u8 = 16;
 pub struct AudioTrack(u8);
 
 /// The tracks of a recording: one video track and up to [`MAX_AUDIO_TRACKS`] audio
-/// tracks (DESIGN §6). Labels such as "Game" live in [`TrackInfo`], not here,
+/// tracks. Labels such as "Game" live in [`TrackInfo`], not here,
 /// so this type stays `Copy` and allocation-free.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TrackId {
     /// Encoded video from the GPU pipeline.
     Video,
-    /// An audio track; slot 0 is Master, then the game and mic tracks (D30).
+    /// An audio track; slot 0 is Master, then the game and mic tracks.
     Audio(AudioTrack),
 }
 
 impl TrackId {
-    /// Audio track 1: the live mix of every enabled source, audio slot 0 (D30).
+    /// Audio track 1: the live mix of every enabled source, audio slot 0.
     // CamelCase, like the variants these names replaced, so call sites read the same.
     #[allow(non_upper_case_globals)]
     pub const Master: Self = Self::Audio(AudioTrack(0));
@@ -198,7 +198,7 @@ impl TrackId {
 ///
 /// There is no separate decode timestamp: encoders are configured without
 /// B-frames (`CODECAPI_AVEncMPVDefaultBPictureCount = 0`), so decode order equals
-/// presentation order. See docs/DECISIONS.md.
+/// presentation order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PacketMeta {
     /// Which track the packet belongs to.
