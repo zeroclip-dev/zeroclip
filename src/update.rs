@@ -218,25 +218,32 @@ pub fn download(release: &Release) -> anyhow::Result<PathBuf> {
     Ok(staged)
 }
 
-/// The release asset holding `ffmpeg.exe`, `ffprobe.exe`, `ffplay.exe` (preview sound) and ffmpeg's licence (a pinned gyan.dev
-/// build repacked by the release workflow).
-pub const FFMPEG_ASSET: &str = "ffmpeg-windows-x64.zip";
+/// Upstream ffmpeg build the user downloads from, pinned: gyan.dev "essentials" (GPL, has
+/// libx264/libx265, which the editor's exact cuts use). ZeroClip does not host or ship it.
+/// Bump URL and hash together.
+pub const FFMPEG_URL: &str =
+    "https://github.com/GyanD/codexffmpeg/releases/download/9.1/ffmpeg-9.1-essentials_build.zip";
+/// SHA-256 of the zip at [`FFMPEG_URL`], lowercase hex.
+pub const FFMPEG_SHA256: &str = "b9bbbb3acece000cbeec994f856649354e52c773807841e78908374b24d658fd";
 
 /// Puts ffmpeg and ffprobe beside the running exe, where `Ffmpeg::locate` looks first. Downloads
-/// [`FFMPEG_ASSET`] from this version's own release, checks it against that release's
-/// `SHA256SUMS.txt`, and unpacks it with Windows' `tar.exe` into a folder first, so a failed
-/// unpack never leaves a half-written `ffmpeg.exe` in place.
+/// [`FFMPEG_URL`], checks it against [`FFMPEG_SHA256`], and unpacks it with Windows' `tar.exe`
+/// into a folder first, so a failed unpack never leaves a half-written `ffmpeg.exe` in place.
+/// Only runs when the user asks for it (the editor's prompt), never at startup.
 pub fn install_ffmpeg() -> anyhow::Result<()> {
     use std::os::windows::process::CommandExt as _;
     let exe = std::env::current_exe()?;
     let dir = exe.parent().context("the app has no folder")?;
-    let base = format!("{DOWNLOAD_PREFIX}v{}/", current_version());
     let zip = dir.join("ffmpeg-download.zip");
     let unpack = dir.join("ffmpeg-download");
-    let sums = curl(&format!("{base}{SUMS_NAME}"), None, 20, 1 << 20)?;
-    let result = curl(&format!("{base}{FFMPEG_ASSET}"), Some(&zip), 900, 512 << 20)
+    let result = curl(FFMPEG_URL, Some(&zip), 900, 512 << 20)
         .and_then(|_| Ok(sha256_file(&zip)?))
-        .and_then(|hash| verify_hash(&String::from_utf8_lossy(&sums), FFMPEG_ASSET, &hash))
+        .and_then(|hash| {
+            if hash != FFMPEG_SHA256 {
+                bail!("ffmpeg download hash {hash} does not match the pinned one");
+            }
+            Ok(())
+        })
         .and_then(|()| {
             let _ = std::fs::remove_dir_all(&unpack);
             std::fs::create_dir_all(&unpack)?;
@@ -251,7 +258,7 @@ pub fn install_ffmpeg() -> anyhow::Result<()> {
                 .status()
                 .context("couldn't run tar.exe")?;
             if !status.success() {
-                bail!("couldn't unpack {FFMPEG_ASSET}");
+                bail!("couldn't unpack the ffmpeg download");
             }
             // ffmpeg.exe last: `locate` keys on it, so it only appears once the others are there.
             for name in ["LICENSE-ffmpeg.txt", "ffprobe.exe", "ffplay.exe", "ffmpeg.exe"] {

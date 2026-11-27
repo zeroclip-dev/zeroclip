@@ -1791,11 +1791,24 @@ impl Render for SettingsView {
                 section_block(
                     "Editor",
                     "External tools used for lossless stream-copy trimming.",
-                    vec![setting_row(
-                        "ffmpeg location",
-                        "Full path to ffmpeg.exe (ffprobe.exe beside it). Leave empty to search next to ZeroClip, then PATH.",
-                        f_ffmpeg,
-                    )],
+                    vec![
+                        setting_row(
+                            "ffmpeg location",
+                            "Full path to ffmpeg.exe (ffprobe.exe beside it). Leave empty to search next to ZeroClip, then PATH.",
+                            f_ffmpeg,
+                        ),
+                        setting_row(
+                            "ffmpeg download",
+                            "ZeroClip doesn't ship ffmpeg. This fetches the pinned GPL build from its upstream publisher, beside ZeroClip.",
+                            button("ffmpeg-download", "Download ffmpeg")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(app) = this.app.upgrade() {
+                                        app.update(cx, |app, cx| app.download_ffmpeg(cx));
+                                    }
+                                }))
+                                .into_any_element(),
+                        ),
+                    ],
                 ),
                 section_block(
                     "Uploads",

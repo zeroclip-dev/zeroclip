@@ -236,27 +236,14 @@ impl ZeroClipApp {
         })
         .detach();
 
-        // No ffmpeg anywhere and none configured: fetch it beside the exe, so the editor,
-        // thumbnails and smooth-seeking clips work without a separate install.
+        // No ffmpeg anywhere and none configured: ask the user to download it (ZeroClip does not
+        // ship ffmpeg, it is GPL). Nothing is fetched until they press Download in Settings.
         if settings.editor.ffmpeg_path.is_none() && zc_editor::ffmpeg::Ffmpeg::locate(None).is_err()
         {
-            cx.spawn(async move |this, cx| {
-                let done = cx.background_executor().spawn(async { update::install_ffmpeg() }).await;
-                let _ = this.update(cx, |app, cx| {
-                    match done {
-                        Ok(()) => app.notify(
-                            NoticeLevel::Info,
-                            "ffmpeg is installed, so the editor and thumbnails are ready.",
-                        ),
-                        // Offline is normal; the editor still says ffmpeg is missing.
-                        Err(error) => {
-                            tracing::warn!(error = %format!("{error:#}"), "ffmpeg install failed")
-                        }
-                    }
-                    cx.notify();
-                });
-            })
-            .detach();
+            notices.push_front(Notice {
+                level: NoticeLevel::Warning,
+                text: "The editor and thumbnails need ffmpeg. Open Settings > Editor and choose Download ffmpeg, or install your own and set its location there.".into(),
+            });
         }
 
         let store = match open_store(&paths.db_file) {
@@ -348,6 +335,31 @@ impl ZeroClipApp {
                 self.notify(NoticeLevel::Error, format!("Update failed: {error:#}"));
             }
         }
+    }
+
+    /// Settings > Editor > "Download ffmpeg": fetches the pinned upstream build beside the exe.
+    /// Runs only on this click, never at startup.
+    pub fn download_ffmpeg(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let done = cx.background_executor().spawn(async { update::install_ffmpeg() }).await;
+            let _ = this.update(cx, |app, cx| {
+                match done {
+                    Ok(()) => app.notify(
+                        NoticeLevel::Info,
+                        "ffmpeg is installed, so the editor and thumbnails are ready.",
+                    ),
+                    Err(error) => {
+                        tracing::warn!(error = %format!("{error:#}"), "ffmpeg download failed");
+                        app.notify(
+                            NoticeLevel::Error,
+                            format!("ffmpeg download failed: {error:#}. Install it yourself and set its location."),
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Settings' "Check now": asks for the latest release right away and, when there is a newer
