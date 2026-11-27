@@ -165,4 +165,7 @@ pub struct EngineStatus {
     /// Executable file names that had focus recently and have no profile, newest first,
     /// at most 8.
     pub recent_games: Vec<String>,
+    /// The game being recorded: unlike `game`, it doesn't change when you alt-tab to the
+    /// taskbar or another app. Clips are tagged with this one.
+    pub tracked_game: Option<String>,
 }

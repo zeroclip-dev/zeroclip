@@ -718,9 +718,10 @@ impl ZeroClipApp {
         .detach();
     }
 
-    /// Records which game `clip` came from (the game in focus now) so Clips can group by game.
+    /// Records which game `clip` came from (the tracked game, not whatever is focused now, so
+    /// an alt-tab to the taskbar doesn't tag it "explorer") so Clips can group by game.
     fn tag_game(&self, clip: &Path) {
-        if let Some(game) = &self.status.game {
+        if let Some(game) = &self.status.tracked_game {
             let name =
                 game.strip_suffix(".exe").or_else(|| game.strip_suffix(".EXE")).unwrap_or(game);
             zc_core::game_tag::save(clip, name);
