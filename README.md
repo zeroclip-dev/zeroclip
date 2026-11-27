@@ -24,10 +24,10 @@ Free for personal use, Windows only.
 
 Your clips show up in the **Clips** tab. ZeroClip lives in the system tray while it runs.
 
-ffmpeg, which the editor, thumbnails and smooth-seeking clips use, comes in the installer and the zip. If you
-downloaded only the `.exe`, ZeroClip fetches ffmpeg next to itself on first start (checked against
-the release's SHA-256 list). Recording and saving clips work without it. To use your own ffmpeg
-instead, set its path in Settings.
+ffmpeg, which the editor, thumbnails and smooth-seeking clips use, is not in the installer or the zip (it is
+GPL, so ZeroClip doesn't ship it). ZeroClip asks you to get it: press **Download ffmpeg** in Settings > Editor
+to fetch the pinned upstream build next to ZeroClip (checked against its SHA-256), or install your own and set
+its path there. Recording and saving clips work without it.
 
 ## Hotkeys
 

@@ -1,6 +1,7 @@
 ; ZeroClip installer (Inno Setup 6). Built by .github/workflows/release.yml:
 ;   iscc /DAppVersion=0.1.5 /DStage=..\stage /DOutDir=..\dist installer\zeroclip.iss
-; Stage holds zeroclip.exe, LICENSE, README.md and the ffmpeg files, the same as the zip.
+; Stage holds zeroclip.exe, LICENSE and README.md, the same as the zip. ffmpeg is not bundled (GPL);
+; the app downloads it on request (Settings > Editor).
 ;
 ; Per-user install (no admin) into %LOCALAPPDATA%\Programs\ZeroClip, because the app updates
 ; itself by renaming its own exe and unpacks ffmpeg beside it; both need a folder the user can

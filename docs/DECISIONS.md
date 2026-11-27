@@ -342,3 +342,11 @@ preallocated in fixed arrays (no allocation on the hot path, DESIGN §6), but on
 A new app track takes a free slot, evicting a switched-off entry when the saved list is full. Clips still
 omit an app track that made no sound in their window, so unused tracks do not reach the editor.
 Consequence: about 24 KB/s of RAM per enabled track (D26); the cap is a ceiling, not unlimited.
+
+### D41 · ffmpeg is not bundled; the user downloads it on request (amends D3 distribution, supersedes the auto-fetch)
+Why: the gyan.dev build is GPL. Shipping it in the zip and installer makes ZeroClip redistribute GPL binaries
+with licence and source obligations, and D28 keeps ZeroClip's own licence separate from that.
+Decision: the release workflow and installer carry no ffmpeg. Startup only shows a notice when ffmpeg is missing.
+Settings > Editor > "Download ffmpeg" fetches the pinned upstream zip (`update::FFMPEG_URL`, SHA-256 checked) on
+that click only. ffmpeg stays a separate `ffmpeg.exe` process (D3).
+Consequence: an install without ffmpeg needs one click or a manual install before the editor and thumbnails work.
