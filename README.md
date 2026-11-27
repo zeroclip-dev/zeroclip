@@ -12,6 +12,32 @@ Free for personal use, Windows only.
 > other machines yet. If something breaks, please
 > [open an issue](https://github.com/zeroclip-dev/zeroclip/issues).
 
+## Screenshots
+
+**Home.** The replay buffer, one button to save a clip, and your latest clips.
+
+![Home: replay buffer, Save clip button and recent clips](assets/screenshots/home.jpg)
+
+**Clips.** Every clip and screenshot, grouped by game, with search, sorting and a list or grid view.
+
+![Clips: library grouped by game](assets/screenshots/clips.jpg)
+
+**Profiles.** Choose how much to keep and whether to record the whole session, per game.
+
+![Profiles: buffer length and whole-session recording per game](assets/screenshots/profiles.jpg)
+
+**Editor.** Preview a clip, then trim, split, reorder and mix its tracks without re-encoding.
+
+![Editor: video preview and playback controls](assets/screenshots/editor.jpg)
+
+The timeline shows thumbnails and the audio waveform, with per-track volume and one-click export.
+
+![Editor: timeline, waveform and export](assets/screenshots/editor-timeline.jpg)
+
+**Settings.** Capture source, codec, resolution, frame rate, audio, hotkeys and storage.
+
+![Settings: capture options](assets/screenshots/settings.jpg)
+
 ## Get started
 
 1. Download the latest `ZeroClip-vX.Y.Z-setup-x64.exe` from
